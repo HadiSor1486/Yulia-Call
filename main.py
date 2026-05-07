@@ -1,6 +1,6 @@
 """
 Silent Hill Voice Call Bot — Kyodo + WebRTC + Chat UI
-GLARE FIX: Only one peer creates offer (by ID comparison).
+GLARE FIX v2: Server assigns peer IDs — both sides compare same IDs.
 """
 
 import asyncio, json, os, time, uuid, traceback
@@ -123,6 +123,9 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                               "muted": False, "is_host": is_host}
     existing = [p for p in room["peers"] if p != peer_id]
     print(f"[WS] {peer_id} ({name}) joined host={is_host}")
+
+    # Send peer their own ID first — critical for glare-free signaling
+    await ws.send_json({"type": "your_id", "id": peer_id})
 
     await ws.send_json({"type": "history", "messages": json_read(room["chat_file"])[-100:]})
     peer_list = [{"id": p, "name": room["peers"][p]["name"], "avatar": room["peers"][p]["avatar"],
@@ -317,34 +320,22 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 </div>
 
 <script>
-// ═══════════════════════════════════════════════════════
-// CONFIG — myPeerId injected by server (not set yet, need to add)
-// ═══════════════════════════════════════════════════════
 const ROOM="__ROOM_ID__",TOKEN="__TOKEN__";
-// We generate our own peer ID locally — used for glare-free signaling
-const MY_ID = Math.random().toString(36).substring(2, 10);
+let MY_ID=""; // Set by server via your_id message — SAME on both sides
 let ws=null,localStream=null,myName="",myAvatar="",isMuted=false,isHost=false;
 const peers={},audios={};
 const peerMap=new Map();
 
-// STUN + TURN servers
+// STUN + TURN
 const ICE_SERVERS=[
   {urls:'stun:stun.l.google.com:19302'},
   {urls:'stun:stun1.l.google.com:19302'},
   {urls:'stun:stun2.l.google.com:19302'},
-  {urls:'stun:stun3.l.google.com:19302'},
-  {urls:'stun:stun4.l.google.com:19302'},
   {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
   {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
   {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'},
-  {urls:'turn:global.relay.metered.ca:80',username:'81eb600c5c9b5488c838ae33',credential:'G8HNxzfb1F0Y1Dsp'},
-  {urls:'turn:global.relay.metered.ca:443',username:'81eb600c5c9b5488c838ae33',credential:'G8HNxzfb1F0Y1Dsp'},
-  {urls:'turn:global.relay.metered.ca:443?transport=tcp',username:'81eb600c5c9b5488c838ae33',credential:'G8HNxzfb1F0Y1Dsp'},
 ];
-
-function getPCConfig(){
-  return{iceServers:ICE_SERVERS,bundlePolicy:'max-bundle',rtcpMuxPolicy:'require',iceCandidatePoolSize:10};
-}
+function getPCConfig(){return{iceServers:ICE_SERVERS,bundlePolicy:'max-bundle',rtcpMuxPolicy:'require',iceCandidatePoolSize:10};}
 
 // ── DEBUG ──
 function log(m){
@@ -374,7 +365,7 @@ async function doJoin(){
   try{
     localStream=await navigator.mediaDevices.getUserMedia({audio:true});
     document.getElementById('vstat').textContent='Connected';
-    log("mic OK, myId="+MY_ID);
+    log("mic OK");
   }catch(e){log("mic err: "+e.message); document.getElementById('vstat').textContent='No mic';}
   document.getElementById('joinOvl').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
@@ -385,43 +376,51 @@ async function doJoin(){
 function connectWS(){
   const p=location.protocol==='https:'?'wss:':'ws:';
   const url=p+'//'+location.host+'/ws/'+ROOM+'?t='+TOKEN;
-  log("WS connect myId="+MY_ID);
+  log("WS connect");
   ws=new WebSocket(url);
 
   ws.onopen=()=>{
-    log("WS open myId="+MY_ID);
+    log("WS open");
     ws.send(JSON.stringify({type:'join',name:myName,avatar:myAvatar}));
   };
 
   ws.onmessage=async(ev)=>{
     let m; try{m=JSON.parse(ev.data);}catch(e){return;}
     switch(m.type){
+      case 'your_id':
+        // CRITICAL: Server tells us our ID. Both peers compare SAME IDs.
+        MY_ID = m.id;
+        log("myId="+MY_ID);
+        break;
+
       case 'history': m.messages.forEach(renderMsg); break;
       case 'chat': renderMsg(m); break;
+
       case 'peers':
         log("peers:"+m.peers.length);
         m.peers.forEach(p=>{
           addPeer(p);
-          // GLARE FIX: Only the peer with LARGER ID creates the offer
+          // GLARE FIX: Compare SAME server-assigned IDs
           if(MY_ID > p.id){
-            log("I am LARGER ("+MY_ID+">"+p.id+") — I create offer");
+            log("LARGER ("+MY_ID+">"+p.id+") offer->"+p.id);
             createOffer(p.id);
           }else{
-            log("I am SMALLER ("+MY_ID+"<"+p.id+") — I wait for offer");
+            log("SMALLER ("+MY_ID+"<"+p.id+") wait");
           }
         });
         break;
+
       case 'peer_joined':
         addPeer(m.peer);
         renderSys(m.peer.name+" joined");
-        // GLARE FIX for late joiners
-        if(MY_ID > m.peer.id){
-          log("late joiner, I am LARGER — offer to "+m.peer.id);
+        if(MY_ID && MY_ID > m.peer.id){
+          log("late LARGER offer->"+m.peer.id);
           createOffer(m.peer.id);
-        }else{
-          log("late joiner, I am SMALLER — waiting");
+        }else if(MY_ID){
+          log("late SMALLER wait");
         }
         break;
+
       case 'peer_left': removePeerAudio(m.peer_id); peerMap.delete(m.peer_id); renderSys(m.name+' left'); updCount(); updPeers(); break;
       case 'webrtc_offer': await handleOffer(m.from,m.sdp); break;
       case 'webrtc_answer': await handleAnswer(m.from,m.sdp); break;
@@ -452,7 +451,7 @@ function updPeers(){
 }
 
 // ═══════════════════════════════════════════════════════
-// WEBRTC — GLARE-FREE: Only larger ID creates offer
+// WEBRTC — GLARE-FREE using server-assigned IDs
 // ═══════════════════════════════════════════════════════
 
 function destroyPeer(pid){
@@ -462,7 +461,7 @@ function destroyPeer(pid){
 
 async function createOffer(pid){
   log("offer->"+pid);
-  destroyPeer(pid); // Clean slate
+  destroyPeer(pid);
   try{
     const pc=new RTCPeerConnection(getPCConfig());
     setupPC(pc,pid);
@@ -477,7 +476,7 @@ async function createOffer(pid){
 
 async function handleOffer(from,sdp){
   log("offer<-"+from);
-  destroyPeer(from); // Clean slate
+  destroyPeer(from);
   try{
     const pc=new RTCPeerConnection(getPCConfig());
     setupPC(pc,from);
@@ -501,20 +500,16 @@ async function handleAnswer(from,sdp){
 }
 
 async function handleIce(from,cand){
-  try{
-    const pc=peers[from]; if(pc&&cand)await pc.addIceCandidate(new RTCIceCandidate(cand));
-  }catch(e){}
+  try{const pc=peers[from]; if(pc&&cand)await pc.addIceCandidate(new RTCIceCandidate(cand));}catch(e){}
 }
 
 function setupPC(pc,pid){
-  // Forward ICE candidates
   pc.onicecandidate=e=>{
     if(e.candidate&&ws&&ws.readyState===1){
       ws.send(JSON.stringify({type:'webrtc_ice',to:pid,candidate:e.candidate}));
     }
   };
 
-  // Receive audio
   pc.ontrack=e=>{
     log("TRACK "+pid+" streams="+e.streams.length);
     let a=audios[pid];
@@ -523,7 +518,6 @@ function setupPC(pc,pid){
       a.autoplay=true;
       a.playsInline=true;
       a.volume=1.0;
-      // Unlock AudioContext for iOS
       try{const C=window.AudioContext||window.webkitAudioContext;const x=new C();x.resume().then(()=>x.close());}catch(e){}
       audios[pid]=a;
     }
@@ -532,14 +526,13 @@ function setupPC(pc,pid){
       log("PLAYING "+pid);
       document.getElementById('vstat').textContent='Voice OK';
     }).catch(err=>{
-      log("playBlock "+pid+" "+err.message);
+      log("playBlock "+pid);
       const r=()=>{a.play().then(()=>log("retryOK "+pid)).catch(()=>{});};
       document.addEventListener('touchstart',r,{once:true});
       document.addEventListener('click',r,{once:true});
     });
   };
 
-  // Connection state
   pc.onconnectionstatechange=()=>{
     log("PC "+pid+" conn="+pc.connectionState+" ice="+pc.iceConnectionState);
     const p=peerMap.get(pid); if(p)p.connState=pc.connectionState;
@@ -548,10 +541,7 @@ function setupPC(pc,pid){
       document.getElementById('vstat').textContent='Voice OK';
       log("CONNECTED "+pid+"!!");
     }
-    if(pc.connectionState==='failed'){
-      log("FAILED "+pid);
-      destroyPeer(pid);
-    }
+    if(pc.connectionState==='failed'){log("FAILED "+pid); destroyPeer(pid);}
   };
 
   pc.oniceconnectionstatechange=()=>{
@@ -617,7 +607,7 @@ function leaveCall(){
   document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#000;color:#fff;font-family:sans-serif"><h2>Left the call</h2></div>';
 }
 
-log("loaded myId="+MY_ID);
+log("page loaded");
 </script>
 </body>
 </html>"""
