@@ -1,18 +1,21 @@
 """
-Silent Hill Voice Call Bot — BEAST MODE
+Silent Hill Voice Call Bot — BEAST MODE v2
 ═══════════════════════════════════════════════════════════════════════════════
 KEY UPGRADES vs. previous version:
   • TURN over TLS (turns:443) — punches through aggressive MENA mobile firewalls
-  • iceTransportPolicy:'relay' fallback after 2 failures (forces TURN-only)
-  • Connection escalation: normal → ICE restart → full restart → relay-only
+  • iceTransportPolicy:'relay' fallback after 1 failure (forces TURN-only faster)
+  • Connection escalation: normal → fast ICE restart (6s timeout) → full restart → relay-only
   • Perfect Negotiation pattern (real, not the half-broken rollback-then-destroy)
   • WebSocket auto-reconnect with exponential backoff (network blips don't kill call)
   • Audio: echoCancellation + noiseSuppression + AGC + Opus tuning (DTX, FEC, 32kbps)
   • /turn endpoint — server-side TURN config with optional Metered/Twilio/Cloudflare
-  • RTCStats monitoring per peer (packet loss / jitter shown in debug)
+  • RTCStats monitoring per peer (packet loss / jitter shown in debug) — INBOUND + OUTBOUND
   • Speaking indicator (audio-level analyser) — shows who is talking
   • Wake Lock so phone screen doesn't sleep mid-call
   • SDP munging for Opus tuning (works on all browsers including iOS Safari)
+  • FAST relay fallback — 6s connection timeout + 4s disconnect retry + 4s stall detect
+  • Bidirectional relay escalation — both sides switch to TURN when either detects trouble
+  • Aggressive ICE error logging (onicecandidateerror) for instant STUN/TURN diagnostics
 
 ═══════════════════════════════════════════════════════════════════════════════
 GETTING REAL TURN CREDENTIALS (READ THIS — IT'S WHY ALGERIA FAILS):
@@ -560,13 +563,15 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 
 <script>
 // ════════════════════════════════════════════════════════════════════════════
-// SILENT HILL CLIENT — BEAST MODE
+// SILENT HILL CLIENT — BEAST MODE v2
 // Architecture:
 //   • Mesh WebRTC topology (good for ≤6 voice participants)
 //   • Server-assigned peer IDs prevent glare
 //   • Larger ID = offerer, Smaller ID = answerer (deterministic)
 //   • Perfect Negotiation pattern handles edge cases (renegotiation, ICE restart)
-//   • Connection escalation: normal → ICE restart → full restart → relay-only
+//   • Connection escalation: normal → fast ICE restart (6s) → full restart → relay-only
+//   • Bidirectional relay: both sides switch to TURN when quality degrades
+//   • Outbound stall detection — catches one-way-audio failures instantly
 // ════════════════════════════════════════════════════════════════════════════
 
 const ROOM = "__ROOM_ID__", TOKEN = "__TOKEN__";
@@ -579,7 +584,7 @@ let wakeLock = null;
 
 const peers = {};      // pid -> RTCPeerConnection
 const audios = {};     // pid -> HTMLAudioElement (PERSISTENT across PC rebuilds)
-const peerMap = new Map();    // pid -> {name, avatar, is_host, muted, connState, retries, speaking, recvLevel, lossPct, useRelay}
+const peerMap = new Map();    // pid -> {name, avatar, is_host, muted, connState, retries, speaking, recvLevel, lossPct, usedRelay}
 const iceBuffer = {};  // pid -> queued candidates received before setRemoteDescription
 const statsTimers = {}; // pid -> setInterval handle
 const inboundLevelTimers = {}; // pid -> setInterval for incoming audio level monitoring
@@ -615,7 +620,8 @@ function getPCConfig(forceRelay) {
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
     iceCandidatePoolSize: 4,
-    iceTransportPolicy: forceRelay ? 'relay' : 'all'
+    iceTransportPolicy: forceRelay ? 'relay' : 'all',
+    sdpSemantics: 'unified-plan'
   };
 }
 
@@ -770,6 +776,14 @@ function connectWS() {
 
       case 'peers':
         log("existing peers: " + m.peers.length);
+        // Clean up peers that are no longer present (server is source of truth)
+        const currentIds = new Set(m.peers.map(p => p.id));
+        for (const [id, _] of peerMap) {
+          if (!currentIds.has(id)) {
+            nukePeer(id);
+            peerMap.delete(id);
+          }
+        }
         for (const p of m.peers) {
           addPeer(p);
           // Larger ID always offers — guarantees no glare
@@ -813,12 +827,10 @@ function connectWS() {
 
       case 'request_relay':
         // Peer is asking us to switch this connection to relay-only mode.
-        // We honour it only if we're the larger-ID side (the offerer).
-        if (MY_ID > m.from) {
-          log("got relay request from " + m.from + " (" + (m.reason || '') + ")");
-          peerRelay[m.from] = true;
-          await switchPeerToRelay(m.from);
-        }
+        // We honour it regardless of ID — both sides should use relay for reliability.
+        log("got relay request from " + m.from + " (" + (m.reason || '') + ")");
+        peerRelay[m.from] = true;
+        await switchPeerToRelay(m.from);
         break;
 
       case 'mute_cmd':
@@ -866,12 +878,14 @@ function connectWS() {
 
 // ── Peer tracking ──
 function addPeer(p) {
-  peerMap.set(p.id, {
-    name: p.name, avatar: p.avatar || '',
-    is_host: p.is_host, muted: p.muted,
-    connState: 'new', retries: 0, speaking: false,
-    usedRelay: false
-  });
+  if (!peerMap.has(p.id)) {
+    peerMap.set(p.id, {
+      name: p.name, avatar: p.avatar || '',
+      is_host: p.is_host, muted: p.muted,
+      connState: 'new', retries: 0, speaking: false,
+      usedRelay: false
+    });
+  }
   if (p.is_host) log("peer " + p.id + " HOST");
   updCount();
   updPeers();
@@ -939,8 +953,62 @@ let _peerLevelTicker = null;
 // WEBRTC — Perfect Negotiation
 // ════════════════════════════════════════════════════════════════════════════
 
+function clearConnectionTimer(pc) {
+  if (pc && pc._connTimer) {
+    clearTimeout(pc._connTimer);
+    pc._connTimer = null;
+  }
+}
+
+function startConnectionTimer(pid) {
+  const pc = peers[pid];
+  if (!pc) return;
+  clearConnectionTimer(pc);
+  pc._connTimer = setTimeout(() => {
+    // Only act if this is still the same PC and it's not connected/closed
+    if (peers[pid] === pc && pc.connectionState !== 'connected' && pc.connectionState !== 'closed') {
+      log("CONN-TIMEOUT " + pid + " state=" + pc.connectionState + "/" + pc.iceConnectionState);
+      forceIceRestart(pid);
+    }
+  }, 6000);
+}
+
+async function forceIceRestart(pid) {
+  const pc = peers[pid];
+  if (!pc || pc.connectionState === 'closed') return;
+  const p = peerMap.get(pid);
+  if (!p || p._iceRestarting || p._retrying) return;
+  // If already checking/connecting, a restart is already in progress or just started
+  if (pc.iceConnectionState === 'checking' || pc.iceConnectionState === 'connecting') {
+    // Wait a bit then try again if still stuck
+    setTimeout(() => {
+      if (peers[pid] === pc && pc.connectionState !== 'connected' && pc.connectionState !== 'closed') {
+        log("FORCE-RETRY after ICE stall " + pid);
+        scheduleRetry(pid);
+      }
+    }, 3000);
+    return;
+  }
+  p._iceRestarting = true;
+  log("FAST ICE restart " + pid);
+  try {
+    const o = await pc.createOffer({ iceRestart: true });
+    o.sdp = preferOpusAndTune(o.sdp);
+    await pc.setLocalDescription(o);
+    ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
+    // Give this restart its own connection timer
+    startConnectionTimer(pid);
+  } catch (e) {
+    log("fast iceRestart fail: " + e.message);
+    scheduleRetry(pid);
+  } finally {
+    setTimeout(() => { if (p) p._iceRestarting = false; }, 3000);
+  }
+}
+
 function destroyPeer(pid, keepAudio) {
   if (peers[pid]) {
+    clearConnectionTimer(peers[pid]);
     try { peers[pid].close(); } catch (e) {}
     delete peers[pid];
   }
@@ -979,7 +1047,7 @@ function nukePeer(pid) {
 function shouldForceRelay(pid) {
   if (peerRelay[pid]) return true;
   const p = peerMap.get(pid);
-  return p && p.retries >= 2;
+  return p && p.retries >= 1; // was >= 2 — now faster relay fallback
 }
 
 async function createOffer(pid) {
@@ -999,6 +1067,8 @@ async function createOffer(pid) {
     await pc.setLocalDescription(offer);
     ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
     log("offer SENT " + pid);
+    // Start guard timer — if not connected in 6s, force ICE restart
+    startConnectionTimer(pid);
   } catch (e) {
     log("offer FAIL " + pid + ": " + e.message);
   }
@@ -1050,6 +1120,7 @@ async function handleOffer(from, sdp) {
       await existing.setLocalDescription(ans);
       ws.send(JSON.stringify({ type: 'webrtc_answer', to: from, sdp: existing.localDescription.sdp }));
       log("in-place answer SENT " + from);
+      startConnectionTimer(from);
       return;
     } catch (e) {
       log("in-place reneg FAIL " + from + ": " + e.message + " → fresh PC");
@@ -1082,6 +1153,7 @@ async function handleOffer(from, sdp) {
     await pc.setLocalDescription(ans);
     ws.send(JSON.stringify({ type: 'webrtc_answer', to: from, sdp: pc.localDescription.sdp }));
     log("answer SENT " + from);
+    startConnectionTimer(from);
   } catch (e) {
     log("answer FAIL " + from + ": " + e.message);
   }
@@ -1098,6 +1170,7 @@ async function handleAnswer(from, sdp) {
     }
     await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
     log("ans applied " + from);
+    startConnectionTimer(from);
   } catch (e) {
     log("ansErr " + from + ": " + e.message);
     scheduleRetry(from);
@@ -1158,6 +1231,33 @@ function preferOpusAndTune(sdp) {
       }
     }
   }
+
+  // Ensure audio section has sendrecv (critical for 2-way audio)
+  let audioStart = -1;
+  for (let i = 0; i < out.length; i++) {
+    if (out[i].startsWith('m=audio')) { audioStart = i; break; }
+  }
+  if (audioStart !== -1) {
+    let dirIdx = -1;
+    for (let i = audioStart + 1; i < out.length; i++) {
+      if (out[i].startsWith('m=')) break;
+      if (out[i].startsWith('a=sendonly') || out[i].startsWith('a=recvonly')) {
+        out[i] = 'a=sendrecv';
+        dirIdx = i;
+        break;
+      }
+    }
+    // Add bandwidth cap to audio section if not present
+    let hasAS = false;
+    for (let i = audioStart + 1; i < out.length; i++) {
+      if (out[i].startsWith('m=')) break;
+      if (out[i].startsWith('b=AS:')) { hasAS = true; break; }
+    }
+    if (!hasAS) {
+      out.splice(audioStart + 1, 0, 'b=AS:40');
+    }
+  }
+
   return out.join('\r\n');
 }
 
@@ -1242,6 +1342,13 @@ function setupPC(pc, pid) {
     }
   };
 
+  // NEW: Log STUN/TURN failures for instant diagnostics
+  pc.onicecandidateerror = e => {
+    if (e.errorCode >= 300 && e.errorCode <= 699) {
+      log("ICE-ERR " + pid + " code=" + e.errorCode + " host=" + (e.address || e.host || '') + ":" + (e.port || ''));
+    }
+  };
+
   pc.ontrack = e => {
     log("TRACK " + pid + " streams=" + e.streams.length);
     let a = audios[pid];
@@ -1260,7 +1367,7 @@ function setupPC(pc, pid) {
     a.muted = false;
     a.volume = 1.0;
 
-    const tryPlay = () => a.play().then(() => {
+    a.play().then(() => {
       log("PLAYING " + pid);
       audioUnlocked = true;
       hideAudioUnlockUI();
@@ -1270,7 +1377,6 @@ function setupPC(pc, pid) {
       // Show the unlock UI so user can tap to enable audio
       showAudioUnlockUI();
     });
-    tryPlay();
 
     // Start inbound audio-level monitoring for this peer.
     // This is the BEST diagnostic — if level is moving, audio is actually flowing.
@@ -1285,6 +1391,7 @@ function setupPC(pc, pid) {
     updPeers();
 
     if (pc.connectionState === 'connected') {
+      clearConnectionTimer(pc);
       document.getElementById('vstat').textContent = 'Voice OK';
       if (p) p.retries = 0;
       // Detect whether we're using relay (TURN) vs direct
@@ -1295,18 +1402,19 @@ function setupPC(pc, pid) {
 
     if (pc.connectionState === 'failed') {
       log("FAILED " + pid);
+      clearConnectionTimer(pc);
       scheduleRetry(pid);
     }
 
     if (pc.connectionState === 'disconnected') {
-      // Don't retry yet — disconnected often recovers on its own within 5-10s
+      // Don't retry yet — disconnected often recovers on its own within 4s
       log("DISCONNECTED " + pid + " — waiting briefly");
       setTimeout(() => {
         if (peers[pid] && peers[pid].connectionState === 'disconnected') {
           log("still disconnected " + pid + " → retry");
           scheduleRetry(pid);
         }
-      }, 8000);
+      }, 4000); // reduced from 8000 for faster recovery
     }
   };
 
@@ -1347,13 +1455,16 @@ async function detectRelay(pc, pid) {
 // ── Periodic stats with AUTO-QUALITY-DETECTION ──
 // Measures per-interval packet loss and triggers auto-relay when bad.
 // Two trigger conditions:
-//   1. Sustained high loss: >5% loss for 8+ seconds (12+ seconds at 4s tick)
-//   2. Audio stalled: 0 packets received for 6+ seconds while conn=connected
+//   1. Sustained high loss: >5% loss for 8+ seconds (2 intervals at 4s tick)
+//   2. Audio stalled: 0 packets received for 4+ seconds while conn=connected
+//   3. NEW: Outbound stalled — catches one-way audio failures
 function startStats(pc, pid) {
   if (statsTimers[pid]) clearInterval(statsTimers[pid]);
   let lastRecv = 0, lastLost = 0;
+  let lastSent = 0;
   let consecutiveBad = 0;     // count of consecutive 4s-intervals with >5% loss
   let consecutiveStalled = 0; // count of consecutive intervals with 0 incoming packets
+  let outboundStall = 0;      // count of consecutive intervals with 0 outgoing packets
 
   statsTimers[pid] = setInterval(async () => {
     if (!peers[pid] || peers[pid].connectionState === 'closed') {
@@ -1365,29 +1476,33 @@ function startStats(pc, pid) {
 
     try {
       const stats = await peers[pid].getStats();
-      let recv = 0, lost = 0, jitter = 0;
+      let recv = 0, lost = 0, jitter = 0, sent = 0;
       stats.forEach(r => {
         if (r.type === 'inbound-rtp' && r.kind === 'audio') {
           recv = r.packetsReceived || 0;
           lost = r.packetsLost || 0;
           jitter = r.jitter || 0;
         }
+        if (r.type === 'outbound-rtp' && r.kind === 'audio') {
+          sent = r.packetsSent || 0;
+        }
       });
       const dRecv = recv - lastRecv;
       const dLost = lost - lastLost;
       const total = dRecv + dLost;
       const lossPct = total > 0 ? (dLost / total) * 100 : 0;
-      lastRecv = recv; lastLost = lost;
+      const dSent = sent - lastSent;
+      lastRecv = recv; lastLost = lost; lastSent = sent;
 
       const p = peerMap.get(pid);
       if (p) { p.lossPct = lossPct; p.recvRate = dRecv / 4; }
 
-      log("STATS " + pid + " ΔR=" + dRecv + " ΔL=" + dLost + " (" + lossPct.toFixed(1) + "%) jit=" + jitter.toFixed(3));
+      log("STATS " + pid + " ΔR=" + dRecv + " ΔL=" + dLost + " (" + lossPct.toFixed(1) + "%) jit=" + jitter.toFixed(3) + " ΔS=" + dSent);
 
       // ── TRIGGER 1: Sustained packet loss > 5% ──
       if (lossPct > 5 && total > 30) {
         consecutiveBad++;
-        if (consecutiveBad >= 3 && !peerRelay[pid]) { // 3 × 4s = 12s of bad quality
+        if (consecutiveBad >= 2 && !peerRelay[pid]) { // 2 × 4s = 8s of bad quality (was 12s)
           requestRelaySwitch(pid, "loss=" + lossPct.toFixed(1) + "%");
           consecutiveBad = 0;
         }
@@ -1395,17 +1510,29 @@ function startStats(pc, pid) {
         consecutiveBad = 0;
       }
 
-      // ── TRIGGER 2: Audio stalled (0 packets for 8s while supposedly connected) ──
+      // ── TRIGGER 2: Audio stalled (0 packets for 4s while supposedly connected) ──
       // This catches the silent NAT-timeout failure mode where the connection
       // claims to be "connected" but no packets are flowing.
       if (dRecv === 0) {
         consecutiveStalled++;
-        if (consecutiveStalled >= 2 && !peerRelay[pid]) { // 2 × 4s = 8s of zero packets
-          requestRelaySwitch(pid, "stalled (0 pkts/8s)");
+        if (consecutiveStalled >= 1 && !peerRelay[pid]) { // 1 × 4s = 4s of zero packets (was 8s)
+          requestRelaySwitch(pid, "stalled (0 pkts/4s)");
           consecutiveStalled = 0;
         }
       } else {
         consecutiveStalled = 0;
+      }
+
+      // ── TRIGGER 3: Outbound stalled (0 packets sent for 8s while connected) ──
+      // Catches the one-way-audio case where we hear peer but peer can't hear us.
+      if (dSent === 0) {
+        outboundStall++;
+        if (outboundStall >= 2 && !peerRelay[pid]) { // 2 × 4s = 8s of zero outbound
+          requestRelaySwitch(pid, "outbound stalled (0 sent/8s)");
+          outboundStall = 0;
+        }
+      } else {
+        outboundStall = 0;
       }
     } catch (e) {}
   }, 4000); // tick every 4s for fast detection
@@ -1415,19 +1542,27 @@ function startStats(pc, pid) {
 async function scheduleRetry(pid) {
   const p = peerMap.get(pid);
   if (!p) return;
+  if (p._retrying) return; // already scheduled
+  p._retrying = true;
   p.retries = (p.retries || 0) + 1;
 
-  if (p.retries > 5) {
+  if (p.retries > 4) {  // was 5
     log("GIVE UP on " + pid);
+    p._retrying = false;
     destroyPeer(pid);
     return;
   }
 
-  const delay = Math.min(1500 * p.retries, 6000);
+  // ESCALATION: retry 1 = ICE restart, retry 2+ = full rebuild with relay-only
+  if (p.retries >= 2 && !peerRelay[pid]) {
+    peerRelay[pid] = true;  // force relay for this and all future attempts
+  }
+
+  const delay = Math.min(1000 * p.retries, 4000); // faster delays: 1s, 2s, 3s, 4s (was 1500 base)
   log("retry #" + p.retries + " in " + delay + "ms → " + pid);
   setTimeout(async () => {
-    if (!peerMap.has(pid)) return;
-    if (!ws || ws.readyState !== 1) return;
+    if (!peerMap.has(pid)) { p._retrying = false; return; }
+    if (!ws || ws.readyState !== 1) { p._retrying = false; return; }
 
     // Only larger-ID side initiates; smaller-ID side passively receives the new offer
     if (MY_ID > pid) {
@@ -1439,6 +1574,8 @@ async function scheduleRetry(pid) {
           o.sdp = preferOpusAndTune(o.sdp);
           await peers[pid].setLocalDescription(o);
           ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: peers[pid].localDescription.sdp }));
+          startConnectionTimer(pid);
+          p._retrying = false;
           return;
         } catch (e) { log("iceRestart fail: " + e.message); }
       }
@@ -1448,6 +1585,7 @@ async function scheduleRetry(pid) {
       destroyPeer(pid);
       log("smaller side: cleared stale PC for " + pid + ", waiting for offer");
     }
+    p._retrying = false;
   }, delay);
 }
 
@@ -1574,51 +1712,55 @@ function toggleMute() {
 // Triggered by startStats() when packet loss is high or audio stops flowing.
 // Cross-peer: smaller-ID side asks larger-ID side via WebSocket.
 // ════════════════════════════════════════════════════════════════════════════
-// ════════════════════════════════════════════════════════════════════════════
 
 async function requestRelaySwitch(pid, reason) {
   const p = peerMap.get(pid);
   if (!p) return;
   if (peerRelay[pid]) return; // already on relay
-  peerRelay[pid] = true; // mark this peer as needing relay
+  peerRelay[pid] = true;
   log("→ AUTO-RELAY for " + pid + " (" + reason + ")");
   if (MY_ID > pid) {
     // I'm the larger ID — I do the actual ICE restart with relay-only
     await switchPeerToRelay(pid);
+    // Also tell the smaller side to switch to relay (mutual relay = best reliability)
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'mutual-relay:' + reason }));
+    }
   } else {
     // I'm the smaller ID — ask my peer (larger) to do it
     if (ws && ws.readyState === 1) {
       ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: reason }));
-      log("relay switch requested from " + pid);
     }
   }
 }
 
 async function switchPeerToRelay(pid) {
+  // Smaller side should NOT create offers — destroy PC and wait for larger side's relay offer
+  if (MY_ID < pid) {
+    log("relay: smaller side destroying PC for " + pid);
+    destroyPeer(pid);
+    return;
+  }
+
   const pc = peers[pid];
   if (!pc) {
-    // No PC — just create one with relay mode (peerRelay[pid] is already true)
-    if (MY_ID > pid) await createOffer(pid);
+    await createOffer(pid);
     return;
   }
   try {
     // Update config first, then ICE-restart
-    pc.setConfiguration({
-      iceServers: ICE_SERVERS,
-      bundlePolicy: 'max-bundle',
-      rtcpMuxPolicy: 'require',
-      iceTransportPolicy: 'relay'
-    });
+    pc.setConfiguration(getPCConfig(true));
     const offer = await pc.createOffer({ iceRestart: true });
     offer.sdp = preferOpusAndTune(offer.sdp);
     await pc.setLocalDescription(offer);
     ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
     log("relay-mode offer SENT " + pid);
+    startConnectionTimer(pid);
   } catch (e) {
     log("setConfig fail " + pid + ": " + e.message + " → full rebuild");
     // Fallback: tear down and rebuild from scratch (peerRelay flag will force relay)
     destroyPeer(pid);
-    if (MY_ID > pid) await createOffer(pid);
+    await createOffer(pid);
   }
 }
 
@@ -1660,7 +1802,7 @@ async def keepalive():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot BEAST MODE | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot BEAST MODE v2 | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK}")
     # Pre-warm TURN cache so first call is fast
     servers = await get_ice_servers()
