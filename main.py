@@ -1009,10 +1009,13 @@ let _peerLevelTicker = null;
 // fresh offer/answer renegotiation to force the browser to rebuild transceivers.
 let _lastJitters = {}; // pid -> last jitter value
 let _zombieCounts = {};  // pid -> consecutive zombie intervals
+let _zombieCooldowns = {}; // pid -> timestamp of last zombie action (prevent rapid-fire)
 
 function checkZombiePeers() {
   peerMap.forEach((p, pid) => {
     if (p.connState !== 'connected') return;
+    // Cooldown: don't act more than once per 10s to prevent reneg storms
+    if (_zombieCooldowns[pid] && Date.now() - _zombieCooldowns[pid] < 10000) return;
     // If recvLevel has been 0 for a while and we know peer isn't muted,
     // the transceiver is likely dead. Trigger a renegotiation.
     if (!p.recvLevel || p.recvLevel < 0.005) {
@@ -1020,6 +1023,7 @@ function checkZombiePeers() {
       if (_zombieCounts[pid] >= 2) {
         log("ZOMBIE detected " + pid + " (no audio despite connected) → renegotiate");
         _zombieCounts[pid] = 0;
+        _zombieCooldowns[pid] = Date.now();
         if (MY_ID > pid) {
           // Force a full rebuild (not just ICE restart) to wake transceivers
           destroyPeer(pid);
@@ -1041,12 +1045,15 @@ function checkZombiePeers() {
 
 // Also hook into the stats timer to detect frozen jitter (another zombie sign)
 function detectFrozenJitter(pid, jitter) {
+  // Cooldown: don't act more than once per 10s
+  if (_zombieCooldowns[pid] && Date.now() - _zombieCooldowns[pid] < 10000) return false;
   const last = _lastJitters[pid];
   if (last !== undefined && jitter === last && jitter > 0) {
     // Jitter hasn't changed at all across two intervals while conn=connected
     // AND we're receiving 0 packets → zombie confirmed
     const p = peerMap.get(pid);
     if (p && p.connState === 'connected' && (!p.recvLevel || p.recvLevel < 0.005)) {
+      _zombieCooldowns[pid] = Date.now();
       return true;
     }
   }
@@ -1063,18 +1070,36 @@ function clearConnectionTimer(pc) {
     clearTimeout(pc._connTimer);
     pc._connTimer = null;
   }
+  if (pc) pc._connTimerFires = 0;
 }
 
+// Connection timer: fires 6s after a NEW PC is created (via createOffer).
+// Does NOT restart on answers or subsequent offers — only on the initial
+// connection attempt. This prevents the infinite loop where every answer
+// resets the timer and it fires again 6s later.
 function startConnectionTimer(pid) {
   const pc = peers[pid];
-  if (!pc) return;
-  clearConnectionTimer(pc);
+  if (!pc || pc._connTimer) return; // already running, don't restart
+  pc._connTimerFires = pc._connTimerFires || 0;
   pc._connTimer = setTimeout(() => {
+    pc._connTimer = null;
     // Only act if this is still the same PC and it's not connected/closed
-    if (peers[pid] === pc && pc.connectionState !== 'connected' && pc.connectionState !== 'closed') {
-      log("CONN-TIMEOUT " + pid + " state=" + pc.connectionState + "/" + pc.iceConnectionState);
-      forceIceRestart(pid);
+    if (peers[pid] !== pc || pc.connectionState === 'connected' || pc.connectionState === 'closed') {
+      return;
     }
+    // If checking/connecting, ICE is still working — give it more time
+    if (pc.iceConnectionState === 'checking' || pc.iceConnectionState === 'connecting') {
+      log("CONN-TIMEOUT " + pid + " still checking, waiting...");
+      return; // let it finish, timer will NOT re-arm (we already cleared it)
+    }
+    pc._connTimerFires++;
+    if (pc._connTimerFires > 2) {
+      log("CONN-TIMEOUT " + pid + " max fires reached, scheduling full retry");
+      scheduleRetry(pid);
+      return;
+    }
+    log("CONN-TIMEOUT " + pid + " state=" + pc.connectionState + "/" + pc.iceConnectionState);
+    forceIceRestart(pid);
   }, 6000);
 }
 
@@ -1085,13 +1110,11 @@ async function forceIceRestart(pid) {
   if (!p || p._iceRestarting || p._retrying) return;
   // If already checking/connecting, a restart is already in progress or just started
   if (pc.iceConnectionState === 'checking' || pc.iceConnectionState === 'connecting') {
-    // Wait a bit then try again if still stuck
-    setTimeout(() => {
-      if (peers[pid] === pc && pc.connectionState !== 'connected' && pc.connectionState !== 'closed') {
-        log("FORCE-RETRY after ICE stall " + pid);
-        scheduleRetry(pid);
-      }
-    }, 3000);
+    return; // wait for it to resolve
+  }
+  // If we have a remote offer pending, don't collide — let the negotiation complete
+  if (pc.signalingState === 'have-remote-offer') {
+    log("ICE restart skipped (have-remote-offer) " + pid);
     return;
   }
   p._iceRestarting = true;
@@ -1101,8 +1124,7 @@ async function forceIceRestart(pid) {
     o.sdp = preferOpusAndTune(o.sdp);
     await pc.setLocalDescription(o);
     ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
-    // Give this restart its own connection timer
-    startConnectionTimer(pid);
+    // DO NOT restart the connection timer here — we want it to fire once only
   } catch (e) {
     log("fast iceRestart fail: " + e.message);
     scheduleRetry(pid);
@@ -1225,7 +1247,6 @@ async function handleOffer(from, sdp) {
       await existing.setLocalDescription(ans);
       ws.send(JSON.stringify({ type: 'webrtc_answer', to: from, sdp: existing.localDescription.sdp }));
       log("in-place answer SENT " + from);
-      startConnectionTimer(from);
       return;
     } catch (e) {
       log("in-place reneg FAIL " + from + ": " + e.message + " → fresh PC");
@@ -1258,6 +1279,7 @@ async function handleOffer(from, sdp) {
     await pc.setLocalDescription(ans);
     ws.send(JSON.stringify({ type: 'webrtc_answer', to: from, sdp: pc.localDescription.sdp }));
     log("answer SENT " + from);
+    // Start guard timer on answerer side too (fresh PC from incoming offer)
     startConnectionTimer(from);
   } catch (e) {
     log("answer FAIL " + from + ": " + e.message);
@@ -1275,7 +1297,8 @@ async function handleAnswer(from, sdp) {
     }
     await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
     log("ans applied " + from);
-    startConnectionTimer(from);
+    // DO NOT restart connection timer on answer — the timer was started when
+    // the offer was created. Restarting it here causes infinite loops.
   } catch (e) {
     log("ansErr " + from + ": " + e.message);
     scheduleRetry(from);
