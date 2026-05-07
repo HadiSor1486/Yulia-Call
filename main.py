@@ -1,6 +1,6 @@
 """
 Silent Hill Voice Call Bot — Kyodo + WebRTC + Chat UI
-All bugs fixed: no dupes, audio works, avatars work, full debug.
+TURN servers added for bulletproof cross-country NAT traversal.
 """
 
 import asyncio, json, os, time, uuid, traceback
@@ -8,25 +8,16 @@ from datetime import datetime
 from typing import Any, Dict
 
 import aiohttp
-import httpx
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from uvicorn import Config, Server
 
-# ═══════════════════════════════════════════════════════════
-# KYODO
-# ═══════════════════════════════════════════════════════════
 try:
     from kyodo import ChatMessage, EventType, KyodoObjectTypes, AsyncClient as Client
     KYODO_OK = True
-    print("[INIT] kyodo OK")
 except ImportError as e:
     KYODO_OK = False
-    print(f"[INIT] kyodo FAILED: {e}")
 
-# ═══════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════
 EMAIL = os.getenv("BOT_EMAIL", "hadidaoud.ha@gmail.com")
 PASSWORD = os.getenv("BOT_PASSWORD", "yulia123")
 DEVICE_ID = os.getenv("BOT_DEVICE_ID", "870d649515ce700797d6a56965689f3aaa7d5e82dfdce994b239e00e37238184")
@@ -39,9 +30,6 @@ tokens: Dict[str, dict] = {}
 rooms: Dict[str, dict] = {}
 kyodo_client = None
 
-# ═══════════════════════════════════════════════════════════
-# JSON HELPERS
-# ═══════════════════════════════════════════════════════════
 def json_write(p: str, d: Any):
     with open(p, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
@@ -53,9 +41,6 @@ def json_read(p: str, default=None):
         with open(p, "r", encoding="utf-8") as f: return json.load(f)
     except Exception: return default
 
-# ═══════════════════════════════════════════════════════════
-# KYODO BOT
-# ═══════════════════════════════════════════════════════════
 async def run_kyodo_bot():
     global kyodo_client
     if not KYODO_OK:
@@ -84,23 +69,17 @@ async def run_kyodo_bot():
                         link = f"{WEB_APP_URL}/call/{rid}?t={tok}"
                         await kyodo_client.send_message(m.chatId,
                             f"Silent Hill Voice Session\n{link}\nTap to join the call.", m.circleId)
-                        print(f"[Kyodo] Room {rid} created")
                 except Exception as e:
                     print(f"[Kyodo] err: {e}")
             await kyodo_client.login(EMAIL, PASSWORD)
             print("[Kyodo] Logged in!")
             await kyodo_client.socket_wait()
-            print("[Kyodo] Socket closed, reconnecting...")
         except (KeyboardInterrupt, SystemExit): raise
         except Exception as e:
             print(f"[Kyodo] crash: {e}")
-            traceback.print_exc()
         backoff = 5 if time.time()-t0 > 300 else min(backoff*2, 120)
         await asyncio.sleep(backoff)
 
-# ═══════════════════════════════════════════════════════════
-# FASTAPI
-# ═══════════════════════════════════════════════════════════
 app = FastAPI()
 
 @app.get("/")
@@ -135,7 +114,7 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
         init = await asyncio.wait_for(ws.receive_json(), timeout=10)
         if init.get("type") == "join":
             name = init.get("name", "Unknown")[:30]
-            avatar = init.get("avatar", "")[:50000]  # cap base64 size
+            avatar = init.get("avatar", "")[:50000]
     except asyncio.TimeoutError:
         await ws.close(code=4002); return
 
@@ -145,14 +124,12 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
     existing = [p for p in room["peers"] if p != peer_id]
     print(f"[WS] {peer_id} ({name}) joined host={is_host}")
 
-    # Send history + existing peers
     await ws.send_json({"type": "history", "messages": json_read(room["chat_file"])[-100:]})
     peer_list = [{"id": p, "name": room["peers"][p]["name"], "avatar": room["peers"][p]["avatar"],
                   "is_host": room["peers"][p]["is_host"], "muted": room["peers"][p]["muted"]}
                  for p in existing]
     await ws.send_json({"type": "peers", "peers": peer_list})
 
-    # Notify others
     join_msg = {"type": "peer_joined",
                 "peer": {"id": peer_id, "name": name, "avatar": avatar,
                          "is_host": is_host, "muted": False}}
@@ -167,7 +144,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
         try: await room["peers"][p]["ws"].send_json(sys_msg)
         except: pass
 
-    # Main loop
     try:
         while True:
             msg = await ws.receive_json()
@@ -179,7 +155,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                       "name": name, "avatar": avatar, "text": text,
                       "time": datetime.now().isoformat()}
                 _append_msg(room_id, cm)
-                # Echo to sender (mark self) + broadcast to others
                 for p, pd in room["peers"].items():
                     try:
                         if p == peer_id:
@@ -229,9 +204,7 @@ def _append_msg(rid, msg):
     m.append(msg)
     json_write(p, m)
 
-# ═══════════════════════════════════════════════════════════
-# HTML — Fixed: no dupes, audio plays on mobile
-# ═══════════════════════════════════════════════════════════
+
 CALL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -271,7 +244,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .msg-bubble{padding:8px 14px;border-radius:18px;font-size:14px;line-height:1.4;word-break:break-word;white-space:pre-wrap}
 .msg-row.other .msg-bubble{background:#2c2c2e;border-bottom-left-radius:4px}
 .msg-row.self .msg-bubble{background:#007aff;border-bottom-right-radius:4px}
-.voice-bar{position:relative;z-index:10;background:rgba(28,28,30,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:10px 16px;display:flex;align-items:center;justify-content:center;gap:24px;flex-shrink:0}
+.voice-bar{position:relative;z-index:10;background:rgba(28,28,30,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:10px 16px;display:flex;align-items:center;justify-content:center;gap:20px;flex-shrink:0}
 .voice-btn{width:48px;height:48px;border-radius:50%;border:none;display:flex;align-items:center;justify-content:center;font-size:22px;cursor:pointer;transition:.2s}
 .voice-btn.mute{background:#3a3a3c;color:#fff}
 .voice-btn.mute.muted{background:#ff3b30;color:#fff}
@@ -295,6 +268,12 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .av-in{display:none}
 .debug{position:fixed;top:0;left:0;right:0;z-index:200;background:rgba(0,0,0,.92);color:#0f0;font:11px monospace;padding:4px;max-height:100px;overflow-y:auto;display:none;white-space:pre-wrap}
 .debug.show{display:block}
+.peer-status{display:flex;gap:6px;align-items:center;overflow-x:auto;padding:4px 12px}
+.peer-status::-webkit-scrollbar{display:none}
+.p-s{flex-shrink:0;display:flex;align-items:center;gap:4px;background:rgba(255,255,255,0.08);padding:4px 10px;border-radius:12px;font-size:11px}
+.p-s .dot{width:8px;height:8px;border-radius:50%;background:#8e8e93}
+.p-s .dot.conn{background:#34c759}
+.p-s .dot.fail{background:#ff3b30}
 .hidden{display:none!important}
 </style>
 </head>
@@ -322,6 +301,9 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 <div class="group-info"><div class="group-name">Silent Hill</div><div class="group-meta" id="mcount">0 in call</div></div>
 <button class="menu-btn" onclick="document.getElementById('dbg').classList.toggle('show')">&#8942;</button>
 </div>
+
+<div class="peer-status" id="pstat"></div>
+
 <div class="messages" id="msgs"></div>
 <div class="voice-bar">
 <button class="voice-btn mute" id="muteBtn" onclick="toggleMute()">&#127908;</button>
@@ -340,7 +322,20 @@ const ROOM="__ROOM_ID__",TOKEN="__TOKEN__";
 let ws=null,localStream=null,myName="",myAvatar="",isMuted=false,isHost=false;
 const peers={},audios={};
 const peerMap=new Map();
-const ICE={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]};
+
+// ═══════════════════════════════════════════
+// TURN + STUN — Bulletproof NAT traversal
+// ═══════════════════════════════════════════
+const ICE={iceServers:[
+  // Public STUN (Google)
+  {urls:'stun:stun.l.google.com:19302'},
+  {urls:'stun:stun1.l.google.com:19302'},
+  {urls:'stun:stun2.l.google.com:19302'},
+  // TURN via Open Relay (free, relays when STUN fails)
+  {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}
+]};
 
 // ── DEBUG ──
 function log(m){
@@ -355,7 +350,7 @@ if(d)d.textContent+=line+'\n';
 function pickAv(e){
 const f=e.target.files[0]; if(!f)return;
 const r=new FileReader();
-r.onload=ev=>{myAvatar=ev.target.result; document.getElementById('avPrev').innerHTML='<img src="'+myAvatar+'">'; log("avatar loaded")};
+r.onload=ev=>{myAvatar=ev.target.result; document.getElementById('avPrev').innerHTML='<img src="'+myAvatar+'">'; log("avatar OK")};
 r.readAsDataURL(f);
 }
 document.getElementById('nameIn').addEventListener('input',e=>{myName=e.target.value; if(!myAvatar)document.getElementById('avInit').textContent=myName?myName[0].toUpperCase():'?';});
@@ -393,7 +388,7 @@ case 'history': m.messages.forEach(renderMsg); break;
 case 'chat': renderMsg(m); break;
 case 'peers': log("peers:"+m.peers.length); m.peers.forEach(p=>{addPeer(p); createOffer(p.id);}); break;
 case 'peer_joined': addPeer(m.peer); renderSys(m.peer.name+" joined"); break;
-case 'peer_left': removePeerAudio(m.peer_id); peerMap.delete(m.peer_id); renderSys(m.name+' left'); updCount(); break;
+case 'peer_left': removePeerAudio(m.peer_id); peerMap.delete(m.peer_id); renderSys(m.name+' left'); updCount(); updPeers(); break;
 case 'webrtc_offer': await handleOffer(m.from,m.sdp); break;
 case 'webrtc_answer': await handleAnswer(m.from,m.sdp); break;
 case 'webrtc_ice': await handleIce(m.from,m.candidate); break;
@@ -406,8 +401,22 @@ ws.onclose=e=>{log("WS close "+e.code); cleanupRTC();};
 ws.onerror=e=>{log("WS err"); document.getElementById('vstat').textContent='Error';};
 }
 
-function addPeer(p){peerMap.set(p.id,{name:p.name,avatar:p.avatar||'',is_host:p.is_host,muted:p.muted}); if(p.is_host)log("peer "+p.id+" is HOST"); updCount();}
+function addPeer(p){peerMap.set(p.id,{name:p.name,avatar:p.avatar||'',is_host:p.is_host,muted:p.muted,connState:'connecting'}); if(p.is_host)log("peer "+p.id+" is HOST"); updCount(); updPeers();}
 function updCount(){document.getElementById('mcount').textContent=(peerMap.size+1)+' in call';}
+
+// ── PEER STATUS BAR ──
+function updPeers(){
+const el=document.getElementById('pstat');
+let h='';
+// Self
+const selfDot=isMuted?'fail':'conn';
+h+='<div class="p-s"><div class="dot '+selfDot+'"></div>'+esc(myName)+'(You)</div>';
+peerMap.forEach((p,id)=>{
+ const dot=p.connState==='connected'?'conn':(p.connState==='failed'?'fail':'');
+ h+='<div class="p-s"><div class="dot '+dot+'"></div>'+esc(p.name)+'</div>';
+});
+el.innerHTML=h;
+}
 
 // ── WEBRTC ──
 async function createOffer(pid){
@@ -452,57 +461,70 @@ const pc=peers[from]; if(pc&&cand)await pc.addIceCandidate(new RTCIceCandidate(c
 }
 
 function setupPC(pc,pid){
-// Forward ICE candidates
+// ICE candidate forwarding
 pc.onicecandidate=e=>{if(e.candidate&&ws&&ws.readyState===1)ws.send(JSON.stringify({type:'webrtc_ice',to:pid,candidate:e.candidate}));};
 
-// RECEIVE AUDIO — this is the critical fix for mobile
+// Track received = audio incoming
 pc.ontrack=e=>{
-log("TRACK from "+pid+"! streams="+e.streams.length+" tracks="+e.streams[0].getTracks().length);
+log("TRACK from "+pid+" streams="+e.streams.length);
 let a=audios[pid];
 if(!a){
 a=new Audio();
 a.autoplay=true;
-a.playsInline=true;  // REQUIRED for iOS Safari
+a.playsInline=true;
 a.volume=1.0;
-// Unlock audio context on first track
+// iOS AudioContext unlock
 if(window.AudioContext||window.webkitAudioContext){
-const Ctx=window.AudioContext||window.webkitAudioContext;
-if(Ctx.prototype.resume){
-const dummy=new Ctx();
-dummy.resume().then(()=>dummy.close());
-}
+ const C=window.AudioContext||window.webkitAudioContext;
+ const d=new C(); d.resume().then(()=>d.close());
 }
 audios[pid]=a;
-log("audio el created");
+log("audio el for "+pid);
 }
 a.srcObject=e.streams[0];
-// Force play — critical for mobile browsers
-a.play().then(()=>log("PLAYING audio from "+pid)).catch(err=>{
-log("play err: "+err.message);
-// Retry on user interaction
-const retry=()=>{a.play().then(()=>log("retry OK")).catch(()=>{}); document.removeEventListener('touchstart',retry); document.removeEventListener('click',retry);};
-document.addEventListener('touchstart',retry,{once:true});
-document.addEventListener('click',retry,{once:true});
+a.play().then(()=>log("PLAYING "+pid)).catch(err=>{
+ log("play err "+pid+": "+err.message);
+ // Unlock on any touch
+ const r=()=>{a.play().then(()=>log("retry OK "+pid)).catch(()=>{});};
+ document.addEventListener('touchstart',r,{once:true});
+ document.addEventListener('click',r,{once:true});
 });
 };
 
+// Connection state — critical debug
 pc.onconnectionstatechange=()=>{
-log("PC "+pid+"="+pc.connectionState);
-if(pc.connectionState==='connected')document.getElementById('vstat').textContent='Voice OK';
-if(pc.connectionState==='failed'||pc.connectionState==='closed'){removePeerAudio(pid);}
+log("PC "+pid+" conn="+pc.connectionState+" ice="+pc.iceConnectionState);
+const p=peerMap.get(pid); if(p)p.connState=pc.connectionState;
+updPeers();
+if(pc.connectionState==='connected'){
+ document.getElementById('vstat').textContent='Voice OK';
+ log("VOICE CONNECTED with "+pid);
+}
+if(pc.connectionState==='failed'||pc.connectionState==='closed'){
+ removePeerAudio(pid);
+}
+};
+
+pc.oniceconnectionstatechange=()=>{
+ log("PC "+pid+" ICE="+pc.iceConnectionState);
+ const p=peerMap.get(pid); if(p)p.connState=pc.connectionState;
+ updPeers();
 };
 }
 
 function removePeerAudio(pid){
 if(peers[pid]){peers[pid].close(); delete peers[pid];}
 if(audios[pid]){audios[pid].pause(); audios[pid].srcObject=null; delete audios[pid];}
+const p=peerMap.get(pid); if(p)p.connState='closed';
+updPeers();
 }
 function cleanupRTC(){
-Object.keys(peers).forEach(removePeerAudio);
+Object.keys(peers).forEach(pid=>{if(peers[pid])peers[pid].close(); delete peers[pid];});
+Object.keys(audios).forEach(pid=>{if(audios[pid]){audios[pid].pause(); audios[pid].srcObject=null; delete audios[pid];}});
 if(localStream){localStream.getTracks().forEach(t=>t.stop()); localStream=null;}
 }
 
-// ── CHAT RENDER — NO optimistic render, server handles everything ──
+// ── CHAT ──
 function renderMsg(m){
 const c=document.getElementById('msgs'); if(!c)return;
 if(m.kind==='system'){
@@ -539,7 +561,6 @@ const d=document.createElement('div'); d.className='msg-system'; d.textContent=t
 function scroll(){const e=document.getElementById('msgs'); e.scrollTop=e.scrollHeight;}
 function esc(t){const d=document.createElement('div'); d.textContent=t||''; return d.innerHTML;}
 
-// ── SEND — server echoes back, NO local optimistic render ──
 function sendMsg(){
 const inEl=document.getElementById('msgIn');
 const text=inEl.value.trim();
@@ -547,11 +568,8 @@ if(!text||!ws||ws.readyState!==1)return;
 log("send: "+text.substring(0,30));
 ws.send(JSON.stringify({type:'chat',text:text}));
 inEl.value='';
-// NOTE: we do NOT render locally. Server sends the message back to us
-// with "self": true, and renderMsg() handles it. This prevents duplicates.
 }
 
-// ── MUTE / LEAVE ──
 function toggleMute(){
 if(!localStream)return;
 isMuted=!isMuted;
@@ -560,6 +578,7 @@ const b=document.getElementById('muteBtn');
 if(isMuted){b.classList.add('muted'); b.innerHTML='&#128263;'; document.getElementById('vstat').textContent='Muted'; log("muted");}
 else{b.classList.remove('muted'); b.innerHTML='&#127908;'; document.getElementById('vstat').textContent='Connected'; log("unmuted");}
 if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:isMuted?'mute_me':'unmute_me'}));
+updPeers();
 }
 
 function leaveCall(){
@@ -574,10 +593,6 @@ log("loaded");
 </script>
 </body>
 </html>"""
-
-# ═══════════════════════════════════════════════════════════
-# KEEPALIVE + MAIN
-# ═══════════════════════════════════════════════════════════
 
 async def keepalive():
     await asyncio.sleep(30)
