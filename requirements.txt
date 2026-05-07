@@ -4,3 +4,4 @@ aiohttp
 httpx
 pillow
 kyodo==1.7.2
+packaging
