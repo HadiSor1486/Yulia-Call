@@ -19,14 +19,14 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from uvicorn import Config, Server
 
 # ═══════════════════════════════════════════════════════════
-# KYODO IMPORT (kyodo 1.7.2 — AsyncClient)
+# KYODO IMPORT (kyodo 1.7.2 — exact match to working bot)
 # ═══════════════════════════════════════════════════════════
 try:
-    from kyodo import AsyncClient, ChatMessage, EventType
+    from kyodo import ChatMessage, EventType, KyodoObjectTypes, AsyncClient as Client
     KYODO_AVAILABLE = True
-except ImportError:
+except ImportError as _e:
     KYODO_AVAILABLE = False
-    print("[WARN] kyodo library not found — bot will not send links to Kyodo")
+    print("[WARN] kyodo import failed: " + str(_e))
 
 # ═══════════════════════════════════════════════════════════
 # CONFIG
@@ -59,7 +59,7 @@ async def run_kyodo_bot():
         while True:
             await asyncio.sleep(3600)
     
-    kyodo_client = AsyncClient(deviceId=DEVICE_ID)
+    kyodo_client = Client(deviceId=DEVICE_ID)
     
     @kyodo_client.middleware(EventType.ChatMessage)
     async def self_filter(message: ChatMessage):
