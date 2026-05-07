@@ -483,6 +483,17 @@ async function createOffer(pid,iceRestart=false){
 
 async function handleOffer(from,sdp){
   log("offer<-"+from);
+  // POLITE PEER: if we already have a pending local offer, only smaller ID rolls back
+  const existing=peers[from];
+  if(existing&&existing.signalingState==='have-local-offer'){
+    if(MY_ID > from){
+      log("offer IGNORED "+from+" (impolite, have-local-offer)");
+      return; // impolite peer ignores incoming offer when we have pending offer
+    }
+    // polite peer: roll back and accept the incoming offer
+    log("offer ROLLBACK "+from);
+    try{await existing.setLocalDescription({type:'rollback'});}catch(e){}
+  }
   destroyPeer(from);
   try{
     const pc=new RTCPeerConnection(getPCConfig());
@@ -510,6 +521,11 @@ async function handleAnswer(from,sdp){
   log("ans<-"+from);
   try{
     const pc=peers[from]; if(!pc){log("no PC for ans"+from);return;}
+    // Guard: only accept answer if we're expecting one
+    if(pc.signalingState!=='have-local-offer'){
+      log("ans SKIP "+from+" state="+pc.signalingState);
+      return;
+    }
     await pc.setRemoteDescription(new RTCSessionDescription({type:'answer',sdp}));
     log("ans OK "+from);
   }catch(e){log("ansErr "+from+": "+e.message); destroyPeer(from);}
@@ -574,22 +590,18 @@ function setupPC(pc,pid){
     if(pc.connectionState==='failed'){
       log("FAILED "+pid);
       destroyPeer(pid);
-      // BOTH sides retry with iceRestart; glare fix (MY_ID>pid) prevents dual offer
+      // Only larger ID retries — glare-free, prevents collision
       const p=peerMap.get(pid);
       if(p) p.retries=(p.retries||0)+1;
       setTimeout(()=>{
         if(MY_ID && pid && ws && ws.readyState===1){
           const peer=peerMap.get(pid);
-          if(!peer || peer.retries >= 4) return;
-          if(MY_ID > pid){
+          if(MY_ID > pid && peer && peer.retries < 4){
             log("RETRY offer->"+pid+" (#"+peer.retries+")");
             createOffer(pid,true);
-          }else{
-            log("RETRY ansOffer->"+pid+" (#"+peer.retries+")");
-            createOffer(pid,true); // answerer can also initiate
           }
         }
-      },1500);
+      },2000);
     }
   };
 
