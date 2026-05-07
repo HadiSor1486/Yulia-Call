@@ -582,10 +582,13 @@ let wsRetries = 0;
 let wakeLock = null;
 
 const peers = {};      // pid -> RTCPeerConnection
-const audios = {};     // pid -> HTMLAudioElement
-const peerMap = new Map();    // pid -> {name, avatar, is_host, muted, connState, retries, speaking}
+const audios = {};     // pid -> HTMLAudioElement (PERSISTENT across PC rebuilds)
+const peerMap = new Map();    // pid -> {name, avatar, is_host, muted, connState, retries, speaking, recvLevel}
 const iceBuffer = {};  // pid -> queued candidates received before setRemoteDescription
 const statsTimers = {}; // pid -> setInterval handle
+const inboundLevelTimers = {}; // pid -> setInterval for incoming audio level monitoring
+let remoteAudioCtx = null; // Shared AudioContext for analysing INCOMING streams
+let audioUnlocked = false; // tracks whether play() has succeeded at least once
 
 let ICE_SERVERS = [
   // Default fallback if /turn endpoint fails — these are hardcoded
@@ -694,6 +697,22 @@ async function doJoin() {
   document.getElementById('joinBtn').disabled = true;
   document.getElementById('joinBtn').textContent = "...";
 
+  // CRITICAL: Use the join-button click as the gesture to unlock AudioContext.
+  // Mobile browsers require a user gesture to start audio playback. Doing this
+  // here means by the time remote streams arrive, audio is already unlocked.
+  try {
+    remoteAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (remoteAudioCtx.state === 'suspended') await remoteAudioCtx.resume();
+    // Play a 100ms silent buffer to fully arm autoplay
+    const silentBuf = remoteAudioCtx.createBuffer(1, remoteAudioCtx.sampleRate * 0.1, remoteAudioCtx.sampleRate);
+    const silentSrc = remoteAudioCtx.createBufferSource();
+    silentSrc.buffer = silentBuf;
+    silentSrc.connect(remoteAudioCtx.destination);
+    silentSrc.start();
+    audioUnlocked = true;
+    log("audio unlocked");
+  } catch (e) { log("audio unlock fail: " + e.message); }
+
   await fetchIceServers();
 
   try {
@@ -708,6 +727,11 @@ async function doJoin() {
   document.getElementById('joinOvl').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
   acquireWakeLock();
+
+  // Start lightweight ticker that updates the audio-level bars next to each peer name
+  if (_peerLevelTicker) clearInterval(_peerLevelTicker);
+  _peerLevelTicker = setInterval(updPeerLevels, 150);
+
   connectWS();
 }
 
@@ -772,7 +796,7 @@ function connectWS() {
         break;
 
       case 'peer_left':
-        destroyPeer(m.peer_id);
+        nukePeer(m.peer_id);
         peerMap.delete(m.peer_id);
         renderSys(m.name + ' left');
         updCount();
@@ -859,31 +883,78 @@ function updPeers() {
     if (p.connState === 'connected') dot = p.usedRelay ? 'relay' : 'conn';
     else if (p.connState === 'failed' || p.connState === 'closed') dot = 'fail';
     else if (p.connState === 'connecting' || p.connState === 'checking' || p.connState === 'new') dot = 'connecting';
-    const speakClass = p.speaking ? ' speaking' : '';
+    // Glow if EITHER sender signals speaking via WS OR we're actually hearing audio.
+    // The second condition is the real proof that audio is flowing through WebRTC.
+    const speakClass = (p.speaking || p.actuallyHeard) ? ' speaking' : '';
     const muteIcon = p.muted ? ' 🔇' : '';
-    h += '<div class="p-s' + speakClass + '"><div class="dot ' + dot + '"></div>' + esc(p.name) + muteIcon + '</div>';
+    // Mini audio level bar shows inbound signal — if this stays empty while
+    // the green dot says speaking, audio path is broken (TURN/codec/etc).
+    const levelPct = Math.min(100, Math.round((p.recvLevel || 0) * 200));
+    const levelBar = p.connState === 'connected'
+      ? '<span style="display:inline-block;width:24px;height:4px;background:rgba(255,255,255,0.15);border-radius:2px;margin-left:4px;vertical-align:middle;overflow:hidden"><span style="display:block;width:' + levelPct + '%;height:100%;background:#34c759;transition:width .1s"></span></span>'
+      : '';
+    h += '<div class="p-s' + speakClass + '" data-pid="' + id + '"><div class="dot ' + dot + '"></div>' + esc(p.name) + muteIcon + levelBar + '</div>';
   });
   el.innerHTML = h;
 }
+
+// Lightweight ticker to refresh level bars without full re-render.
+// Only updates the inner level <span> width, not the surrounding elements.
+function updPeerLevels() {
+  const el = document.getElementById('pstat');
+  if (!el) return;
+  el.querySelectorAll('[data-pid]').forEach(div => {
+    const pid = div.getAttribute('data-pid');
+    const p = peerMap.get(pid);
+    if (!p) return;
+    const innerBar = div.querySelector('span > span');
+    if (innerBar) {
+      const lvl = Math.min(100, Math.round((p.recvLevel || 0) * 200));
+      innerBar.style.width = lvl + '%';
+    }
+    // Also toggle the speaking class without rebuilding HTML
+    const isActive = p.speaking || p.actuallyHeard;
+    if (isActive && !div.classList.contains('speaking')) div.classList.add('speaking');
+    else if (!isActive && div.classList.contains('speaking')) div.classList.remove('speaking');
+  });
+}
+let _peerLevelTicker = null;
 
 // ════════════════════════════════════════════════════════════════════════════
 // WEBRTC — Perfect Negotiation
 // ════════════════════════════════════════════════════════════════════════════
 
-function destroyPeer(pid) {
+function destroyPeer(pid, keepAudio) {
   if (peers[pid]) {
     try { peers[pid].close(); } catch (e) {}
     delete peers[pid];
   }
-  if (audios[pid]) {
-    try { audios[pid].pause(); audios[pid].srcObject = null; audios[pid].remove(); } catch (e) {}
-    delete audios[pid];
+  // CRITICAL: We do NOT remove the audio element by default.
+  // Reusing the same <audio> element across PC rebuilds means the browser's
+  // "user gesture activation" for autoplay carries over — play() will succeed
+  // immediately when the new track arrives, instead of getting blocked.
+  if (audios[pid] && !keepAudio) {
+    try { audios[pid].srcObject = null; } catch (e) {}
+    // Note: deliberately not calling .remove() or deleting from `audios` map
   }
   if (statsTimers[pid]) {
     clearInterval(statsTimers[pid]);
     delete statsTimers[pid];
   }
+  if (inboundLevelTimers[pid]) {
+    clearInterval(inboundLevelTimers[pid]);
+    delete inboundLevelTimers[pid];
+  }
   delete iceBuffer[pid];
+}
+
+// Full nuke — call ONLY when the peer leaves the call entirely
+function nukePeer(pid) {
+  destroyPeer(pid);
+  if (audios[pid]) {
+    try { audios[pid].pause(); audios[pid].srcObject = null; audios[pid].remove(); } catch (e) {}
+    delete audios[pid];
+  }
 }
 
 // Decide whether to use relay-only mode for this peer
@@ -907,9 +978,6 @@ async function createOffer(pid) {
     peers[pid] = pc;
     if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-    // Tweak transceiver direction: we both send and receive audio
-    pc.getTransceivers().forEach(tr => { tr.direction = 'sendrecv'; });
-
     const offer = await pc.createOffer();
     offer.sdp = preferOpusAndTune(offer.sdp);
     await pc.setLocalDescription(offer);
@@ -924,42 +992,45 @@ async function handleOffer(from, sdp) {
   log("offer←" + from);
   const existing = peers[from];
 
-  // Perfect Negotiation: detect collision
-  // If we already have a local offer outstanding AND we are the impolite peer (larger ID),
-  // ignore the incoming offer. The polite peer (smaller ID) will accept theirs.
-  // In practice this shouldn't happen because larger always offers, but handle it for ICE-restart edge.
-  if (existing && existing.signalingState === 'have-local-offer') {
-    if (MY_ID > from) {
-      log("collision: I'm impolite, ignoring offer from " + from);
-      return;
-    }
-    // Polite path: rollback + reuse the same PC (DON'T destroy)
-    log("collision: I'm polite, rolling back");
+  // Path A: Existing PC is healthy or in-progress → renegotiate IN PLACE.
+  // This is the key fix. Even if we get rapid/stray offers, we don't tear
+  // down the working connection and the audio element keeps playing.
+  if (existing && existing.signalingState !== 'closed' && existing.connectionState !== 'failed') {
     try {
-      await Promise.all([
-        existing.setLocalDescription({ type: 'rollback' }),
-        existing.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }))
-      ]);
-      // flush buffered ICE
+      // Glare guard: if WE have a local offer pending, only the smaller-ID
+      // (polite) side rolls back. Larger-ID (impolite) ignores incoming offer.
+      if (existing.signalingState === 'have-local-offer') {
+        if (MY_ID > from) {
+          log("collision: I'm impolite, ignoring offer from " + from);
+          return;
+        }
+        log("collision: polite rollback for " + from);
+        await existing.setLocalDescription({ type: 'rollback' });
+      }
+
+      await existing.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
+
+      // Flush any ICE candidates that arrived before remoteDescription was set
       if (iceBuffer[from]) {
         for (const c of iceBuffer[from]) {
           try { await existing.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
         }
         delete iceBuffer[from];
       }
-      const a = await existing.createAnswer();
-      a.sdp = preferOpusAndTune(a.sdp);
-      await existing.setLocalDescription(a);
+
+      const ans = await existing.createAnswer();
+      ans.sdp = preferOpusAndTune(ans.sdp);
+      await existing.setLocalDescription(ans);
       ws.send(JSON.stringify({ type: 'webrtc_answer', to: from, sdp: existing.localDescription.sdp }));
-      log("rollback answer SENT " + from);
+      log("in-place answer SENT " + from);
       return;
     } catch (e) {
-      log("rollback FAIL: " + e.message + " → fresh PC");
-      // fall through to fresh-PC path
+      log("in-place reneg FAIL " + from + ": " + e.message + " → fresh PC");
+      // Fall through to fresh-PC path
     }
   }
 
-  // Standard answerer path: destroy any stale PC, build fresh one
+  // Path B: No existing PC (or it's broken) → build fresh one
   destroyPeer(from);
   try {
     const pc = new RTCPeerConnection(getPCConfig(shouldForceRelay(from)));
@@ -1063,6 +1134,79 @@ function preferOpusAndTune(sdp) {
   return out.join('\r\n');
 }
 
+// ── Inbound audio level monitoring ──
+// This taps the RECEIVED stream (after WebRTC) and analyses it.
+// If level > 0, audio IS arriving and being decoded.
+// If level stays 0 despite sender showing as speaking → audio path is broken.
+function startInboundLevel(stream, pid) {
+  // Stop any previous monitor for this peer
+  if (inboundLevelTimers[pid]) {
+    clearInterval(inboundLevelTimers[pid]);
+    delete inboundLevelTimers[pid];
+  }
+  try {
+    if (!remoteAudioCtx) {
+      remoteAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (remoteAudioCtx.state === 'suspended') {
+      remoteAudioCtx.resume().catch(() => {});
+    }
+    const src = remoteAudioCtx.createMediaStreamSource(stream);
+    const analyser = remoteAudioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    src.connect(analyser);
+    // IMPORTANT: do NOT connect analyser to destination — that would double-play.
+    // The <audio> element is responsible for actual playback.
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    inboundLevelTimers[pid] = setInterval(() => {
+      analyser.getByteFrequencyData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i];
+      const level = sum / data.length / 255;
+      const p = peerMap.get(pid);
+      if (p) {
+        p.recvLevel = level;
+        // If we're receiving audio, mark them as actively heard
+        p.actuallyHeard = level > 0.02;
+      }
+    }, 200);
+  } catch (e) {
+    log("inboundLevel fail " + pid + ": " + e.message);
+  }
+}
+
+// ── Audio unlock UI ──
+// Shows a banner the user can tap to recover from autoplay blocks
+function showAudioUnlockUI() {
+  let el = document.getElementById('audioUnlock');
+  if (el) return;
+  el = document.createElement('div');
+  el.id = 'audioUnlock';
+  el.style.cssText = 'position:fixed;top:50px;left:10px;right:10px;z-index:150;background:#ff9500;color:#000;padding:14px;border-radius:12px;text-align:center;font-weight:600;font-size:14px;cursor:pointer;animation:msgIn .3s';
+  el.textContent = '🔊 Tap here to enable sound';
+  el.onclick = () => {
+    log("audio unlock tapped");
+    if (remoteAudioCtx && remoteAudioCtx.state === 'suspended') {
+      remoteAudioCtx.resume().catch(() => {});
+    }
+    Object.values(audios).forEach(a => {
+      try {
+        a.muted = false;
+        a.volume = 1.0;
+        a.play().catch(() => {});
+      } catch (e) {}
+    });
+    audioUnlocked = true;
+    hideAudioUnlockUI();
+  };
+  document.body.appendChild(el);
+}
+
+function hideAudioUnlockUI() {
+  const el = document.getElementById('audioUnlock');
+  if (el) el.remove();
+}
+
 // ── PC event wiring ──
 function setupPC(pc, pid) {
   pc.onicecandidate = e => {
@@ -1079,20 +1223,32 @@ function setupPC(pc, pid) {
       a.autoplay = true;
       a.playsInline = true;
       a.volume = 1.0;
+      a.muted = false; // explicit, in case some browser default flips this
       a.style.display = 'none';
       document.body.appendChild(a);
       audios[pid] = a;
     }
+    // Always update srcObject (might be a renegotiated stream)
     a.srcObject = e.streams[0];
-    a.play().then(() => {
+    a.muted = false;
+    a.volume = 1.0;
+
+    const tryPlay = () => a.play().then(() => {
       log("PLAYING " + pid);
+      audioUnlocked = true;
+      hideAudioUnlockUI();
       document.getElementById('vstat').textContent = 'Voice OK';
-    }).catch(() => {
-      log("playBlock " + pid + " — waiting for user gesture");
-      const r = () => { a.play().catch(() => {}); };
-      document.addEventListener('touchstart', r, { once: true });
-      document.addEventListener('click', r, { once: true });
+    }).catch(err => {
+      log("playBlock " + pid + ": " + err.name);
+      // Show the unlock UI so user can tap to enable audio
+      showAudioUnlockUI();
     });
+    tryPlay();
+
+    // Start inbound audio-level monitoring for this peer.
+    // This is the BEST diagnostic — if level is moving, audio is actually flowing.
+    // If sender shows speaking but recvLevel stays 0, audio path is broken.
+    startInboundLevel(e.streams[0], pid);
   };
 
   pc.onconnectionstatechange = () => {
@@ -1131,18 +1287,10 @@ function setupPC(pc, pid) {
     log("PC " + pid + " ICE=" + pc.iceConnectionState);
   };
 
-  // onnegotiationneeded — for future renegotiation (e.g. adding video later)
-  pc.onnegotiationneeded = async () => {
-    if (MY_ID < pid) return; // only larger-ID side initiates renegotiation
-    if (pc.signalingState !== 'stable') return;
-    try {
-      log("renegotiate→" + pid);
-      const o = await pc.createOffer();
-      o.sdp = preferOpusAndTune(o.sdp);
-      await pc.setLocalDescription(o);
-      ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
-    } catch (e) { log("renegErr: " + e.message); }
-  };
+  // NOTE: onnegotiationneeded intentionally NOT set. For voice-only calls with
+  // tracks added at PC creation, it tends to fire spuriously after the answer
+  // arrives, causing offer storms and audio dropouts. We use deterministic
+  // initial negotiation only.
 }
 
 // ── Detect whether peer connection is going through TURN relay ──
@@ -1270,7 +1418,7 @@ function setupLocalLevelMonitor() {
 
 // ── UI handlers ──
 function cleanupRTC() {
-  Object.keys(peers).forEach(pid => destroyPeer(pid));
+  Object.keys({...peers, ...audios}).forEach(pid => nukePeer(pid));
   if (localStream) {
     localStream.getTracks().forEach(t => t.stop());
     localStream = null;
