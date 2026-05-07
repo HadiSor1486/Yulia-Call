@@ -326,7 +326,8 @@ const peers={},audios={};
 const peerMap=new Map();
 const iceBuffer={}; // buffer trickle ICE candidates arriving before setRemoteDescription
 
-// STUN + TURN — expanded for mobile network compatibility
+// STUN + TURN — aggressive config for cross-country mobile (Lebanon ↔ Algeria etc)
+// TCP TURN is critical because many MENA mobile ISPs block UDP entirely
 const ICE_SERVERS=[
   {urls:'stun:stun.l.google.com:19302'},
   {urls:'stun:stun1.l.google.com:19302'},
@@ -335,9 +336,11 @@ const ICE_SERVERS=[
   {urls:'stun:stun4.l.google.com:19302'},
   {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
   {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:openrelay.metered.ca:443?transport=udp',username:'openrelayproject',credential:'openrelayproject'},
   {urls:'turn:turn.anyfirewall.com:443?transport=tcp',username:'webrtc',credential:'webrtc'},
+  {urls:'turn:turn.anyfirewall.com:443?transport=udp',username:'webrtc',credential:'webrtc'},
 ];
-function getPCConfig(){return{iceServers:ICE_SERVERS,bundlePolicy:'max-bundle',rtcpMuxPolicy:'require',iceCandidatePoolSize:10};}
+function getPCConfig(){return{iceServers:ICE_SERVERS,bundlePolicy:'max-bundle',rtcpMuxPolicy:'require',iceCandidatePoolSize:20};}
 
 // ── DEBUG ──
 function log(m){
@@ -456,22 +459,6 @@ function updPeers(){
 // WEBRTC — GLARE-FREE using server-assigned IDs
 // ═══════════════════════════════════════════════════════
 
-// Wait for ICE gathering to complete (with timeout) — 8s for mobile networks
-function iceGatherComplete(pc,timeout=8000){
-  return new Promise(resolve=>{
-    if(pc.iceGatheringState==='complete'){resolve();return;}
-    const t=setTimeout(()=>{pc.removeEventListener('icegatheringstatechange',check);resolve();},timeout);
-    const check=()=>{
-      if(pc.iceGatheringState==='complete'){
-        clearTimeout(t);
-        pc.removeEventListener('icegatheringstatechange',check);
-        resolve();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange',check);
-  });
-}
-
 function destroyPeer(pid){
   if(peers[pid]){try{peers[pid].close();}catch(e){} delete peers[pid];}
   if(audios[pid]){try{audios[pid].pause(); audios[pid].srcObject=null; audios[pid].remove();}catch(e){} delete audios[pid];}
@@ -480,7 +467,7 @@ function destroyPeer(pid){
 async function createOffer(pid,iceRestart=false){
   log("offer->"+pid+(iceRestart?" iceRestart":""));
   destroyPeer(pid);
-  const p=peerMap.get(pid); if(p) p.retries=0; // reset retry count on fresh offer
+  const p=peerMap.get(pid); if(p) p.retries=(p.retries||0)+1;
   try{
     const pc=new RTCPeerConnection(getPCConfig());
     setupPC(pc,pid);
@@ -488,8 +475,7 @@ async function createOffer(pid,iceRestart=false){
     if(localStream)localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
     const o=await pc.createOffer({iceRestart});
     await pc.setLocalDescription(o);
-    // FIX: wait for ICE gathering before sending (ensures candidates in SDP)
-    await iceGatherComplete(pc);
+    // TRICKLE ICE: send immediately, let onicecandidate relay more candidates
     ws.send(JSON.stringify({type:'webrtc_offer',to:pid,sdp:pc.localDescription.sdp}));
     log("offer SENT "+pid+" ice="+pc.iceGatheringState);
   }catch(e){log("offer FAIL "+pid+": "+e.message);}
@@ -514,8 +500,7 @@ async function handleOffer(from,sdp){
     if(localStream)localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
     const a=await pc.createAnswer();
     await pc.setLocalDescription(a);
-    // FIX: wait for ICE gathering before sending (ensures candidates in SDP)
-    await iceGatherComplete(pc);
+    // TRICKLE ICE: send immediately, let onicecandidate relay more candidates
     ws.send(JSON.stringify({type:'webrtc_answer',to:from,sdp:pc.localDescription.sdp}));
     log("answer SENT "+from+" ice="+pc.iceGatheringState);
   }catch(e){log("ans FAIL "+from+": "+e.message);}
@@ -589,18 +574,22 @@ function setupPC(pc,pid){
     if(pc.connectionState==='failed'){
       log("FAILED "+pid);
       destroyPeer(pid);
-      // FIX: auto-retry with iceRestart, max 2 retries, 1s delay
+      // BOTH sides retry with iceRestart; glare fix (MY_ID>pid) prevents dual offer
       const p=peerMap.get(pid);
       if(p) p.retries=(p.retries||0)+1;
       setTimeout(()=>{
         if(MY_ID && pid && ws && ws.readyState===1){
           const peer=peerMap.get(pid);
-          if(MY_ID > pid && peer && peer.retries < 3){
+          if(!peer || peer.retries >= 4) return;
+          if(MY_ID > pid){
             log("RETRY offer->"+pid+" (#"+peer.retries+")");
-            createOffer(pid,true); // iceRestart=true
+            createOffer(pid,true);
+          }else{
+            log("RETRY ansOffer->"+pid+" (#"+peer.retries+")");
+            createOffer(pid,true); // answerer can also initiate
           }
         }
-      },1000);
+      },1500);
     }
   };
 
