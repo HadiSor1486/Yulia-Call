@@ -324,15 +324,18 @@ let MY_ID=""; // Set by server via your_id message — SAME on both sides
 let ws=null,localStream=null,myName="",myAvatar="",isMuted=false,isHost=false;
 const peers={},audios={};
 const peerMap=new Map();
+const iceBuffer={}; // buffer trickle ICE candidates arriving before setRemoteDescription
 
-// STUN + TURN
+// STUN + TURN — expanded for mobile network compatibility
 const ICE_SERVERS=[
   {urls:'stun:stun.l.google.com:19302'},
   {urls:'stun:stun1.l.google.com:19302'},
   {urls:'stun:stun2.l.google.com:19302'},
+  {urls:'stun:stun3.l.google.com:19302'},
+  {urls:'stun:stun4.l.google.com:19302'},
   {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
-  {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
   {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:turn.anyfirewall.com:443?transport=tcp',username:'webrtc',credential:'webrtc'},
 ];
 function getPCConfig(){return{iceServers:ICE_SERVERS,bundlePolicy:'max-bundle',rtcpMuxPolicy:'require',iceCandidatePoolSize:10};}
 
@@ -420,7 +423,7 @@ function connectWS(){
         }
         break;
 
-      case 'peer_left': removePeerAudio(m.peer_id); peerMap.delete(m.peer_id); renderSys(m.name+' left'); updCount(); updPeers(); break;
+      case 'peer_left': destroyPeer(m.peer_id); peerMap.delete(m.peer_id); renderSys(m.name+' left'); updCount(); updPeers(); break;
       case 'webrtc_offer': await handleOffer(m.from,m.sdp); break;
       case 'webrtc_answer': await handleAnswer(m.from,m.sdp); break;
       case 'webrtc_ice': await handleIce(m.from,m.candidate); break;
@@ -433,7 +436,7 @@ function connectWS(){
   ws.onerror=e=>{log("WS err"); document.getElementById('vstat').textContent='Error';};
 }
 
-function addPeer(p){peerMap.set(p.id,{name:p.name,avatar:p.avatar||'',is_host:p.is_host,muted:p.muted,connState:'new'}); if(p.is_host)log("peer "+p.id+" HOST"); updCount(); updPeers();}
+function addPeer(p){peerMap.set(p.id,{name:p.name,avatar:p.avatar||'',is_host:p.is_host,muted:p.muted,connState:'new',retries:0}); if(p.is_host)log("peer "+p.id+" HOST"); updCount(); updPeers();}
 function updCount(){document.getElementById('mcount').textContent=(peerMap.size+1)+' in call';}
 
 // ── PEER STATUS BAR ──
@@ -453,8 +456,8 @@ function updPeers(){
 // WEBRTC — GLARE-FREE using server-assigned IDs
 // ═══════════════════════════════════════════════════════
 
-// Wait for ICE gathering to complete (with timeout)
-function iceGatherComplete(pc,timeout=3000){
+// Wait for ICE gathering to complete (with timeout) — 8s for mobile networks
+function iceGatherComplete(pc,timeout=8000){
   return new Promise(resolve=>{
     if(pc.iceGatheringState==='complete'){resolve();return;}
     const t=setTimeout(()=>{pc.removeEventListener('icegatheringstatechange',check);resolve();},timeout);
@@ -471,18 +474,19 @@ function iceGatherComplete(pc,timeout=3000){
 
 function destroyPeer(pid){
   if(peers[pid]){try{peers[pid].close();}catch(e){} delete peers[pid];}
-  if(audios[pid]){try{audios[pid].pause(); audios[pid].srcObject=null;}catch(e){} delete audios[pid];}
+  if(audios[pid]){try{audios[pid].pause(); audios[pid].srcObject=null; audios[pid].remove();}catch(e){} delete audios[pid];}
 }
 
-async function createOffer(pid){
-  log("offer->"+pid);
+async function createOffer(pid,iceRestart=false){
+  log("offer->"+pid+(iceRestart?" iceRestart":""));
   destroyPeer(pid);
+  const p=peerMap.get(pid); if(p) p.retries=0; // reset retry count on fresh offer
   try{
     const pc=new RTCPeerConnection(getPCConfig());
     setupPC(pc,pid);
     peers[pid]=pc;
     if(localStream)localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
-    const o=await pc.createOffer();
+    const o=await pc.createOffer({iceRestart});
     await pc.setLocalDescription(o);
     // FIX: wait for ICE gathering before sending (ensures candidates in SDP)
     await iceGatherComplete(pc);
@@ -500,6 +504,13 @@ async function handleOffer(from,sdp){
     peers[from]=pc;
     // FIX: setRemoteDescription BEFORE addTrack so transceivers match the offer
     await pc.setRemoteDescription(new RTCSessionDescription({type:'offer',sdp}));
+    // Apply any buffered trickle ICE candidates that arrived before setRemoteDescription
+    if(iceBuffer[from]){
+      for(const cand of iceBuffer[from]){
+        try{await pc.addIceCandidate(new RTCIceCandidate(cand));}catch(e){}
+      }
+      delete iceBuffer[from];
+    }
     if(localStream)localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
     const a=await pc.createAnswer();
     await pc.setLocalDescription(a);
@@ -520,7 +531,14 @@ async function handleAnswer(from,sdp){
 }
 
 async function handleIce(from,cand){
-  try{const pc=peers[from]; if(pc&&cand)await pc.addIceCandidate(new RTCIceCandidate(cand));}catch(e){}
+  const pc=peers[from];
+  if(pc&&cand){
+    try{await pc.addIceCandidate(new RTCIceCandidate(cand));}catch(e){}
+  }else if(cand){
+    // Buffer candidate until PC is created by setRemoteDescription
+    if(!iceBuffer[from]) iceBuffer[from]=[];
+    iceBuffer[from].push(cand);
+  }
 }
 
 function setupPC(pc,pid){
@@ -542,6 +560,8 @@ function setupPC(pc,pid){
       a.autoplay=true;
       a.playsInline=true;
       a.volume=1.0;
+      a.style.display='none';
+      document.body.appendChild(a); // add to DOM for mobile compatibility
       try{const C=window.AudioContext||window.webkitAudioContext;const x=new C();x.resume().then(()=>x.close());}catch(e){}
       audios[pid]=a;
     }
@@ -564,19 +584,23 @@ function setupPC(pc,pid){
     if(pc.connectionState==='connected'){
       document.getElementById('vstat').textContent='Voice OK';
       log("CONNECTED "+pid+"!!");
+      const p=peerMap.get(pid); if(p) p.retries=0; // reset retry count on success
     }
     if(pc.connectionState==='failed'){
       log("FAILED "+pid);
       destroyPeer(pid);
-      // FIX: auto-retry connection after 2s if we are the offerer
+      // FIX: auto-retry with iceRestart, max 2 retries, 1s delay
+      const p=peerMap.get(pid);
+      if(p) p.retries=(p.retries||0)+1;
       setTimeout(()=>{
         if(MY_ID && pid && ws && ws.readyState===1){
-          if(MY_ID > pid){
-            log("RETRY offer->"+pid);
-            createOffer(pid);
+          const peer=peerMap.get(pid);
+          if(MY_ID > pid && peer && peer.retries < 3){
+            log("RETRY offer->"+pid+" (#"+peer.retries+")");
+            createOffer(pid,true); // iceRestart=true
           }
         }
-      },2000);
+      },1000);
     }
   };
 
