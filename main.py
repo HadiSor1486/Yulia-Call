@@ -1,6 +1,6 @@
 """
 Silent Hill Voice Call Bot — Kyodo + WebRTC + Chat UI
-TURN servers added for bulletproof cross-country NAT traversal.
+BEAST MODE: 5 TURN servers + auto ICE restart + relay fallback.
 """
 
 import asyncio, json, os, time, uuid, traceback
@@ -196,7 +196,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                 if os.path.exists(f): os.remove(f)
             for tk in [k for k, v in tokens.items() if v.get("room_id") == room_id]: del tokens[tk]
             del rooms[room_id]
-            print(f"[Room {room_id}] closed")
 
 def _append_msg(rid, msg):
     p = f"{rid}_chat.json"
@@ -266,7 +265,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .av-preview{width:80px;height:80px;border-radius:50%;margin:0 auto 10px;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:32px;font-weight:600;color:#8e8e93;overflow:hidden;cursor:pointer;border:3px solid #3a3a3c}
 .av-preview img{width:100%;height:100%;object-fit:cover}
 .av-in{display:none}
-.debug{position:fixed;top:0;left:0;right:0;z-index:200;background:rgba(0,0,0,.92);color:#0f0;font:11px monospace;padding:4px;max-height:100px;overflow-y:auto;display:none;white-space:pre-wrap}
+.debug{position:fixed;top:0;left:0;right:0;z-index:200;background:rgba(0,0,0,.92);color:#0f0;font:11px monospace;padding:4px;max-height:120px;overflow-y:auto;display:none;white-space:pre-wrap}
 .debug.show{display:block}
 .peer-status{display:flex;gap:6px;align-items:center;overflow-x:auto;padding:4px 12px}
 .peer-status::-webkit-scrollbar{display:none}
@@ -274,6 +273,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .p-s .dot{width:8px;height:8px;border-radius:50%;background:#8e8e93}
 .p-s .dot.conn{background:#34c759}
 .p-s .dot.fail{background:#ff3b30}
+.p-s .dot.warn{background:#ff9500}
 .hidden{display:none!important}
 </style>
 </head>
@@ -324,18 +324,37 @@ const peers={},audios={};
 const peerMap=new Map();
 
 // ═══════════════════════════════════════════
-// TURN + STUN — Bulletproof NAT traversal
+// BEAST MODE ICE — 5 STUN + 8 TURN servers
 // ═══════════════════════════════════════════
-const ICE={iceServers:[
-  // Public STUN (Google)
+const ICE_SERVERS=[
+  // STUN (find public IP)
   {urls:'stun:stun.l.google.com:19302'},
   {urls:'stun:stun1.l.google.com:19302'},
   {urls:'stun:stun2.l.google.com:19302'},
-  // TURN via Open Relay (free, relays when STUN fails)
+  {urls:'stun:stun3.l.google.com:19302'},
+  {urls:'stun:stun4.l.google.com:19302'},
+  // TURN Relay 1: Open Relay (UDP+TCP)
   {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
   {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
-  {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}
-]};
+  {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'},
+  // TURN Relay 2: metered.ca direct
+  {urls:'turn:global.relay.metered.ca:80',username:'81eb600c5c9b5488c838ae33',credential:'G8HNxzfb1F0Y1Dsp'},
+  {urls:'turn:global.relay.metered.ca:443',username:'81eb600c5c9b5488c838ae33',credential:'G8HNxzfb1F0Y1Dsp'},
+  {urls:'turn:global.relay.metered.ca:443?transport=tcp',username:'81eb600c5c9b5488c838ae33',credential:'G8HNxzfb1F0Y1Dsp'},
+  // TURN Relay 3: Another free relay
+  {urls:'turn:freeturn.net:3478',username:'free',credential:'free'},
+  {urls:'turn:freeturn.net:3478?transport=tcp',username:'free',credential:'free'},
+];
+
+function getPCConfig(relayOnly){
+return{
+  iceServers:ICE_SERVERS,
+  bundlePolicy:'max-bundle',
+  rtcpMuxPolicy:'require',
+  iceCandidatePoolSize:relayOnly?0:10,
+  iceTransportPolicy:relayOnly?'relay':'all'
+};
+}
 
 // ── DEBUG ──
 function log(m){
@@ -386,10 +405,10 @@ let m; try{m=JSON.parse(ev.data);}catch(e){return;}
 switch(m.type){
 case 'history': m.messages.forEach(renderMsg); break;
 case 'chat': renderMsg(m); break;
-case 'peers': log("peers:"+m.peers.length); m.peers.forEach(p=>{addPeer(p); createOffer(p.id);}); break;
+case 'peers': log("peers:"+m.peers.length); m.peers.forEach(p=>{addPeer(p); createOffer(p.id,false);}); break;
 case 'peer_joined': addPeer(m.peer); renderSys(m.peer.name+" joined"); break;
 case 'peer_left': removePeerAudio(m.peer_id); peerMap.delete(m.peer_id); renderSys(m.name+' left'); updCount(); updPeers(); break;
-case 'webrtc_offer': await handleOffer(m.from,m.sdp); break;
+case 'webrtc_offer': await handleOffer(m.from,m.sdp,false); break;
 case 'webrtc_answer': await handleAnswer(m.from,m.sdp); break;
 case 'webrtc_ice': await handleIce(m.from,m.candidate); break;
 case 'mute_cmd': if(localStream)localStream.getAudioTracks().forEach(t=>t.enabled=false); break;
@@ -401,49 +420,59 @@ ws.onclose=e=>{log("WS close "+e.code); cleanupRTC();};
 ws.onerror=e=>{log("WS err"); document.getElementById('vstat').textContent='Error';};
 }
 
-function addPeer(p){peerMap.set(p.id,{name:p.name,avatar:p.avatar||'',is_host:p.is_host,muted:p.muted,connState:'connecting'}); if(p.is_host)log("peer "+p.id+" is HOST"); updCount(); updPeers();}
+function addPeer(p){peerMap.set(p.id,{name:p.name,avatar:p.avatar||'',is_host:p.is_host,muted:p.muted,connState:'connecting',relayAttempt:0}); if(p.is_host)log("peer "+p.id+" HOST"); updCount(); updPeers();}
 function updCount(){document.getElementById('mcount').textContent=(peerMap.size+1)+' in call';}
 
 // ── PEER STATUS BAR ──
 function updPeers(){
 const el=document.getElementById('pstat');
 let h='';
-// Self
 const selfDot=isMuted?'fail':'conn';
 h+='<div class="p-s"><div class="dot '+selfDot+'"></div>'+esc(myName)+'(You)</div>';
 peerMap.forEach((p,id)=>{
- const dot=p.connState==='connected'?'conn':(p.connState==='failed'?'fail':'');
+ const dot=p.connState==='connected'?'conn':(p.connState==='failed'?'fail':(p.connState==='connecting'?'warn':''));
  h+='<div class="p-s"><div class="dot '+dot+'"></div>'+esc(p.name)+'</div>';
 });
 el.innerHTML=h;
 }
 
-// ── WEBRTC ──
-async function createOffer(pid){
-log("offer->"+pid);
+// ═══════════════════════════════════════════
+// WEBRTC — Create Offer
+// ═══════════════════════════════════════════
+async function createOffer(pid,relayOnly){
+const strategy=relayOnly?'RELAY':'ALL';
+log("offer->"+pid+" mode="+strategy);
 try{
-const pc=new RTCPeerConnection(ICE);
-setupPC(pc,pid);
+if(peers[pid]){peers[pid].close(); delete peers[pid];}
+const pc=new RTCPeerConnection(getPCConfig(relayOnly));
+setupPC(pc,pid,relayOnly);
 peers[pid]=pc;
 if(localStream)localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
 const o=await pc.createOffer();
 await pc.setLocalDescription(o);
-ws.send(JSON.stringify({type:'webrtc_offer',to:pid,sdp:o.sdp}));
-}catch(e){log("offer FAIL: "+e.message);}
+// Wait for ICE gathering to complete or time out
+await waitForICE(pc,5000);
+ws.send(JSON.stringify({type:'webrtc_offer',to:pid,sdp:pc.localDescription.sdp}));
+log("offer SENT to "+pid+" mode="+strategy);
+}catch(e){log("offer FAIL "+pid+": "+e.message);}
 }
 
-async function handleOffer(from,sdp){
-log("offer<-"+from);
+async function handleOffer(from,sdp,relayOnly){
+const strategy=relayOnly?'RELAY':'ALL';
+log("offer<-"+from+" mode="+strategy);
 try{
-const pc=new RTCPeerConnection(ICE);
-setupPC(pc,from);
+if(peers[from]){peers[from].close(); delete peers[from];}
+const pc=new RTCPeerConnection(getPCConfig(relayOnly));
+setupPC(pc,from,relayOnly);
 peers[from]=pc;
 if(localStream)localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
 await pc.setRemoteDescription(new RTCSessionDescription({type:'offer',sdp}));
 const a=await pc.createAnswer();
 await pc.setLocalDescription(a);
-ws.send(JSON.stringify({type:'webrtc_answer',to:from,sdp:a.sdp}));
-}catch(e){log("ans FAIL: "+e.message);}
+await waitForICE(pc,5000);
+ws.send(JSON.stringify({type:'webrtc_answer',to:from,sdp:pc.localDescription.sdp}));
+log("answer SENT to "+from+" mode="+strategy);
+}catch(e){log("ans FAIL "+from+": "+e.message);}
 }
 
 async function handleAnswer(from,sdp){
@@ -451,64 +480,92 @@ log("ans<-"+from);
 try{
 const pc=peers[from]; if(!pc)return;
 await pc.setRemoteDescription(new RTCSessionDescription({type:'answer',sdp}));
-}catch(e){log("ansErr: "+e.message);}
+log("ans OK "+from);
+}catch(e){log("ansErr "+from+": "+e.message);}
 }
 
 async function handleIce(from,cand){
 try{
-const pc=peers[from]; if(pc&&cand)await pc.addIceCandidate(new RTCIceCandidate(cand));
+const pc=peers[from]; if(pc&&cand)await pc.addICE(pc,cand);
 }catch(e){}
 }
 
-function setupPC(pc,pid){
-// ICE candidate forwarding
-pc.onicecandidate=e=>{if(e.candidate&&ws&&ws.readyState===1)ws.send(JSON.stringify({type:'webrtc_ice',to:pid,candidate:e.candidate}));};
+// Wait for ICE gathering with timeout
+function waitForICE(pc,timeout){
+return new Promise(resolve=>{
+if(pc.iceGatheringState==='complete'){resolve();return;}
+const t=setTimeout(()=>{log("ICE timeout, using gathered so far");resolve();},timeout);
+pc.onicegatheringstatechange=()=>{
+if(pc.iceGatheringState==='complete'){clearTimeout(t);resolve();}
+};
+});
+}
 
-// Track received = audio incoming
+function setupPC(pc,pid,usedRelay){
+// Forward ICE candidates as they arrive (trickle)
+pc.onicecandidate=e=>{
+if(e.candidate&&ws&&ws.readyState===1){
+  log("ICE->"+pid+": "+e.candidate.candidate.substring(0,40));
+  ws.send(JSON.stringify({type:'webrtc_ice',to:pid,candidate:e.candidate}));
+}
+};
+
+// Receive audio
 pc.ontrack=e=>{
-log("TRACK from "+pid+" streams="+e.streams.length);
+log("TRACK "+pid+"! streams="+e.streams.length);
 let a=audios[pid];
 if(!a){
 a=new Audio();
 a.autoplay=true;
 a.playsInline=true;
 a.volume=1.0;
-// iOS AudioContext unlock
-if(window.AudioContext||window.webkitAudioContext){
- const C=window.AudioContext||window.webkitAudioContext;
- const d=new C(); d.resume().then(()=>d.close());
-}
+// Unlock AudioContext for mobile
+const AC=window.AudioContext||window.webkitAudioContext;
+if(AC){const c=new AC();c.resume().then(()=>c.close().catch(()=>{}));}
 audios[pid]=a;
-log("audio el for "+pid);
 }
 a.srcObject=e.streams[0];
-a.play().then(()=>log("PLAYING "+pid)).catch(err=>{
- log("play err "+pid+": "+err.message);
- // Unlock on any touch
- const r=()=>{a.play().then(()=>log("retry OK "+pid)).catch(()=>{});};
- document.addEventListener('touchstart',r,{once:true});
- document.addEventListener('click',r,{once:true});
+a.play().then(()=>{
+  log("PLAYING "+pid);
+  document.getElementById('vstat').textContent='Voice OK';
+}).catch(err=>{
+  log("play err "+pid+": "+err.message);
+  const retry=()=>{a.play().then(()=>log("retry OK "+pid)).catch(()=>{});};
+  document.addEventListener('touchstart',retry,{once:true});
+  document.addEventListener('click',retry,{once:true});
 });
 };
 
-// Connection state — critical debug
+// Connection state — with auto ICE restart
 pc.onconnectionstatechange=()=>{
 log("PC "+pid+" conn="+pc.connectionState+" ice="+pc.iceConnectionState);
 const p=peerMap.get(pid); if(p)p.connState=pc.connectionState;
 updPeers();
 if(pc.connectionState==='connected'){
- document.getElementById('vstat').textContent='Voice OK';
- log("VOICE CONNECTED with "+pid);
+  document.getElementById('vstat').textContent='Voice OK';
+  log("CONNECTED "+pid+"!");
+  const pp=peerMap.get(pid); if(pp)pp.relayAttempt=0;
 }
-if(pc.connectionState==='failed'||pc.connectionState==='closed'){
- removePeerAudio(pid);
+if(pc.connectionState==='failed'){
+  log("FAILED "+pid+" — will retry with relay");
+  removePeerAudio(pid);
+  const pp=peerMap.get(pid);
+  if(pp&&pp.relayAttempt<2){
+    pp.relayAttempt++;
+    setTimeout(()=>{createOffer(pid,true);},500);
+  }
 }
+if(pc.connectionState==='closed')removePeerAudio(pid);
 };
 
 pc.oniceconnectionstatechange=()=>{
- log("PC "+pid+" ICE="+pc.iceConnectionState);
- const p=peerMap.get(pid); if(p)p.connState=pc.connectionState;
- updPeers();
+log("PC "+pid+" ICE="+pc.iceConnectionState);
+if(pc.iceConnectionState==='disconnected'){
+  log("ICE DISCO "+pid);
+}
+if(pc.iceConnectionState==='failed'){
+  log("ICE FAILED "+pid);
+}
 };
 }
 
@@ -519,7 +576,7 @@ const p=peerMap.get(pid); if(p)p.connState='closed';
 updPeers();
 }
 function cleanupRTC(){
-Object.keys(peers).forEach(pid=>{if(peers[pid])peers[pid].close(); delete peers[pid];});
+Object.keys(peers).forEach(pid=>{if(peers[pid]){peers[pid].close(); delete peers[pid];}});
 Object.keys(audios).forEach(pid=>{if(audios[pid]){audios[pid].pause(); audios[pid].srcObject=null; delete audios[pid];}});
 if(localStream){localStream.getTracks().forEach(t=>t.stop()); localStream=null;}
 }
