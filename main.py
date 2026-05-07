@@ -188,7 +188,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
         lm = {"type": "peer_left", "peer_id": peer_id, "name": name}
         sm = {"type": "chat", "kind": "system", "text": f"{name} left the call",
               "time": datetime.now().isoformat()}
-        _append_msg(room_id, sm)
         for p, pd in list(room["peers"].items()):
             try:
                 await pd["ws"].send_json(lm)
@@ -454,6 +453,22 @@ function updPeers(){
 // WEBRTC — GLARE-FREE using server-assigned IDs
 // ═══════════════════════════════════════════════════════
 
+// Wait for ICE gathering to complete (with timeout)
+function iceGatherComplete(pc,timeout=3000){
+  return new Promise(resolve=>{
+    if(pc.iceGatheringState==='complete'){resolve();return;}
+    const t=setTimeout(()=>{pc.removeEventListener('icegatheringstatechange',check);resolve();},timeout);
+    const check=()=>{
+      if(pc.iceGatheringState==='complete'){
+        clearTimeout(t);
+        pc.removeEventListener('icegatheringstatechange',check);
+        resolve();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange',check);
+  });
+}
+
 function destroyPeer(pid){
   if(peers[pid]){try{peers[pid].close();}catch(e){} delete peers[pid];}
   if(audios[pid]){try{audios[pid].pause(); audios[pid].srcObject=null;}catch(e){} delete audios[pid];}
@@ -469,8 +484,10 @@ async function createOffer(pid){
     if(localStream)localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
     const o=await pc.createOffer();
     await pc.setLocalDescription(o);
-    ws.send(JSON.stringify({type:'webrtc_offer',to:pid,sdp:o.sdp}));
-    log("offer SENT "+pid);
+    // FIX: wait for ICE gathering before sending (ensures candidates in SDP)
+    await iceGatherComplete(pc);
+    ws.send(JSON.stringify({type:'webrtc_offer',to:pid,sdp:pc.localDescription.sdp}));
+    log("offer SENT "+pid+" ice="+pc.iceGatheringState);
   }catch(e){log("offer FAIL "+pid+": "+e.message);}
 }
 
@@ -481,12 +498,15 @@ async function handleOffer(from,sdp){
     const pc=new RTCPeerConnection(getPCConfig());
     setupPC(pc,from);
     peers[from]=pc;
-    if(localStream)localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+    // FIX: setRemoteDescription BEFORE addTrack so transceivers match the offer
     await pc.setRemoteDescription(new RTCSessionDescription({type:'offer',sdp}));
+    if(localStream)localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
     const a=await pc.createAnswer();
     await pc.setLocalDescription(a);
-    ws.send(JSON.stringify({type:'webrtc_answer',to:from,sdp:a.sdp}));
-    log("answer SENT "+from);
+    // FIX: wait for ICE gathering before sending (ensures candidates in SDP)
+    await iceGatherComplete(pc);
+    ws.send(JSON.stringify({type:'webrtc_answer',to:from,sdp:pc.localDescription.sdp}));
+    log("answer SENT "+from+" ice="+pc.iceGatheringState);
   }catch(e){log("ans FAIL "+from+": "+e.message);}
 }
 
@@ -508,6 +528,10 @@ function setupPC(pc,pid){
     if(e.candidate&&ws&&ws.readyState===1){
       ws.send(JSON.stringify({type:'webrtc_ice',to:pid,candidate:e.candidate}));
     }
+  };
+
+  pc.onicegatheringstatechange=()=>{
+    log("PC "+pid+" ICEgather="+pc.iceGatheringState);
   };
 
   pc.ontrack=e=>{
@@ -541,7 +565,19 @@ function setupPC(pc,pid){
       document.getElementById('vstat').textContent='Voice OK';
       log("CONNECTED "+pid+"!!");
     }
-    if(pc.connectionState==='failed'){log("FAILED "+pid); destroyPeer(pid);}
+    if(pc.connectionState==='failed'){
+      log("FAILED "+pid);
+      destroyPeer(pid);
+      // FIX: auto-retry connection after 2s if we are the offerer
+      setTimeout(()=>{
+        if(MY_ID && pid && ws && ws.readyState===1){
+          if(MY_ID > pid){
+            log("RETRY offer->"+pid);
+            createOffer(pid);
+          }
+        }
+      },2000);
+    }
   };
 
   pc.oniceconnectionstatechange=()=>{
