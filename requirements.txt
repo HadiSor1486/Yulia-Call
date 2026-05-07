@@ -3,4 +3,4 @@ uvicorn
 aiohttp
 httpx
 pillow
-kyodo
+kyodo==1.7.2
