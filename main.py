@@ -572,6 +572,8 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 //   • Connection escalation: normal → fast ICE restart (6s) → full restart → relay-only
 //   • Bidirectional relay: both sides switch to TURN when quality degrades
 //   • Outbound stall detection — catches one-way-audio failures instantly
+//   • MUTE/UNMUTE FIX: uses replaceTrack() instead of track.enabled to avoid
+//     the mobile browser bug where re-enabling a track leaves RTP dead.
 // ════════════════════════════════════════════════════════════════════════════
 
 const ROOM = "__ROOM_ID__", TOKEN = "__TOKEN__";
@@ -825,20 +827,72 @@ function connectWS() {
         await handleIce(m.from, m.candidate);
         break;
 
-      case 'request_relay':
-        // Peer is asking us to switch this connection to relay-only mode.
-        // We honour it regardless of ID — both sides should use relay for reliability.
-        log("got relay request from " + m.from + " (" + (m.reason || '') + ")");
+      case 'request_relay': {
+        const reason = m.reason || '';
+        const isZombie = reason.startsWith('zombie');
+        if (!isZombie && MY_ID < m.from) {
+          // Normal relay: smaller side ignores (larger side drives relay switch)
+          break;
+        }
+        log("got relay request from " + m.from + " (" + reason + ")");
         peerRelay[m.from] = true;
-        await switchPeerToRelay(m.from);
+        if (isZombie && MY_ID > m.from) {
+          // Zombie from smaller side: do full rebuild (ICE restart won't fix dead transceiver)
+          log("zombie reneg from smaller side → full rebuild " + m.from);
+          destroyPeer(m.from);
+          setTimeout(() => createOffer(m.from), 300);
+        } else {
+          await switchPeerToRelay(m.from);
+        }
         break;
+      }
 
-      case 'mute_cmd':
-        if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = false);
+      case 'mute_cmd': {
+        // Server asked us to mute. Use replaceTrack(null) instead of track.enabled=false
+        // to avoid the mobile browser zombie-RTP bug.
+        if (localStream) {
+          const t = localStream.getAudioTracks()[0];
+          if (t) {
+            Object.values(peers).forEach(pc => {
+              pc.getSenders().forEach(sender => {
+                if (sender.track && sender.track.kind === 'audio') {
+                  try { sender.replaceTrack(null); } catch (e) {}
+                }
+              });
+            });
+            t.enabled = false;
+          }
+        }
+        isMuted = true;
+        document.getElementById('muteBtn').classList.add('muted');
+        document.getElementById('muteBtn').innerHTML = '&#128263;';
+        document.getElementById('vstat').textContent = 'Muted';
+        updPeers();
         break;
-      case 'unmute_cmd':
-        if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = true);
+      }
+      case 'unmute_cmd': {
+        // Server asked us to unmute. Restore track via replaceTrack(realTrack).
+        if (localStream) {
+          const t = localStream.getAudioTracks()[0];
+          if (t) {
+            Object.values(peers).forEach(pc => {
+              pc.getSenders().forEach(sender => {
+                if (sender.track && sender.track.kind === 'audio') {
+                  try { sender.replaceTrack(t); } catch (e) {}
+                }
+              });
+            });
+            t.enabled = true;
+          }
+        }
+        isMuted = false;
+        document.getElementById('muteBtn').classList.remove('muted');
+        document.getElementById('muteBtn').innerHTML = '&#127908;';
+        document.getElementById('vstat').textContent = 'Connected';
+        setTimeout(() => checkZombiePeers(), 500);
+        updPeers();
         break;
+      }
 
       case 'voice_state': {
         const p = peerMap.get(m.peer_id);
@@ -948,6 +1002,57 @@ function updPeerLevels() {
   });
 }
 let _peerLevelTicker = null;
+
+// ── Zombie peer detection ──
+// Detects the "mute/unmute zombie" where connectionState is 'connected' but
+// inbound RTP is dead (ΔR=0, frozen jitter, but ΔS>0). The only cure is a
+// fresh offer/answer renegotiation to force the browser to rebuild transceivers.
+let _lastJitters = {}; // pid -> last jitter value
+let _zombieCounts = {};  // pid -> consecutive zombie intervals
+
+function checkZombiePeers() {
+  peerMap.forEach((p, pid) => {
+    if (p.connState !== 'connected') return;
+    // If recvLevel has been 0 for a while and we know peer isn't muted,
+    // the transceiver is likely dead. Trigger a renegotiation.
+    if (!p.recvLevel || p.recvLevel < 0.005) {
+      _zombieCounts[pid] = (_zombieCounts[pid] || 0) + 1;
+      if (_zombieCounts[pid] >= 2) {
+        log("ZOMBIE detected " + pid + " (no audio despite connected) → renegotiate");
+        _zombieCounts[pid] = 0;
+        if (MY_ID > pid) {
+          // Force a full rebuild (not just ICE restart) to wake transceivers
+          destroyPeer(pid);
+          setTimeout(() => createOffer(pid), 300);
+        } else {
+          // Smaller side: destroy and wait for larger side to offer
+          destroyPeer(pid);
+          // Ask larger side to re-offer via WS
+          if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'zombie-reneg' }));
+          }
+        }
+      }
+    } else {
+      _zombieCounts[pid] = 0;
+    }
+  });
+}
+
+// Also hook into the stats timer to detect frozen jitter (another zombie sign)
+function detectFrozenJitter(pid, jitter) {
+  const last = _lastJitters[pid];
+  if (last !== undefined && jitter === last && jitter > 0) {
+    // Jitter hasn't changed at all across two intervals while conn=connected
+    // AND we're receiving 0 packets → zombie confirmed
+    const p = peerMap.get(pid);
+    if (p && p.connState === 'connected' && (!p.recvLevel || p.recvLevel < 0.005)) {
+      return true;
+    }
+  }
+  _lastJitters[pid] = jitter;
+  return false;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // WEBRTC — Perfect Negotiation
@@ -1534,6 +1639,21 @@ function startStats(pc, pid) {
       } else {
         outboundStall = 0;
       }
+
+      // ── TRIGGER 4: Zombie transceiver (frozen jitter + 0 recv while connected) ──
+      // This is the mute/unmute bug: connectionState='connected', ΔR=0, jitter frozen.
+      if (detectFrozenJitter(pid, jitter)) {
+        log("ZOMBIE jitter frozen on " + pid + " → full renegotiate");
+        if (MY_ID > pid) {
+          destroyPeer(pid);
+          setTimeout(() => createOffer(pid), 300);
+        } else {
+          destroyPeer(pid);
+          if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'zombie-reneg' }));
+          }
+        }
+      }
     } catch (e) {}
   }, 4000); // tick every 4s for fast detection
 }
@@ -1692,7 +1812,30 @@ function sendMsg() {
 function toggleMute() {
   if (!localStream) return;
   isMuted = !isMuted;
-  localStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
+  // ── THE MUTE FIX ──
+  // Mobile browsers (Safari especially) have a bug where track.enabled = false
+  // then true leaves the RTP sender in a dead state. The connection stays "connected"
+  // but the peer receives 0 packets (ΔR=0, frozen jitter). The fix: replaceTrack()
+  // with null when muting, and the real track when unmuting. This forces the
+  // browser to tear down and rebuild the sender, avoiding the zombie stream.
+  const realTrack = localStream.getAudioTracks()[0];
+  if (!realTrack) return;
+
+  Object.values(peers).forEach(pc => {
+    pc.getSenders().forEach(sender => {
+      if (sender.track && sender.track.kind === 'audio') {
+        try {
+          sender.replaceTrack(isMuted ? null : realTrack);
+        } catch (e) {
+          log("replaceTrack err: " + e.message);
+        }
+      }
+    });
+  });
+
+  // Also toggle .enabled for local monitoring (so local analyser sees silence)
+  realTrack.enabled = !isMuted;
+
   const b = document.getElementById('muteBtn');
   if (isMuted) {
     b.classList.add('muted');
@@ -1702,6 +1845,8 @@ function toggleMute() {
     b.classList.remove('muted');
     b.innerHTML = '&#127908;';
     document.getElementById('vstat').textContent = 'Connected';
+    // After unmuting, check if any peer's inbound is dead — if so, kick a renegotiation
+    setTimeout(() => checkZombiePeers(), 500);
   }
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: isMuted ? 'mute_me' : 'unmute_me' }));
   updPeers();
