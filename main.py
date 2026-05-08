@@ -758,7 +758,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .messages{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:6px;position:relative;z-index:5}
 .messages::-webkit-scrollbar{width:0}
 .msg-system{text-align:center;color:#8e8e93;font-size:12px;padding:6px 0}
-.msg-row{display:flex;gap:8px;max-width:85%;animation:msgIn .2s ease-out;align-items:flex-start}
+.msg-row{display:flex;gap:8px;max-width:85%;animation:msgIn .2s ease-out;align-items:flex-start;position:relative;overflow:hidden;touch-action:pan-y}
 .msg-row.self{align-self:flex-end;flex-direction:row-reverse}
 .msg-row.other{align-self:flex-start}
 @keyframes msgIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
@@ -796,6 +796,8 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .img-preview-overlay .close-hint{position:absolute;top:20px;right:20px;color:#fff;font-size:32px;opacity:0.7}
 .typing-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:6px 12px;font-size:12px;color:#8e8e93;flex-shrink:0;animation:msgIn .15s}
 .typing-bar.hidden{display:none!important}
+.new-msg-pill{position:fixed;bottom:76px;left:50%;transform:translateX(-50%) scale(0.9);background:#007aff;color:#fff;padding:8px 18px;border-radius:20px;font-size:13px;font-weight:600;z-index:20;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.45);opacity:0;transition:opacity .15s,transform .15s;pointer-events:none}.new-msg-pill.show{opacity:1;transform:translateX(-50%) scale(1);pointer-events:auto}
+.msg-row{position:relative;overflow:hidden;touch-action:pan-y}
 .input-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:8px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0}
 .input-attach,.input-send{width:38px;height:38px;border-radius:50%;border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0}
 .input-attach{background:#2c2c2e;color:#fff;font-size:18px}
@@ -860,6 +862,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 
 <div class="peer-status" id="pstat"></div>
 
+<div class="new-msg-pill" id="newMsgPill" onclick="catchUpScroll()">new messages</div>
 <div class="messages" id="msgs"></div>
 <div class="typing-bar hidden" id="typingBar"></div>
 <div class="input-bar">
@@ -923,6 +926,13 @@ const relayConnectedAt = {};        // v3.2: when did relay path stabilize
 const lossEwma = {};                // v3.2: smoothed loss per peer
 const sustainedBadStart = {};       // v3.2: when sustained bad began
 let lastMuteToggleAt = 0;
+
+// ════════════════════════════════════════════════════════════════════════════
+// v3.6 FEATURES: auto-scroll lock, swipe-to-reply, wake-lock reacquire, audio self-heal
+// ════════════════════════════════════════════════════════════════════════════
+let autoScrollEnabled = true;
+let newMsgCount = 0;
+let swipeState = null;
 
 // frozen-jitter zombie tracking
 const frozenJitterCounts = {};
@@ -1008,7 +1018,73 @@ document.getElementById('nameIn').addEventListener('input', e => {
   });
 })();
 
-async function fetchIceServers() {
+// ════════════════════════════════════════════════════════════════════════════
+// FEATURE INIT: scroll lock, swipe-to-reply, wake-lock guard, audio self-heal
+// ════════════════════════════════════════════════════════════════════════════
+(function initFeatures() {
+  const msgsEl = document.getElementById('msgs');
+  if (!msgsEl) return;
+
+  // ── scroll lock: detect when user scrolls up ──
+  msgsEl.addEventListener('scroll', () => {
+    const nearBottom = msgsEl.scrollTop + msgsEl.clientHeight >= msgsEl.scrollHeight - 60;
+    if (nearBottom && !autoScrollEnabled) {
+      autoScrollEnabled = true;
+      newMsgCount = 0;
+      const pill = document.getElementById('newMsgPill');
+      if (pill) pill.classList.remove('show');
+    } else if (!nearBottom && autoScrollEnabled) {
+      autoScrollEnabled = false;
+    }
+  }, { passive: true });
+
+  // ── swipe-to-reply: right on others, left on self ──
+  msgsEl.addEventListener('touchstart', e => {
+    const row = e.target.closest('.msg-row');
+    if (!row || row.classList.contains('system')) return;
+    const touch = e.touches[0];
+    swipeState = { x: touch.clientX, y: touch.clientY, row, moved: false };
+  }, { passive: true });
+
+  msgsEl.addEventListener('touchmove', e => {
+    if (!swipeState || !swipeState.row) return;
+    const touch = e.touches[0];
+    const dx = touch.clientX - swipeState.x;
+    const dy = touch.clientY - swipeState.y;
+    const isSelf = swipeState.row.classList.contains('self');
+    const validDir = (!isSelf && dx > 0) || (isSelf && dx < 0);
+    if (validDir && Math.abs(dx) > Math.abs(dy) * 1.5 && Math.abs(dx) > 8) {
+      const bubble = swipeState.row.querySelector('.msg-bubble');
+      if (bubble) bubble.style.transform = 'translateX(' + (dx * 0.25) + 'px)';
+      swipeState.moved = true;
+    }
+  }, { passive: true });
+
+  msgsEl.addEventListener('touchend', e => {
+    if (!swipeState || !swipeState.row) { swipeState = null; return; }
+    const touch = e.changedTouches[0];
+    const dx = touch.clientX - swipeState.x;
+    const dy = touch.clientY - swipeState.y;
+    const isSelf = swipeState.row.classList.contains('self');
+    // Reset transform
+    const bubble = swipeState.row.querySelector('.msg-bubble');
+    if (bubble) bubble.style.transform = '';
+    const mostlyHorizontal = Math.abs(dx) > Math.abs(dy) * 1.5;
+    const threshold = 60;
+    if (mostlyHorizontal && Math.abs(dx) > threshold) {
+      if (!isSelf && dx > 0) {
+        const md = swipeState.row._msgData;
+        if (md) startReply(md);
+      } else if (isSelf && dx < 0) {
+        const md = swipeState.row._msgData;
+        if (md) startReply(md);
+      }
+    }
+    swipeState = null;
+  }, { passive: true });
+})();
+
+async function fetchIceServers()
   try {
     const r = await fetch('/turn', { cache: 'no-store' });
     if (r.ok) {
@@ -1050,7 +1126,7 @@ async function acquireWakeLock() {
 }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    if (!wakeLock) acquireWakeLock();
+    if (!wakeLock || wakeLock.released) acquireWakeLock();
     log("foreground — refreshing peer health");
     Object.entries(peers).forEach(([pid, pc]) => {
       if (pc.connectionState === 'disconnected' && MY_ID > pid) {
@@ -1060,6 +1136,36 @@ document.addEventListener('visibilitychange', () => {
     });
   }
 });
+
+// v3.6: wake lock auto-reacquire — iOS Safari silently kills it
+setInterval(() => {
+  if (document.visibilityState === 'visible' && (!wakeLock || wakeLock.released)) {
+    acquireWakeLock();
+  }
+}, 30000);
+
+// v3.6: audio self-heal — iOS bg suspend can drop audio streams
+setInterval(() => {
+  Object.entries(audios).forEach(([pid, a]) => {
+    if (!a) return;
+    const streamDead = !a.srcObject || a.srcObject.getTracks().every(t => t.readyState === 'ended');
+    if (a.paused || streamDead) {
+      const pc = peers[pid];
+      if (pc) {
+        const recv = pc.getReceivers().find(r => r.track && r.track.kind === 'audio' && r.track.readyState === 'live');
+        if (recv) {
+          log("audio self-heal " + pid);
+          const fresh = new MediaStream([recv.track]);
+          a.srcObject = fresh;
+          a.muted = false;
+          a.volume = 1.0;
+          a.play().catch(() => {});
+          startInboundLevel(fresh, pid);
+        }
+      }
+    }
+  });
+}, 5000);
 
 window.addEventListener('online', () => {
   log("network online — refreshing connections");
@@ -2562,6 +2668,7 @@ function renderMsg(m) {
   });
 
   c.appendChild(row);
+  row._msgData = m;
   scroll();
 }
 
@@ -2576,7 +2683,33 @@ function renderSys(t) {
 
 function scroll() {
   const e = document.getElementById('msgs');
-  e.scrollTop = e.scrollHeight;
+  if (!e) return;
+  if (autoScrollEnabled) {
+    e.scrollTop = e.scrollHeight;
+  } else {
+    newMsgCount++;
+    updateNewMsgPill();
+  }
+}
+
+function updateNewMsgPill() {
+  const pill = document.getElementById('newMsgPill');
+  if (!pill) return;
+  if (newMsgCount > 0) {
+    pill.textContent = '\u2193 ' + newMsgCount + ' new message' + (newMsgCount > 1 ? 's' : '');
+    pill.classList.add('show');
+  } else {
+    pill.classList.remove('show');
+  }
+}
+
+function catchUpScroll() {
+  autoScrollEnabled = true;
+  newMsgCount = 0;
+  const pill = document.getElementById('newMsgPill');
+  if (pill) pill.classList.remove('show');
+  const e = document.getElementById('msgs');
+  if (e) e.scrollTop = e.scrollHeight;
 }
 
 function esc(t) {
