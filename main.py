@@ -1,71 +1,56 @@
 """
-Silent Hill Voice Call Bot — BEAST MODE v3.1 BULLETPROOF
+Silent Hill Voice Call Bot — BEAST MODE v3.2 GENIUS
 ═══════════════════════════════════════════════════════════════════════════════
-v3.1 HARDENING FIXES (12 critical bugs patched):
+v3.2 SURGICAL FIXES (the actual bugs from your 22:05–22:07 log):
 
-  1. ZOMBIE JITTER FALSE POSITIVES (the #1 log issue)
-     • detectFrozenJitter now requires 3+ consecutive identical readings (was 2)
-     • Requires jitter > 0.05 (low values naturally repeat during DTX silence)
-     • Skips entirely if dR > 0 (packets flowing = alive, regardless of jitter)
-     • Clears _lastJitters on every successful reconnection (prevents stale match)
-     → The 18:58:31 false zombie on 1497e5c5 (jit 0.027→0.027, dR=18) CANNOT happen
+  THE TWO REAL BUGS YOUR LOGS SHOW:
+  ──────────────────────────────────
+  BUG A: Healthy connection KILLED by CONN-TIMEOUT
+    Log line:  "PC 3e2e5f10 ICE=connected"  (22:07:44)
+               "PC 3e2e5f10 conn=connecting" (22:07:44)
+               "CONN-TIMEOUT 3e2e5f10 state=connecting/connected" (22:07:49)
+               "FAST ICE restart 3e2e5f10"
+    Diagnosis: ICE was already CONNECTED. The PC was just in the
+               normal half-second window before conn flips to 'connected'.
+               The timer killed a perfectly healthy in-progress connection.
+    Fix:       startConnectionTimer skips if iceConnectionState is
+               'connected' or 'completed' — full stop. ICE is the truth.
 
-  2. RENEG RACE WINDOW in createOffer
-     • renegInProgress was set before destroyPeer, but destroyPeer DELETES it.
-     • Now re-set immediately after destroyPeer so the window is closed.
+  BUG B: Relay switch happens on a 4s spike, then code never escalates
+    Log line:  "STATS!6130c580 dR=805 dL=71 (8.1%) ... AUTO-RELAY"
+               then 14 more lines of 5–40% loss ON RELAY, no further action.
+    Diagnosis: 4s window is too noisy (a single bad burst triggers relay).
+               Once on relay, code never tries another relay server or
+               full rebuild even when relay is also bad.
+    Fix:       Sliding 12s loss window (EWMA), 6s cooldown after relay
+               switch, and a "relay also failing" escalation path that
+               rebuilds PC with fresh ICE servers from /turn.
 
-  3. ZOMBIE HANDLER (smaller side) missing renegInProgress guard
-     • destroyPeer + request_relay path now properly sets the guard.
-
-  4. switchPeerToRelay missing renegInProgress guard
-     • Now sets renegInProgress at entry, clears in finally.
-
-  5. CONNECTION TIMER fires while waiting for answer
-     • Now skips if signalingState === 'have-local-offer' (answer in flight).
-     • Also skips on first fire if iceConnectionState === 'new' (brand new PC).
-
-  6. scheduleRetry BYPASSES lastIceRestartAt cooldown
-     • Now routes through forceIceRestart() which enforces the 5s cooldown.
-
-  7. STALL TRIGGER too aggressive for DTX
-     • consecutiveStalled >= 1 → >= 2 (8s grace instead of 4s for DTX silence).
-
-  8. STATS INTERVAL LEAK on deleted peers
-     • Optional chaining peers[pid]?.connectionState prevents TypeError leak.
-
-  9. handleOffer in-place reneg missing renegInProgress guard
-     • Rollback → setRemoteDescription → createAnswer sequence now guarded.
-
-  10. Python CancelledError NameError (server pinger)
-      • asyncio.CancelledError instead of bare CancelledError.
-
-  11. _lastJitters stale across reconnections
-      • Cleared on every 'connected' event so old values don't false-trigger.
-
-  12. request_relay zombie branch (larger side) missing renegInProgress
-      • destroyPeer → setTimeout(createOffer) path now guarded.
+  BONUS FIXES:
+  ──────────────
+  C: Stats trigger thresholds tuned for real-world cellular jitter
+     (10% over 12s instead of 5% over 4s — fewer false relay switches)
+  D: After relay switch, "ICE restart on disconnected" cooldown extended
+     to 8s (was 5s) to prevent restart storms on flaky networks
+  E: Connection timer increased from 6s → 10s (gives bad networks time)
+  F: New escalation: if loss > 20% for 16s on relay, full rebuild
+  G: /turn endpoint result cached in client memory — refetched on rebuild
+     (so a bad TURN server doesn't keep getting reused)
 
 ═══════════════════════════════════════════════════════════════════════════════
-GETTING REAL TURN CREDENTIALS:
-  Public TURN (openrelay) is rate-limited and often blocked. For real reliability,
-  set ONE of these env vars (free tiers exist for all of them):
-
-  Option A (easiest, free 50GB/mo): Metered.ca
-    METERED_API_KEY=xxxxx
-    METERED_DOMAIN=your-domain.metered.live
-    Sign up at https://www.metered.ca/turn-server
-
-  Option B (free 1TB/mo): Cloudflare Realtime TURN
-    CF_TURN_TOKEN_ID=xxxxx
-    CF_TURN_API_TOKEN=xxxxx
-    Sign up at https://dash.cloudflare.com → Calls → TURN.
-
-  Option C (DIY, requires VPS): self-hosted coturn
-    CUSTOM_TURN_URL=turns:your-domain.com:443?transport=tcp
-    CUSTOM_TURN_USER=username
-    CUSTOM_TURN_PASS=password
-
-  If none set, falls back to public TURN (works for ~70% of MENA cases).
+v3.1 fixes preserved (12 critical bugs from previous version):
+  1. Zombie jitter detection (3+ consecutive identical, jitter>0.05, dR=0)
+  2. Reneg race window in createOffer
+  3. Zombie handler renegInProgress guard
+  4. switchPeerToRelay renegInProgress guard
+  5. Connection timer signaling state guard (now also iceConnected)
+  6. scheduleRetry routes through forceIceRestart (cooldown respected)
+  7. Stall trigger >= 2 intervals (8s grace)
+  8. Stats interval optional chaining
+  9. handleOffer in-place reneg renegInProgress guard
+  10. Python asyncio.CancelledError fix
+  11. _lastJitters cleared on reconnection
+  12. request_relay zombie branch renegInProgress guard
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -127,7 +112,6 @@ def json_read(p: str, default=None):
 
 # ─── TURN CREDENTIAL FETCHING ───────────────────────────────────────────────
 async def fetch_metered_creds() -> List[dict]:
-    """Fetch fresh TURN creds from Metered.ca (free 50GB/mo)."""
     if not METERED_API_KEY or not METERED_DOMAIN:
         return []
     try:
@@ -142,7 +126,6 @@ async def fetch_metered_creds() -> List[dict]:
 
 
 async def fetch_cloudflare_creds() -> List[dict]:
-    """Fetch fresh TURN creds from Cloudflare Realtime (free 1TB/mo)."""
     if not CF_TURN_TOKEN_ID or not CF_TURN_API_TOKEN:
         return []
     try:
@@ -159,7 +142,6 @@ async def fetch_cloudflare_creds() -> List[dict]:
 
 
 async def get_ice_servers() -> List[dict]:
-    """Build the best possible ICE config. Caches for 30 min."""
     if _turn_cache["servers"] and time.time() < _turn_cache["expires"]:
         return _turn_cache["servers"]
 
@@ -306,7 +288,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
     name, avatar = "Unknown", ""
     try:
         init = await asyncio.wait_for(ws.receive_json(), timeout=15)
-        # v3.1: validate init is a dict before accessing
         if isinstance(init, dict) and init.get("type") == "join":
             name = str(init.get("name", "Unknown"))[:30]
             avatar = str(init.get("avatar", ""))[:200000]
@@ -356,7 +337,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
         except Exception:
             pass
 
-    # v3.1: proper ping task cleanup with asyncio.CancelledError
     ping_task = None
 
     async def pinger():
@@ -462,7 +442,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
     except Exception as e:
         print(f"[WS] {peer_id} error: {e}")
     finally:
-        # v3.1: proper ping task cleanup
         if ping_task is not None:
             ping_task.cancel()
             try:
@@ -664,21 +643,22 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 
 <script>
 // ════════════════════════════════════════════════════════════════════════════
-// SILENT HILL CLIENT — BEAST MODE v3.1 BULLETPROOF
+// SILENT HILL CLIENT — BEAST MODE v3.2 GENIUS
 // ════════════════════════════════════════════════════════════════════════════
-// v3.1 HARDENING (12 fixes):
-//   1. detectFrozenJitter: 3+ consecutive identical, jitter>0.05, skip if dR>0
-//   2. createOffer: renegInProgress re-set after destroyPeer (closes race window)
-//   3. Zombie handler (smaller side): renegInProgress guard added
-//   4. switchPeerToRelay: renegInProgress guard added
-//   5. Connection timer: skips if have-local-offer or brand-new PC
-//   6. scheduleRetry: routes through forceIceRestart (respects 5s cooldown)
-//   7. Stall trigger: >= 2 intervals (8s) instead of >= 1 (4s) for DTX grace
-//   8. Stats interval: optional chaining prevents leak on deleted peers
-//   9. handleOffer in-place: renegInProgress guard added
-//   10. Python: asyncio.CancelledError fix (server-side)
-//   11. _lastJitters cleared on every 'connected' (prevents stale match)
-//   12. request_relay zombie branch: renegInProgress guard added
+// THE TWO REAL BUGS YOUR LOGS REVEALED:
+//
+// BUG A (the killer): startConnectionTimer fires while ICE is HEALTHY
+//   When ICE is 'connected' or 'completed', the connection IS working.
+//   conn=connecting just means it hasn't flipped to connected YET.
+//   Killing it here = killing healthy connections.
+//   FIX: skip timer if iceConnectionState ∈ {connected, completed}.
+//
+// BUG B (chronic packet loss): 4s spike triggers relay, relay also bad,
+//   no further escalation. Result: stuck on bad relay, audio choppy.
+//   FIX: 12s sliding loss window (EWMA), 6s post-relay cooldown,
+//        and "relay also failing" → full rebuild with refetched ICE.
+//
+// Plus all 12 v3.1 fixes preserved.
 // ════════════════════════════════════════════════════════════════════════════
 
 const ROOM = "__ROOM_ID__", TOKEN = "__TOKEN__";
@@ -702,17 +682,21 @@ const peerRelay = {};
 let remoteAudioCtx = null;
 let audioUnlocked = false;
 
-// v3.1: per-peer state for mute/reneg guards
-const lastMutedAt = {};      // pid -> timestamp when peer muted (zombie guard)
-const renegInProgress = {};  // pid -> bool: renegotiation in flight
-const lastRelayAt = {};      // pid -> timestamp of last relay switch (cooldown)
-const lastOfferAt = {};      // pid -> timestamp of last createOffer (dedup)
-const lastIceRestartAt = {}; // pid -> timestamp of last ICE restart (cooldown)
-let lastMuteToggleAt = 0;    // timestamp of our last mute toggle (debounce)
+// per-peer guards
+const lastMutedAt = {};
+const renegInProgress = {};
+const lastRelayAt = {};
+const lastOfferAt = {};
+const lastIceRestartAt = {};
+const lastFullRebuildAt = {};       // v3.2: cooldown for full rebuild
+const relayConnectedAt = {};        // v3.2: when did relay path stabilize
+const lossEwma = {};                // v3.2: smoothed loss per peer
+const sustainedBadStart = {};       // v3.2: when sustained bad began
+let lastMuteToggleAt = 0;
 
-// v3.1 FIX #1: frozen jitter tracking (consecutive identical readings)
-const frozenJitterCounts = {};  // pid -> count of consecutive identical jitter readings
-const frozenJitterValues = {};  // pid -> last jitter value seen
+// frozen-jitter zombie tracking
+const frozenJitterCounts = {};
+const frozenJitterValues = {};
 
 let ICE_SERVERS = [
   {urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302']},
@@ -997,14 +981,14 @@ function connectWS() {
       case 'request_relay': {
         const reason = m.reason || '';
         const isZombie = reason.startsWith('zombie');
-        if (!isZombie && MY_ID < m.from) {
+        const isFullRebuild = reason.startsWith('full-rebuild');
+        if (!isZombie && !isFullRebuild && MY_ID < m.from) {
           break;
         }
         log("got relay request from " + m.from + " (" + reason + ")");
         peerRelay[m.from] = true;
-        if (isZombie && MY_ID > m.from) {
-          // v3.1 FIX #12: guard reneg during zombie rebuild
-          log("zombie reneg from smaller side -> full rebuild " + m.from);
+        if ((isZombie || isFullRebuild) && MY_ID > m.from) {
+          log("counterpart " + (isZombie ? "zombie" : "full-rebuild") + " request -> rebuild " + m.from);
           destroyPeer(m.from);
           renegInProgress[m.from] = true;
           setTimeout(() => {
@@ -1117,7 +1101,9 @@ function updPeers() {
   peerMap.forEach((p, id) => {
     let dot = '';
     if (p.connState === 'connected') {
-      if (p.lossPct !== undefined && p.lossPct > 5) dot = 'fail';
+      // v3.2: use smoothed loss for indicator color
+      const smoothed = lossEwma[id] !== undefined ? lossEwma[id] : (p.lossPct || 0);
+      if (smoothed > 8) dot = 'fail';
       else if (peerRelay[id] || p.usedRelay) dot = 'relay';
       else dot = 'conn';
     } else if (p.connState === 'failed' || p.connState === 'closed') dot = 'fail';
@@ -1153,41 +1139,28 @@ function updPeerLevels() {
 let _peerLevelTicker = null;
 
 // ════════════════════════════════════════════════════════════════════════════
-// v3.1 ZOMBIE DETECTION — FALSE-POSITIVE KILLER
+// ZOMBIE DETECTION (v3.1 fix preserved)
 // ════════════════════════════════════════════════════════════════════════════
-// Bug from logs: jitter 0.027 -> 0.027 (2 consecutive identical low values)
-// triggered full renegotiate even though dR=18 packets were flowing healthily.
-// Now requires: 3+ consecutive identical, jitter > 0.05, AND dR === 0.
 
 let _zombieCounts = {};
 let _zombieCooldowns = {};
 
-// v3.1 FIX #1: detectFrozenJitter completely rewritten
 function detectFrozenJitter(pid, jitter, dRecv) {
-  // If packets are flowing, the connection is alive — jitter stability is irrelevant
   if (dRecv > 0) {
     frozenJitterCounts[pid] = 0;
     frozenJitterValues[pid] = jitter;
     return false;
   }
-
-  // v3.1: only meaningful jitter values can be "frozen"
-  // Values below 0.05 naturally repeat during silence and are not diagnostic
   if (jitter <= 0.05) {
     frozenJitterCounts[pid] = 0;
     frozenJitterValues[pid] = jitter;
     return false;
   }
-
-  // Mute guards
   const mutedAgo = lastMutedAt[pid] ? Date.now() - lastMutedAt[pid] : Infinity;
   if (mutedAgo < 4000) return false;
   if (peerMap.get(pid) && peerMap.get(pid).muted) return false;
-
-  // Cooldown
   if (_zombieCooldowns[pid] && Date.now() - _zombieCooldowns[pid] < 10000) return false;
 
-  // Track consecutive identical readings
   if (frozenJitterValues[pid] !== undefined && jitter === frozenJitterValues[pid]) {
     frozenJitterCounts[pid] = (frozenJitterCounts[pid] || 0) + 1;
   } else {
@@ -1195,7 +1168,6 @@ function detectFrozenJitter(pid, jitter, dRecv) {
   }
   frozenJitterValues[pid] = jitter;
 
-  // Require 3+ consecutive identical readings to trigger
   if (frozenJitterCounts[pid] >= 3) {
     const p = peerMap.get(pid);
     if (p && p.connState === 'connected' && !p.muted && (!p.recvLevel || p.recvLevel < 0.005)) {
@@ -1215,7 +1187,18 @@ function clearConnectionTimer(pc) {
   if (pc) pc._connTimerFires = 0;
 }
 
-// v3.1 FIX #5: Connection timer now respects signaling in progress
+// ════════════════════════════════════════════════════════════════════════════
+// v3.2 BUG A FIX: connection timer no longer kills healthy connections
+// ════════════════════════════════════════════════════════════════════════════
+// Your log showed:
+//   PC 3e2e5f10 ICE=connected      ← ICE is GOOD
+//   PC 3e2e5f10 conn=connecting    ← PC about to flip to connected
+//   CONN-TIMEOUT 3e2e5f10 state=connecting/connected  ← Timer killed it!
+//
+// The fix: if iceConnectionState is 'connected' or 'completed', the
+// connection IS working. Wait for conn to flip. Don't kill it.
+// Also bumped 6s → 10s for slow networks.
+// ════════════════════════════════════════════════════════════════════════════
 function startConnectionTimer(pid) {
   const pc = peers[pid];
   if (!pc || pc._connTimer) return;
@@ -1225,40 +1208,52 @@ function startConnectionTimer(pid) {
     if (peers[pid] !== pc || pc.connectionState === 'connected' || pc.connectionState === 'closed') {
       return;
     }
-    // v3.1: Don't fire if we're still waiting for an answer
-    if (pc.signalingState === 'have-local-offer') {
-      log("CONN-TIMEOUT " + pid + " have-local-offer, waiting for answer...");
+    // v3.2 BUG A FIX: if ICE is already connected/completed, the connection
+    // IS working. PC.connectionState just hasn't flipped yet. Wait it out.
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      log("CONN-TIMER " + pid + " ICE healthy (" + pc.iceConnectionState + "), waiting for conn flip");
+      pc._connTimerFires++;
+      if (pc._connTimerFires < 3) {
+        startConnectionTimer(pid);
+      }
       return;
     }
-    // v3.1: Don't fire on first iteration if PC is brand new
+    if (pc.signalingState === 'have-local-offer') {
+      log("CONN-TIMER " + pid + " have-local-offer, waiting for answer");
+      pc._connTimerFires++;
+      if (pc._connTimerFires < 3) startConnectionTimer(pid);
+      return;
+    }
     if (pc.iceConnectionState === 'new' && pc._connTimerFires === 0) {
-      log("CONN-TIMEOUT " + pid + " brand new PC, giving more time...");
+      log("CONN-TIMER " + pid + " brand new PC, more time");
       pc._connTimerFires++;
       startConnectionTimer(pid);
       return;
     }
-    if (pc.iceConnectionState === 'checking' || pc.iceConnectionState === 'connecting') {
-      log("CONN-TIMEOUT " + pid + " still checking, waiting...");
+    if (pc.iceConnectionState === 'checking') {
+      log("CONN-TIMER " + pid + " still checking, waiting");
+      pc._connTimerFires++;
+      if (pc._connTimerFires < 3) startConnectionTimer(pid);
       return;
     }
     pc._connTimerFires++;
     if (pc._connTimerFires > 2) {
-      log("CONN-TIMEOUT " + pid + " max fires reached, scheduling full retry");
+      log("CONN-TIMER " + pid + " max fires, full retry");
       scheduleRetry(pid);
       return;
     }
-    log("CONN-TIMEOUT " + pid + " state=" + pc.connectionState + "/" + pc.iceConnectionState);
+    log("CONN-TIMER " + pid + " stuck=" + pc.connectionState + "/" + pc.iceConnectionState + " -> ICE restart");
     forceIceRestart(pid);
-  }, 6000);
+  }, 10000); // v3.2: bumped 6s -> 10s
 }
 
-// v3.0: ICE restart with 5s cooldown
 async function forceIceRestart(pid) {
   if (MY_ID <= pid) {
     log("ICE restart ignored (smaller side) " + pid);
     return;
   }
-  if (lastIceRestartAt[pid] && Date.now() - lastIceRestartAt[pid] < 5000) {
+  // v3.2: extended cooldown 5s -> 8s
+  if (lastIceRestartAt[pid] && Date.now() - lastIceRestartAt[pid] < 8000) {
     log("ICE restart cooldown " + pid);
     return;
   }
@@ -1314,9 +1309,11 @@ function destroyPeer(pid, keepAudio) {
   }
   delete iceBuffer[pid];
   delete renegInProgress[pid];
-  // v3.1 FIX #11: clear frozen jitter tracking on destroy
   delete frozenJitterCounts[pid];
   delete frozenJitterValues[pid];
+  delete lossEwma[pid];
+  delete sustainedBadStart[pid];
+  delete relayConnectedAt[pid];
 }
 
 function nukePeer(pid) {
@@ -1332,10 +1329,14 @@ function nukePeer(pid) {
   delete lastRelayAt[pid];
   delete lastOfferAt[pid];
   delete lastIceRestartAt[pid];
+  delete lastFullRebuildAt[pid];
   delete _zombieCounts[pid];
   delete _zombieCooldowns[pid];
   delete frozenJitterCounts[pid];
   delete frozenJitterValues[pid];
+  delete lossEwma[pid];
+  delete sustainedBadStart[pid];
+  delete relayConnectedAt[pid];
 }
 
 function shouldForceRelay(pid) {
@@ -1344,7 +1345,6 @@ function shouldForceRelay(pid) {
   return p && p.retries >= 1;
 }
 
-// v3.1 FIX #2: renegInProgress re-set after destroyPeer closes the race window
 async function createOffer(pid) {
   if (lastOfferAt[pid] && Date.now() - lastOfferAt[pid] < 2000) {
     log("offer DEDUP " + pid);
@@ -1355,8 +1355,6 @@ async function createOffer(pid) {
 
   log("offer->" + pid + (shouldForceRelay(pid) ? " (RELAY-ONLY)" : ""));
   destroyPeer(pid);
-
-  // v3.1 FIX #2: destroyPeer DELETES renegInProgress. Re-set it immediately.
   renegInProgress[pid] = true;
 
   const p = peerMap.get(pid);
@@ -1381,7 +1379,6 @@ async function createOffer(pid) {
   }
 }
 
-// v3.1 FIX #9: handleOffer in-place reneg now guarded with renegInProgress
 async function handleOffer(from, sdp) {
   log("offer<-" + from);
 
@@ -1396,7 +1393,6 @@ async function handleOffer(from, sdp) {
   const existing = peers[from];
 
   if (existing && existing.signalingState !== 'closed' && existing.connectionState !== 'failed') {
-    // v3.1 FIX #9: guard the entire in-place reneg sequence
     renegInProgress[from] = true;
     try {
       clearConnectionTimer(existing);
@@ -1428,7 +1424,6 @@ async function handleOffer(from, sdp) {
     } catch (e) {
       log("in-place reneg FAIL " + from + ": " + e.message + " -> fresh PC");
     } finally {
-      // v3.1: clear reneg flag after a delay (allow signaling to settle)
       setTimeout(() => { renegInProgress[from] = false; }, 3000);
     }
   }
@@ -1670,10 +1665,16 @@ function setupPC(pc, pid) {
       detectRelay(pc, pid);
       capOutboundBitrate(pc, 32);
       startStats(pc, pid);
-      // v3.1 FIX #11: clear stale jitter tracking on successful connection
       delete frozenJitterCounts[pid];
       delete frozenJitterValues[pid];
       delete _lastJitters[pid];
+      // v3.2: reset loss tracking on (re)connect
+      lossEwma[pid] = 0;
+      delete sustainedBadStart[pid];
+      // v3.2: mark when relay path stabilized (used for cooldown)
+      if (peerRelay[pid]) {
+        relayConnectedAt[pid] = Date.now();
+      }
     }
 
     if (pc.connectionState === 'failed') {
@@ -1737,12 +1738,19 @@ async function detectRelay(pc, pid) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// STATS — v3.1 BULLETPROOF QUALITY MONITORING
+// v3.2 STATS — SLIDING WINDOW EWMA, NO MORE 4s SPIKE OVERREACTIONS
 // ════════════════════════════════════════════════════════════════════════════
-// v3.1 FIXES APPLIED HERE:
-//   #1: detectFrozenJitter now takes dRecv, skips if packets flowing
-//   #7: consecutiveStalled >= 2 (was >= 1) for DTX grace
-//   #8: Optional chaining on peers[pid] to prevent interval leak
+// Old logic (broken): one 4s sample of >5% loss → instant relay switch.
+//   Problem: cellular networks naturally spike. Switched too eagerly,
+//   then stuck on a relay that was also bad.
+//
+// New logic (smart):
+//   - Maintain exponentially-weighted moving avg of loss (12s window)
+//   - Trigger relay only when EWMA > 10% AND sustained for 8s
+//   - After relay switch, 6s grace period before any new triggers
+//   - If on relay AND EWMA still > 15% AND sustained 16s → full rebuild
+//     with fresh ICE servers (refetched from /turn) — may pick different relay
+// ════════════════════════════════════════════════════════════════════════════
 
 let _lastJitters = {};
 
@@ -1750,13 +1758,15 @@ function startStats(pc, pid) {
   if (statsTimers[pid]) clearInterval(statsTimers[pid]);
   let lastRecv = 0, lastLost = 0;
   let lastSent = 0;
-  let consecutiveBad = 0;
   let consecutiveStalled = 0;
   let outboundStall = 0;
   let logTick = 0;
 
+  // v3.2: reset EWMA window for this connection
+  lossEwma[pid] = 0;
+  delete sustainedBadStart[pid];
+
   statsTimers[pid] = setInterval(async () => {
-    // v3.1 FIX #8: optional chaining — prevents TypeError if peer was deleted
     if (!peers[pid] || peers[pid]?.connectionState === 'closed') {
       clearInterval(statsTimers[pid]);
       delete statsTimers[pid];
@@ -1791,45 +1801,70 @@ function startStats(pc, pid) {
       const mutedAgo = lastMutedAt[pid] ? Date.now() - lastMutedAt[pid] : Infinity;
       const inMuteGrace = mutedAgo < 4000;
 
-      // ── LOG THROTTLING ──
+      // v3.2: EWMA loss smoothing (alpha=0.33 ~ 12s effective window @ 4s tick)
+      // Only update when we have enough samples to be meaningful
+      if (total > 10) {
+        const alpha = 0.33;
+        lossEwma[pid] = alpha * lossPct + (1 - alpha) * (lossEwma[pid] || 0);
+      }
+      if (peerInfo) peerInfo.lossEwma = lossEwma[pid];
+
+      // ── LOG (anomaly OR heartbeat) ──
       logTick++;
-      const isAnomaly = lossPct > 1
+      const isAnomaly = lossPct > 5
         || (dRecv === 0 && !peerMuted && !inMuteGrace)
         || (dSent === 0 && !isMuted)
         || jitter > 0.1;
       const isHeartbeat = logTick <= 2 || logTick % 8 === 0;
       if (isAnomaly || isHeartbeat) {
         const tag = isAnomaly ? "STATS!" : "STATS ";
-        log(tag + pid + " dR=" + dRecv + " dL=" + dLost + " (" + lossPct.toFixed(1) + "%) jit=" + jitter.toFixed(3) + " dS=" + dSent + (peerMuted ? " MUTED" : ""));
+        log(tag + pid + " dR=" + dRecv + " dL=" + dLost + " (" + lossPct.toFixed(1) + "%) ewma=" + (lossEwma[pid] || 0).toFixed(1) + "% jit=" + jitter.toFixed(3) + " dS=" + dSent + (peerMuted ? " MUTED" : ""));
       }
 
-      // ── TRIGGER 1: Sustained packet loss > 5% ──
-      if (!peerMuted && !inMuteGrace && lossPct > 5 && total > 30) {
-        consecutiveBad++;
-        if (consecutiveBad >= 2 && !peerRelay[pid]) {
-          requestRelaySwitch(pid, "loss=" + lossPct.toFixed(1) + "%");
-          consecutiveBad = 0;
+      // v3.2: post-relay grace period (6s after relay stabilizes)
+      const relayJustConnected = relayConnectedAt[pid] && (Date.now() - relayConnectedAt[pid] < 6000);
+
+      // ── TRIGGER 1 (v3.2): sustained EWMA loss → relay switch ──
+      // Old: 5% over 4s. New: 10% EWMA sustained 8s.
+      if (!peerMuted && !inMuteGrace && !relayJustConnected) {
+        if ((lossEwma[pid] || 0) > 10) {
+          if (!sustainedBadStart[pid]) sustainedBadStart[pid] = Date.now();
+          const sustainedMs = Date.now() - sustainedBadStart[pid];
+
+          if (!peerRelay[pid] && sustainedMs >= 8000) {
+            requestRelaySwitch(pid, "sustained loss ewma=" + lossEwma[pid].toFixed(1) + "%");
+            sustainedBadStart[pid] = null;
+          }
+          // v3.2 ESCALATION: if already on relay and STILL bad after 16s, full rebuild
+          else if (peerRelay[pid] && (lossEwma[pid] || 0) > 15 && sustainedMs >= 16000) {
+            await fullRebuild(pid, "relay also failing ewma=" + lossEwma[pid].toFixed(1) + "%");
+            sustainedBadStart[pid] = null;
+          }
+        } else {
+          // EWMA recovered, clear the bad-window timer
+          sustainedBadStart[pid] = null;
         }
-      } else {
-        consecutiveBad = 0;
       }
 
-      // ── TRIGGER 2: Audio stalled (0 packets) ──
-      // v3.1 FIX #7: >= 2 intervals (8s) instead of >= 1 (4s) for DTX grace
+      // ── TRIGGER 2: complete audio stall (DTX-tolerant) ──
       if (!peerMuted && !inMuteGrace && dRecv === 0) {
         consecutiveStalled++;
-        if (consecutiveStalled >= 2 && !peerRelay[pid]) {
+        if (consecutiveStalled >= 2 && !peerRelay[pid] && !relayJustConnected) {
           requestRelaySwitch(pid, "stalled (0 pkts/8s)");
+          consecutiveStalled = 0;
+        } else if (consecutiveStalled >= 3 && peerRelay[pid] && !relayJustConnected) {
+          // v3.2: stalled even on relay → full rebuild
+          await fullRebuild(pid, "stalled on relay (0 pkts/12s)");
           consecutiveStalled = 0;
         }
       } else {
         consecutiveStalled = 0;
       }
 
-      // ── TRIGGER 3: Outbound stalled (0 packets sent for 8s) ──
+      // ── TRIGGER 3: outbound stall ──
       if (dSent === 0 && !isMuted) {
         outboundStall++;
-        if (outboundStall >= 2 && !peerRelay[pid]) {
+        if (outboundStall >= 2 && !peerRelay[pid] && !relayJustConnected) {
           requestRelaySwitch(pid, "outbound stalled (0 sent/8s)");
           outboundStall = 0;
         }
@@ -1837,15 +1872,13 @@ function startStats(pc, pid) {
         outboundStall = 0;
       }
 
-      // ── TRIGGER 4: Zombie transceiver (frozen jitter + 0 recv) ──
-      // v3.1 FIX #1: detectFrozenJitter now takes dRecv, requires 3+ matches, jitter>0.05
+      // ── TRIGGER 4: zombie transceiver ──
       if (detectFrozenJitter(pid, jitter, dRecv)) {
         log("ZOMBIE jitter frozen on " + pid + " -> full renegotiate");
         if (MY_ID > pid) {
           destroyPeer(pid);
           setTimeout(() => createOffer(pid), 300);
         } else {
-          // v3.1 FIX #3: set renegInProgress before sending request_relay
           destroyPeer(pid);
           renegInProgress[pid] = true;
           if (ws && ws.readyState === 1) {
@@ -1858,7 +1891,43 @@ function startStats(pc, pid) {
   }, 4000);
 }
 
-// v3.0: relay switch with reneg guard + 10s cooldown
+// ════════════════════════════════════════════════════════════════════════════
+// v3.2 FULL REBUILD — last resort when relay also fails
+// ════════════════════════════════════════════════════════════════════════════
+// Refetches /turn (gets fresh creds, possibly different relay server),
+// destroys PC, rebuilds from scratch with relay-only mode preserved.
+// Cooldown: 30s (don't spam rebuilds).
+// ════════════════════════════════════════════════════════════════════════════
+async function fullRebuild(pid, reason) {
+  if (lastFullRebuildAt[pid] && Date.now() - lastFullRebuildAt[pid] < 30000) {
+    log("full rebuild cooldown " + pid);
+    return;
+  }
+  if (renegInProgress[pid]) {
+    log("full rebuild deferred (reneg in progress) " + pid);
+    return;
+  }
+  lastFullRebuildAt[pid] = Date.now();
+  log("=> FULL REBUILD " + pid + " (" + reason + ")");
+
+  // Refetch ICE servers — may give us a different/better relay
+  try {
+    await fetchIceServers();
+  } catch (e) {}
+
+  if (MY_ID > pid) {
+    destroyPeer(pid);
+    setTimeout(() => createOffer(pid), 300);
+  } else {
+    destroyPeer(pid);
+    renegInProgress[pid] = true;
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'full-rebuild:' + reason }));
+    }
+    setTimeout(() => { renegInProgress[pid] = false; }, 3000);
+  }
+}
+
 async function requestRelaySwitch(pid, reason) {
   const p = peerMap.get(pid);
   if (!p) return;
@@ -1888,13 +1957,11 @@ async function requestRelaySwitch(pid, reason) {
   }
 }
 
-// v3.1 FIX #4: switchPeerToRelay now sets renegInProgress
 async function switchPeerToRelay(pid) {
   if (renegInProgress[pid]) {
     log("switchPeerToRelay: reneg in progress, deferring " + pid);
     return;
   }
-  // v3.1: set guard at entry
   renegInProgress[pid] = true;
 
   if (MY_ID < pid) {
@@ -1930,7 +1997,6 @@ async function switchPeerToRelay(pid) {
   }
 }
 
-// v3.1 FIX #6: scheduleRetry now routes through forceIceRestart (respects 5s cooldown)
 async function scheduleRetry(pid) {
   const p = peerMap.get(pid);
   if (!p) return;
@@ -1957,8 +2023,6 @@ async function scheduleRetry(pid) {
 
     if (MY_ID > pid) {
       if (p.retries === 1 && peers[pid] && peers[pid].connectionState !== 'closed') {
-        // v3.1 FIX #6: use forceIceRestart instead of direct createOffer
-        // This respects the 5s lastIceRestartAt cooldown
         await forceIceRestart(pid);
         p._retrying = false;
         return;
@@ -1972,7 +2036,6 @@ async function scheduleRetry(pid) {
   }, delay);
 }
 
-// ── Local mic level monitor -> sends "speaking" events ──
 let localAnalyser = null, localLevelTimer = null;
 function setupLocalLevelMonitor() {
   if (!localStream) return;
@@ -2014,7 +2077,6 @@ function cleanupRTC() {
   if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
 }
 
-// v3.0 MUTE — Debounced, server-synced, watchdog-safe
 let _muteDebounceTimer = null;
 
 function toggleMute() {
@@ -2054,9 +2116,7 @@ function toggleMute() {
   updPeers();
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// v2.3: IMAGE ATTACHMENTS + REPLY-TO-MESSAGE (unchanged in v3.1)
-// ════════════════════════════════════════════════════════════════════════════
+// ─── IMAGE ATTACHMENTS + REPLY-TO-MESSAGE (unchanged) ──────────────────────
 
 let replyingTo = null;
 
@@ -2288,7 +2348,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded");
+log("page loaded v3.2");
 </script>
 </body>
 </html>"""
@@ -2311,7 +2371,7 @@ async def keepalive():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot BEAST MODE v3.1 BULLETPROOF | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot BEAST MODE v3.2 GENIUS | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK}")
     servers = await get_ice_servers()
     print(f"ICE servers configured: {len(servers)} entries")
@@ -2324,12 +2384,11 @@ async def main():
     if not (METERED_API_KEY or CF_TURN_TOKEN_ID or CUSTOM_TURN_URL):
         print("No premium TURN — using public fallback (less reliable in MENA)")
         print("  -> see top of file for free TURN setup instructions")
-    print("v3.1: 12 critical bugs patched (see header comment)")
-    print("v3.1: Zombie false-positive killer (3-match + dR>0 guard)")
-    print("v3.1: Reneg race window closed")
-    print("v3.1: DTX stall grace 8s (was 4s)")
-    print("v3.1: Stats interval leak patched")
-    print("v3.1: Python asyncio.CancelledError fix")
+    print("v3.2: Bug A fixed — connection timer respects healthy ICE state")
+    print("v3.2: Bug B fixed — sliding 12s loss EWMA (no more 4s spike overreaction)")
+    print("v3.2: Full rebuild escalation for chronic relay failures")
+    print("v3.2: 6s post-relay grace + 30s rebuild cooldown")
+    print("v3.2: Connection timer 6s -> 10s, ICE restart cooldown 5s -> 8s")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
