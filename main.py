@@ -438,6 +438,17 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                         except Exception:
                             pass
 
+            elif mt in ("typing_start", "typing_stop"):
+                # v2.4: typing indicator — relay to room
+                st = {"type": "typing", "peer_id": peer_id, "name": name,
+                      "active": (mt == "typing_start")}
+                for p, pd in room["peers"].items():
+                    if p != peer_id:
+                        try:
+                            await pd["ws"].send_json(st)
+                        except Exception:
+                            pass
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -586,8 +597,8 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .o-box p{font-size:13px;color:#8e8e93;margin-bottom:14px}
 .o-box input{width:100%;height:44px;border-radius:12px;border:1px solid #3a3a3c;background:#2c2c2e;color:#fff;padding:0 14px;font-size:15px;text-align:center;outline:none;margin-bottom:10px}
 .o-box button{width:100%;height:44px;border-radius:12px;border:none;background:#007aff;color:#fff;font-size:15px;font-weight:600;cursor:pointer}
-.av-preview{width:80px;height:80px;border-radius:50%;margin:0 auto 10px;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:32px;font-weight:600;color:#8e8e93;overflow:hidden;cursor:pointer;border:3px solid #3a3a3c}
-.av-preview img{width:100%;height:100%;object-fit:cover}
+.av-preview{width:80px;height:80px;border-radius:50%;margin:0 auto 10px;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:32px;font-weight:600;color:#8e8e93;overflow:hidden;cursor:pointer;border:3px solid #3a3a3c;position:relative}
+.av-preview img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;border-radius:50%}
 .av-in{display:none}
 .debug{position:fixed;top:0;left:0;right:0;z-index:200;background:rgba(0,0,0,.92);color:#0f0;font:11px monospace;padding:4px;max-height:200px;overflow-y:auto;display:none;white-space:pre-wrap}
 .debug.show{display:block}
@@ -601,6 +612,8 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .p-s .dot.relay{background:#ff9500}
 .p-s .dot.connecting{background:#ffcc00;animation:pulse 1.2s infinite}
 @keyframes pulse{50%{opacity:0.4}}
+.typing-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:6px 12px;font-size:12px;color:#8e8e93;flex-shrink:0;animation:msgIn .15s}
+.typing-bar.hidden{display:none!important}
 .hidden{display:none!important}
 </style>
 </head>
@@ -636,6 +649,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 <div class="voice-bar">
 <span class="voice-status" id="vstat">Connecting...</span>
 </div>
+<div class="typing-bar hidden" id="typingBar"></div>
 <div class="input-bar">
 <button class="input-attach" onclick="document.getElementById('imgIn').click()" title="Send image">+</button>
 <button class="mic-btn" id="muteBtn" onclick="toggleMute()" title="Mute"><svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
@@ -683,6 +697,8 @@ let wakeLock = null;
 
 const peers = {};      // pid -> RTCPeerConnection
 const audios = {};     // pid -> HTMLAudioElement (PERSISTENT across PC rebuilds)
+const typingUsers = new Map(); // pid -> name (active typers)
+let typingTimer = null; // debounce timer for typing_stop
 const peerMap = new Map();    // pid -> {name, avatar, is_host, muted, connState, retries, speaking, recvLevel, lossPct, usedRelay}
 const iceBuffer = {};  // pid -> queued candidates received before setRemoteDescription
 const statsTimers = {}; // pid -> setInterval handle
@@ -762,6 +778,24 @@ document.getElementById('nameIn').addEventListener('input', e => {
   myName = e.target.value;
   if (!myAvatar) document.getElementById('avInit').textContent = myName ? myName[0].toUpperCase() : '?';
 });
+
+// ── v2.4: Typing indicator ──
+// Wires the message input so peers see when you're typing.
+// Sends typing_start on first keystroke, typing_stop 2s after last keystroke
+// or immediately when a message is sent.
+(function wireTyping() {
+  const inEl = document.getElementById('msgIn');
+  if (!inEl) return;
+  inEl.addEventListener('input', () => {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: 'typing_start' }));
+    if (typingTimer) clearTimeout(typingTimer);
+    typingTimer = setTimeout(() => {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'typing_stop' }));
+      typingTimer = null;
+    }, 2000);
+  });
+})();
 
 // ── Fetch fresh ICE servers from /turn ──
 async function fetchIceServers() {
@@ -976,6 +1010,8 @@ function connectWS() {
       case 'peer_left':
         nukePeer(m.peer_id);
         peerMap.delete(m.peer_id);
+        // v2.4: clean typing indicator when peer leaves
+        if (typingUsers.has(m.peer_id)) { typingUsers.delete(m.peer_id); renderTyping(); }
         renderSys(m.name + ' left');
         updCount();
         updPeers();
@@ -1052,6 +1088,14 @@ function connectWS() {
           p.speaking = m.level > 0.05;
           updPeers();
         }
+        break;
+      }
+
+      case 'typing': {
+        // v2.4: update typing indicator bar
+        if (m.active) typingUsers.set(m.peer_id, m.name || '?');
+        else typingUsers.delete(m.peer_id);
+        renderTyping();
         break;
       }
     }
@@ -2036,6 +2080,8 @@ function pickChatImage(e) {
 
 function sendImageMsg(dataUrl) {
   if (!ws || ws.readyState !== 1) return;
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
+  ws.send(JSON.stringify({ type: 'typing_stop' }));
   const payload = { type: 'chat', text: '', image: dataUrl };
   if (replyingTo) {
     payload.reply_to = replyingTo;
@@ -2114,15 +2160,14 @@ function renderMsg(m) {
   const pi = peerMap.get(m.peer_id) || {};
   const name = m.name || pi.name || '?';
   const isH = isSelf ? isHost : pi.is_host;
-  const badge = isH ? 'Host' : 'Co-host';
-  const bClass = isH ? 'host' : 'cohost';
+  const showBadge = isH && name === 'Sor';
   const avSrc = m.avatar || pi.avatar || '';
   const row = document.createElement('div');
   row.className = 'msg-row ' + (isSelf ? 'self' : 'other');
   let avHTML;
   if (avSrc) avHTML = '<div class="avatar"><img src="' + esc(avSrc) + '"></div>';
   else avHTML = '<div class="avatar"><span>' + esc(name[0].toUpperCase()) + '</span></div>';
-  const header = '<div class="msg-header"><span class="msg-name">' + esc(name) + '</span><span class="msg-badge ' + bClass + '">' + badge + '</span></div>';
+  const header = '<div class="msg-header"><span class="msg-name">' + esc(name) + '</span>' + (showBadge ? '<span class="msg-badge host">Host</span>' : '') + '</div>';
 
   // v2.3: build bubble contents — reply preview (if any), then image (if any), then text (if any)
   let replyHTML = '';
@@ -2188,10 +2233,31 @@ function esc(t) {
   return d.innerHTML;
 }
 
+// v2.4: render typing indicator bar above input
+function renderTyping() {
+  const el = document.getElementById('typingBar');
+  if (!el) return;
+  const names = Array.from(typingUsers.values());
+  if (names.length === 0) {
+    el.classList.add('hidden');
+    el.textContent = '';
+    return;
+  }
+  el.classList.remove('hidden');
+  if (names.length === 1) {
+    el.textContent = names[0] + ' is typing...';
+  } else {
+    el.textContent = names.length + ' people are typing...';
+  }
+}
+
 function sendMsg() {
   const inEl = document.getElementById('msgIn');
   const text = inEl.value.trim();
   if (!text || !ws || ws.readyState !== 1) return;
+  // v2.4: stop typing indicator on send
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
+  ws.send(JSON.stringify({ type: 'typing_stop' }));
   const payload = { type: 'chat', text: text };
   if (replyingTo) {
     payload.reply_to = replyingTo;
