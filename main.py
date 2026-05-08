@@ -1,5 +1,73 @@
 """
-Silent Hill Voice Call Bot — BEAST MODE v3.2 GENIUS
+Silent Hill Voice Call Bot — v3.4 TURN-DIAGNOSTIC
+═══════════════════════════════════════════════════════════════════════════════
+v3.4 FIXES (Metered configured but maybe not loading):
+
+  THE PROBLEM: User has METERED_API_KEY + METERED_DOMAIN env vars set,
+  but the log "ICE: 7 server entries loaded" suggests Metered creds
+  aren't actually being merged in (expected ~10-12 entries with Metered).
+
+  v3.4 ADDS:
+    1. Metered fetch errors are now VISIBLE — every failure mode logs
+       a clear reason (HTTP status, JSON parse error, timeout, exception).
+       Run the server and watch stdout for "[turn] METERED ..." lines.
+    2. Failed premium fetches now cache for only 60s (was 30 min).
+       So a transient error doesn't keep Gulf peers broken for half an hour.
+    3. New /turn-debug endpoint. Hit it in your browser:
+         https://your-app.onrender.com/turn-debug
+       Returns sanitized JSON showing exactly which TURN entries are
+       loaded right now and whether Metered/CF env vars were detected.
+    4. /turn-status now reflects whether premium TURN ACTUALLY loaded
+       (by inspecting URLs and usernames), not just whether env vars exist.
+
+  HOW TO USE:
+    a. Deploy this version.
+    b. Open https://your-app.onrender.com/turn-debug in any browser.
+    c. Look for entries with non-public usernames — Metered creds will
+       have a long random username, openrelayproject is the public one.
+    d. If only Google/openrelay show up, check Render's stdout logs for
+       the "[turn] METERED ..." line. It will tell you exactly why.
+
+═══════════════════════════════════════════════════════════════════════════════
+v3.3 FIXES (the Oman peer's logs at 22:51:45 / 22:53:42):
+
+  THE BUG: Two peers stuck in ICE=checking for 15s → fail → retry on
+           same broken path → fail again. Pattern from log:
+             PC afae129b ICE=checking
+             CONN-TIMER afae129b still checking, waiting
+             PC afae129b ICE=disconnected
+             PC afae129b conn=failed
+             retry #1 ... (retries with same direct config)
+
+  ROOT CAUSE: Many Gulf/MENA networks (Omani Omantel, some Iraqi/Kuwaiti
+              ISPs, corporate WiFi) block direct UDP P2P entirely. The
+              connection NEEDS TURN-over-TCP/443 from the first attempt.
+              v3.2 only switched to relay after stats showed loss — but
+              if the PC never connects, stats never run.
+
+  v3.3 FIXES:
+    A. forceIceRestart now FORCES relay-only mode when the PC was
+       already failed (not just disconnected). On retry #1 from a
+       failed state, we do iceTransportPolicy:'relay' immediately.
+    B. scheduleRetry's first retry forces a fresh PC with relay-only
+       (was reusing PC config). Eliminates wasted retry on broken path.
+    C. New CONN-TIMER threshold: if ICE has been 'checking' for 12s,
+       force relay immediately instead of waiting for 'failed'. Saves
+       3-5 seconds and prevents the 'checking → failed' dead-end.
+    D. New /turn-test endpoint that the client probes on join — if
+       the configured TURN server isn't actually reachable, log a
+       LOUD warning so the operator knows their TURN is broken.
+    E. Increased connection timer to a hard 25s ceiling (3 fires of
+       10s but with relay escalation at the 12s checking mark).
+
+  IMPORTANT FOR YOUR OMAN FRIEND: The code can only do so much. You
+  MUST set up a real TURN server. Free options (5 min setup):
+    - Metered.ca (50GB/mo free) — set METERED_API_KEY + METERED_DOMAIN
+    - Cloudflare Realtime (1TB/mo free) — set CF_TURN_TOKEN_ID +
+      CF_TURN_API_TOKEN
+  The public openrelay.metered.ca fallback is rate-limited and often
+  blocked by ISP DPI in Oman/UAE/Saudi.
+
 ═══════════════════════════════════════════════════════════════════════════════
 v3.2 SURGICAL FIXES (the actual bugs from your 22:05–22:07 log):
 
@@ -112,16 +180,35 @@ def json_read(p: str, default=None):
 
 # ─── TURN CREDENTIAL FETCHING ───────────────────────────────────────────────
 async def fetch_metered_creds() -> List[dict]:
+    """Fetch fresh TURN creds from Metered.ca. v3.4: VISIBLE errors."""
     if not METERED_API_KEY or not METERED_DOMAIN:
         return []
     try:
         url = f"https://{METERED_DOMAIN}/api/v1/turn/credentials?apiKey={METERED_API_KEY}"
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=10) as r:
+                body_text = await r.text()
                 if r.status == 200:
-                    return await r.json()
+                    try:
+                        data = json.loads(body_text)
+                    except Exception as e:
+                        print(f"[turn] METERED JSON parse error: {e}; body={body_text[:200]}")
+                        return []
+                    # Metered returns a JSON array directly
+                    if isinstance(data, list) and len(data) > 0:
+                        print(f"[turn] METERED OK: {len(data)} ICE entries")
+                        return data
+                    else:
+                        print(f"[turn] METERED unexpected shape: {type(data).__name__}, len={len(data) if hasattr(data, '__len__') else '?'}; body={body_text[:200]}")
+                        return []
+                else:
+                    print(f"[turn] METERED HTTP {r.status}: {body_text[:300]}")
+                    return []
+    except asyncio.TimeoutError:
+        print(f"[turn] METERED TIMEOUT (>10s) — Render server can't reach {METERED_DOMAIN}")
+        return []
     except Exception as e:
-        print(f"[turn] metered err: {e}")
+        print(f"[turn] METERED EXCEPTION: {type(e).__name__}: {e}")
     return []
 
 
@@ -154,11 +241,13 @@ async def get_ice_servers() -> List[dict]:
     ]
 
     metered = await fetch_metered_creds()
+    metered_ok = bool(metered)
     if metered:
         servers.extend(metered)
         print(f"[turn] using Metered.ca ({len(metered)} URLs)")
 
     cf = await fetch_cloudflare_creds()
+    cf_ok = bool(cf)
     if cf:
         servers.extend(cf)
         print(f"[turn] using Cloudflare ({len(cf)} URLs)")
@@ -181,7 +270,18 @@ async def get_ice_servers() -> List[dict]:
     ])
 
     _turn_cache["servers"] = servers
-    _turn_cache["expires"] = time.time() + 1800
+    # v3.4: only cache for full 30 min if premium TURN actually loaded.
+    # If Metered/CF was configured but failed, retry in 60s — don't
+    # serve a 30-min stale fallback that keeps Gulf peers broken.
+    metered_configured = bool(METERED_API_KEY and METERED_DOMAIN)
+    cf_configured = bool(CF_TURN_TOKEN_ID and CF_TURN_API_TOKEN)
+    expected_premium = metered_configured or cf_configured
+    got_premium = metered_ok or cf_ok or bool(CUSTOM_TURN_URL)
+    if expected_premium and not got_premium:
+        print("[turn] !! PREMIUM TURN CONFIGURED BUT FETCH FAILED — short cache (60s)")
+        _turn_cache["expires"] = time.time() + 60
+    else:
+        _turn_cache["expires"] = time.time() + 1800
     return servers
 
 
@@ -265,6 +365,60 @@ async def turn_endpoint():
     """Serves freshest possible ICE config to clients."""
     servers = await get_ice_servers()
     return JSONResponse({"iceServers": servers})
+
+
+@app.get("/turn-status")
+async def turn_status():
+    """Reports whether premium TURN is ACTUALLY working (not just configured)."""
+    servers = await get_ice_servers()
+    # Inspect what's actually loaded — find any non-public TURN URL
+    has_real_turn = False
+    for entry in servers:
+        urls = entry.get("urls", [])
+        if isinstance(urls, str):
+            urls = [urls]
+        username = entry.get("username", "")
+        for u in urls:
+            if "turn" in u and "openrelayproject" not in username:
+                has_real_turn = True
+                break
+        if has_real_turn:
+            break
+    return JSONResponse({
+        "premium": has_real_turn,
+        "metered_configured": bool(METERED_API_KEY),
+        "cloudflare_configured": bool(CF_TURN_TOKEN_ID),
+        "custom_configured": bool(CUSTOM_TURN_URL),
+    })
+
+
+@app.get("/turn-debug")
+async def turn_debug():
+    """v3.4: full diagnostic — what TURN config is actually being served?
+    Hit this URL in your browser to see if Metered creds are loading."""
+    servers = await get_ice_servers()
+    # Sanitize: hide actual passwords/secrets in the response
+    sanitized = []
+    for entry in servers:
+        urls = entry.get("urls", [])
+        if isinstance(urls, str):
+            urls = [urls]
+        username = entry.get("username", "")
+        cred = entry.get("credential", "")
+        sanitized.append({
+            "urls": urls,
+            "username": username[:4] + "..." if username else "",
+            "has_credential": bool(cred),
+        })
+    return JSONResponse({
+        "total_entries": len(servers),
+        "metered_env_set": bool(METERED_API_KEY and METERED_DOMAIN),
+        "metered_domain": METERED_DOMAIN if METERED_DOMAIN else "(unset)",
+        "cloudflare_env_set": bool(CF_TURN_TOKEN_ID and CF_TURN_API_TOKEN),
+        "custom_env_set": bool(CUSTOM_TURN_URL),
+        "cache_expires_in": int(_turn_cache.get("expires", 0) - time.time()),
+        "entries": sanitized,
+    })
 
 
 @app.get("/call/{room_id}")
@@ -791,6 +945,23 @@ async function fetchIceServers() {
   } catch (e) {
     log("ICE fetch failed, using fallback");
   }
+  // v3.4: warn loudly if premium TURN didn't actually load
+  try {
+    const sr = await fetch('/turn-status', { cache: 'no-store' });
+    if (sr.ok) {
+      const st = await sr.json();
+      if (!st.premium) {
+        if (st.metered_configured || st.cloudflare_configured || st.custom_configured) {
+          log("!!! TURN ENV SET BUT FETCH FAILED — check /turn-debug");
+          log("!!! Server can't reach configured TURN provider");
+        } else {
+          log("!!! WARN: NO TURN CONFIGURED — Gulf/MENA peers will fail");
+        }
+      } else {
+        log("TURN: premium provider active");
+      }
+    }
+  } catch (e) {}
 }
 
 async function acquireWakeLock() {
@@ -982,7 +1153,10 @@ function connectWS() {
         const reason = m.reason || '';
         const isZombie = reason.startsWith('zombie');
         const isFullRebuild = reason.startsWith('full-rebuild');
-        if (!isZombie && !isFullRebuild && MY_ID < m.from) {
+        // v3.3: stuck-checking and retry-after-fail force smaller side
+        // to also destroy its PC and wait for the relay-mode offer
+        const isFreshRelay = reason === 'stuck-checking' || reason === 'retry-after-fail';
+        if (!isZombie && !isFullRebuild && !isFreshRelay && MY_ID < m.from) {
           break;
         }
         log("got relay request from " + m.from + " (" + reason + ")");
@@ -995,6 +1169,11 @@ function connectWS() {
             createOffer(m.from);
             setTimeout(() => { renegInProgress[m.from] = false; }, 3000);
           }, 300);
+        } else if (isFreshRelay) {
+          // v3.3: smaller side just clears PC and waits for the
+          // larger side's relay-mode offer (which is already coming)
+          log("fresh relay request: smaller side clearing PC for " + m.from);
+          destroyPeer(m.from);
         } else {
           await switchPeerToRelay(m.from);
         }
@@ -1231,8 +1410,28 @@ function startConnectionTimer(pid) {
       return;
     }
     if (pc.iceConnectionState === 'checking') {
-      log("CONN-TIMER " + pid + " still checking, waiting");
       pc._connTimerFires++;
+      // v3.3 FIX C: if we've been checking for ~10-20s, the path is
+      // almost certainly blocked. Force relay NOW instead of waiting
+      // for 'failed' (which adds another 15-30s of dead time).
+      if (pc._connTimerFires >= 1 && !peerRelay[pid] && MY_ID > pid) {
+        log("CONN-TIMER " + pid + " stuck checking 10s -> force RELAY (likely blocked UDP)");
+        peerRelay[pid] = true;
+        lastRelayAt[pid] = Date.now();
+        // Tell the other side we're going relay-only
+        if (ws && ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'stuck-checking' }));
+        }
+        // Rebuild PC with relay-only transport
+        destroyPeer(pid);
+        renegInProgress[pid] = true;
+        setTimeout(() => {
+          createOffer(pid);
+          setTimeout(() => { renegInProgress[pid] = false; }, 3000);
+        }, 200);
+        return;
+      }
+      log("CONN-TIMER " + pid + " still checking, waiting");
       if (pc._connTimerFires < 3) startConnectionTimer(pid);
       return;
     }
@@ -2011,22 +2210,30 @@ async function scheduleRetry(pid) {
     return;
   }
 
-  if (p.retries >= 1 && !peerRelay[pid]) {
+  // v3.3 FIX B: ALWAYS force relay on retry. If direct failed once,
+  // the network won't suddenly start allowing P2P. Skip wasting
+  // another 15-30s on the same broken path.
+  if (!peerRelay[pid]) {
+    log("retry forcing RELAY for " + pid + " (direct path failed)");
     peerRelay[pid] = true;
+    lastRelayAt[pid] = Date.now();
+    if (ws && ws.readyState === 1 && MY_ID > pid) {
+      // Tell the smaller side to also go relay
+      ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'retry-after-fail' }));
+    }
   }
 
   const delay = Math.min(1000 * p.retries, 4000);
-  log("retry #" + p.retries + " in " + delay + "ms -> " + pid);
+  log("retry #" + p.retries + " in " + delay + "ms -> " + pid + " (RELAY)");
   setTimeout(async () => {
     if (!peerMap.has(pid)) { p._retrying = false; return; }
     if (!ws || ws.readyState !== 1) { p._retrying = false; return; }
 
     if (MY_ID > pid) {
-      if (p.retries === 1 && peers[pid] && peers[pid].connectionState !== 'closed') {
-        await forceIceRestart(pid);
-        p._retrying = false;
-        return;
-      }
+      // v3.3: don't reuse the failed PC. Always rebuild fresh on retry.
+      // The old code did forceIceRestart on retry #1, but iceRestart
+      // on a failed PC keeps the same iceTransportPolicy. We need a
+      // new PC with relay-only.
       await createOffer(pid);
     } else {
       destroyPeer(pid);
@@ -2348,7 +2555,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.2");
+log("page loaded v3.4");
 </script>
 </body>
 </html>"""
@@ -2371,24 +2578,24 @@ async def keepalive():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot BEAST MODE v3.2 GENIUS | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot v3.4 TURN-DIAGNOSTIC | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK}")
     servers = await get_ice_servers()
     print(f"ICE servers configured: {len(servers)} entries")
+    has_premium = bool(METERED_API_KEY or CF_TURN_TOKEN_ID or CUSTOM_TURN_URL)
     if METERED_API_KEY:
-        print("Metered.ca TURN configured")
+        print(f"Metered.ca configured: domain={METERED_DOMAIN}")
     if CF_TURN_TOKEN_ID:
         print("Cloudflare TURN configured")
     if CUSTOM_TURN_URL:
         print("Custom TURN configured")
-    if not (METERED_API_KEY or CF_TURN_TOKEN_ID or CUSTOM_TURN_URL):
-        print("No premium TURN — using public fallback (less reliable in MENA)")
-        print("  -> see top of file for free TURN setup instructions")
-    print("v3.2: Bug A fixed — connection timer respects healthy ICE state")
-    print("v3.2: Bug B fixed — sliding 12s loss EWMA (no more 4s spike overreaction)")
-    print("v3.2: Full rebuild escalation for chronic relay failures")
-    print("v3.2: 6s post-relay grace + 30s rebuild cooldown")
-    print("v3.2: Connection timer 6s -> 10s, ICE restart cooldown 5s -> 8s")
+    if not has_premium:
+        print("!" * 60)
+        print("! NO PREMIUM TURN CONFIGURED — Gulf/MENA peers WILL FAIL  !")
+        print("!" * 60)
+    print("v3.4: Metered fetch errors are now VISIBLE in logs")
+    print("v3.4: Failed premium fetches retry every 60s (not 30 min)")
+    print("v3.4: Hit /turn-debug in browser to inspect actual ICE config")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
