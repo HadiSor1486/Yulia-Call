@@ -1,5 +1,21 @@
 """
-Silent Hill Voice Call Bot — v3.5 SECRET-KEY-COMPATIBLE
+Silent Hill Voice Call Bot — v3.6 SECRET-KEY-COMPATIBLE
+═══════════════════════════════════════════════════════════════════════════════
+v3.6 ADDS (iOS Safari mid-call stability):
+
+  1. WAKE LOCK AUTO-REACQUIRE — iOS Safari silently drops wakeLock after a
+     few minutes. A watchdog now checks every 30s and re-acquires if lost.
+     Phone will NOT sleep mid-call anymore.
+
+  2. AUDIO SELF-HEAL — iOS background suspend can silently kill audio
+     streams without firing 'ended' events. Every 5s the code verifies:
+     • Remote audio elements still have live tracks (restores from PC
+       receivers if not, and resumes if paused)
+     • Local mic track hasn't silently ended (reacquires + replaces on
+       all peer connections if it has)
+     The "I can hear them but they can't hear me" (or vice-versa) scenarios
+     after backgrounding are now far less likely.
+
 ═══════════════════════════════════════════════════════════════════════════════
 v3.5 FIX (the actual root cause from Render logs HTTP 401):
 
@@ -758,7 +774,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .messages{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:6px;position:relative;z-index:5}
 .messages::-webkit-scrollbar{width:0}
 .msg-system{text-align:center;color:#8e8e93;font-size:12px;padding:6px 0}
-.msg-row{display:flex;gap:8px;max-width:85%;animation:msgIn .2s ease-out;align-items:flex-start;position:relative;overflow:hidden;touch-action:pan-y}
+.msg-row{display:flex;gap:8px;max-width:85%;animation:msgIn .2s ease-out;align-items:flex-start}
 .msg-row.self{align-self:flex-end;flex-direction:row-reverse}
 .msg-row.other{align-self:flex-start}
 @keyframes msgIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
@@ -796,7 +812,6 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .img-preview-overlay .close-hint{position:absolute;top:20px;right:20px;color:#fff;font-size:32px;opacity:0.7}
 .typing-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:6px 12px;font-size:12px;color:#8e8e93;flex-shrink:0;animation:msgIn .15s}
 .typing-bar.hidden{display:none!important}
-.new-msg-pill{position:fixed;bottom:76px;left:50%;transform:translateX(-50%) scale(0.9);background:#007aff;color:#fff;padding:8px 18px;border-radius:20px;font-size:13px;font-weight:600;z-index:20;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.45);opacity:0;transition:opacity .15s,transform .15s;pointer-events:none}.new-msg-pill.show{opacity:1;transform:translateX(-50%) scale(1);pointer-events:auto}
 .input-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:8px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0}
 .input-attach,.input-send{width:38px;height:38px;border-radius:50%;border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0}
 .input-attach{background:#2c2c2e;color:#fff;font-size:18px}
@@ -861,7 +876,6 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 
 <div class="peer-status" id="pstat"></div>
 
-<div class="new-msg-pill" id="newMsgPill" onclick="catchUpScroll()">new messages</div>
 <div class="messages" id="msgs"></div>
 <div class="typing-bar hidden" id="typingBar"></div>
 <div class="input-bar">
@@ -900,6 +914,8 @@ let isMuted = false, isHost = false;
 let leaving = false;
 let wsRetries = 0;
 let wakeLock = null;
+let wakeLockCheckTimer = null;   // v3.6: wake lock auto-reacquire (iOS Safari)
+let audioHealTimer = null;        // v3.6: audio self-heal (iOS bg suspend recovery)
 
 const peers = {};
 const audios = {};
@@ -925,13 +941,6 @@ const relayConnectedAt = {};        // v3.2: when did relay path stabilize
 const lossEwma = {};                // v3.2: smoothed loss per peer
 const sustainedBadStart = {};       // v3.2: when sustained bad began
 let lastMuteToggleAt = 0;
-
-// ════════════════════════════════════════════════════════════════════════════
-// v3.6 FEATURES: auto-scroll lock, swipe-to-reply, wake-lock reacquire, audio self-heal
-// ════════════════════════════════════════════════════════════════════════════
-let autoScrollEnabled = true;
-let newMsgCount = 0;
-let swipeState = null;
 
 // frozen-jitter zombie tracking
 const frozenJitterCounts = {};
@@ -1017,72 +1026,6 @@ document.getElementById('nameIn').addEventListener('input', e => {
   });
 })();
 
-// ════════════════════════════════════════════════════════════════════════════
-// FEATURE INIT: scroll lock, swipe-to-reply, wake-lock guard, audio self-heal
-// ════════════════════════════════════════════════════════════════════════════
-(function initFeatures() {
-  const msgsEl = document.getElementById('msgs');
-  if (!msgsEl) return;
-
-  // ── scroll lock: detect when user scrolls up ──
-  msgsEl.addEventListener('scroll', () => {
-    const nearBottom = msgsEl.scrollTop + msgsEl.clientHeight >= msgsEl.scrollHeight - 60;
-    if (nearBottom && !autoScrollEnabled) {
-      autoScrollEnabled = true;
-      newMsgCount = 0;
-      const pill = document.getElementById('newMsgPill');
-      if (pill) pill.classList.remove('show');
-    } else if (!nearBottom && autoScrollEnabled) {
-      autoScrollEnabled = false;
-    }
-  }, { passive: true });
-
-  // ── swipe-to-reply: right on others, left on self ──
-  msgsEl.addEventListener('touchstart', e => {
-    const row = e.target.closest('.msg-row');
-    if (!row || row.classList.contains('system')) return;
-    const touch = e.touches[0];
-    swipeState = { x: touch.clientX, y: touch.clientY, row, moved: false };
-  }, { passive: true });
-
-  msgsEl.addEventListener('touchmove', e => {
-    if (!swipeState || !swipeState.row) return;
-    const touch = e.touches[0];
-    const dx = touch.clientX - swipeState.x;
-    const dy = touch.clientY - swipeState.y;
-    const isSelf = swipeState.row.classList.contains('self');
-    const validDir = (!isSelf && dx > 0) || (isSelf && dx < 0);
-    if (validDir && Math.abs(dx) > Math.abs(dy) * 1.5 && Math.abs(dx) > 8) {
-      const bubble = swipeState.row.querySelector('.msg-bubble');
-      if (bubble) bubble.style.transform = 'translateX(' + (dx * 0.25) + 'px)';
-      swipeState.moved = true;
-    }
-  }, { passive: true });
-
-  msgsEl.addEventListener('touchend', e => {
-    if (!swipeState || !swipeState.row) { swipeState = null; return; }
-    const touch = e.changedTouches[0];
-    const dx = touch.clientX - swipeState.x;
-    const dy = touch.clientY - swipeState.y;
-    const isSelf = swipeState.row.classList.contains('self');
-    // Reset transform
-    const bubble = swipeState.row.querySelector('.msg-bubble');
-    if (bubble) bubble.style.transform = '';
-    const mostlyHorizontal = Math.abs(dx) > Math.abs(dy) * 1.5;
-    const threshold = 60;
-    if (mostlyHorizontal && Math.abs(dx) > threshold) {
-      if (!isSelf && dx > 0) {
-        const md = swipeState.row._msgData;
-        if (md) startReply(md);
-      } else if (isSelf && dx < 0) {
-        const md = swipeState.row._msgData;
-        if (md) startReply(md);
-      }
-    }
-    swipeState = null;
-  }, { passive: true });
-})();
-
 async function fetchIceServers() {
   try {
     const r = await fetch('/turn', { cache: 'no-store' });
@@ -1123,9 +1066,80 @@ async function acquireWakeLock() {
     }
   } catch (e) { log("wakeLock fail"); }
 }
+
+// v3.6 WAKE LOCK AUTO-REACQUIRE — iOS Safari silently drops wakeLock after
+// a few minutes. This watchdog checks every 30s and re-acquires if lost.
+// Phone will NOT sleep mid-call anymore.
+function startWakeLockWatch() {
+  if (wakeLockCheckTimer) clearInterval(wakeLockCheckTimer);
+  wakeLockCheckTimer = setInterval(() => {
+    if (!wakeLock && document.visibilityState === 'visible') {
+      log("wakeLock dropped — reacquiring");
+      acquireWakeLock();
+    }
+  }, 30000);
+}
+
+// v3.6 AUDIO SELF-HEAL — iOS background suspend can silently kill audio
+// streams without firing 'ended' events. Every 5s we verify both remote
+// audio elements and the local mic track are still alive, and restore them
+// from the peer connection receivers if needed.
+function startAudioSelfHeal() {
+  if (audioHealTimer) clearInterval(audioHealTimer);
+  audioHealTimer = setInterval(() => {
+    // ── Remote audio recovery ──
+    Object.entries(audios).forEach(([pid, audio]) => {
+      try {
+        const pc = peers[pid];
+        if (!pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') return;
+        const stream = audio.srcObject;
+        const hasLiveTracks = stream && stream.getTracks().some(t => t.readyState === 'live');
+        if (!hasLiveTracks) {
+          const receivers = pc.getReceivers().filter(r => r.track && r.track.readyState === 'live');
+          if (receivers.length > 0) {
+            const newStream = new MediaStream(receivers.map(r => r.track));
+            audio.srcObject = newStream;
+            audio.play().catch(() => {});
+            log("audio heal: restored stream for " + pid);
+          }
+        }
+        if (audio.paused && hasLiveTracks) {
+          audio.play().catch(() => {});
+          log("audio heal: resumed paused audio for " + pid);
+        }
+      } catch (e) { /* silent — don't spam logs on transient states */ }
+    });
+    // ── Local mic recovery ──
+    if (localStream) {
+      const micTrack = localStream.getAudioTracks()[0];
+      if (micTrack && micTrack.readyState === 'ended') {
+        log("audio heal: local mic track ended, reacquiring");
+        navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS).then(newStream => {
+          const newTrack = newStream.getAudioTracks()[0];
+          if (newTrack) {
+            newTrack.enabled = !isMuted;
+            Object.values(peers).forEach(pc => {
+              pc.getSenders().forEach(s => {
+                if (s.track && s.track.kind === 'audio') {
+                  try { s.replaceTrack(newTrack); } catch (e) {}
+                }
+              });
+            });
+            localStream.getTracks().forEach(tr => tr.stop());
+            localStream = newStream;
+            watchLocalTrack();
+            setupLocalLevelMonitor();
+            log("audio heal: mic reacquired");
+          }
+        }).catch(e => log("audio heal: mic reacquire failed: " + e.message));
+      }
+    }
+  }, 5000);
+}
+
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    if (!wakeLock || wakeLock.released) acquireWakeLock();
+    if (!wakeLock) acquireWakeLock();
     log("foreground — refreshing peer health");
     Object.entries(peers).forEach(([pid, pc]) => {
       if (pc.connectionState === 'disconnected' && MY_ID > pid) {
@@ -1135,36 +1149,6 @@ document.addEventListener('visibilitychange', () => {
     });
   }
 });
-
-// v3.6: wake lock auto-reacquire — iOS Safari silently kills it
-setInterval(() => {
-  if (document.visibilityState === 'visible' && (!wakeLock || wakeLock.released)) {
-    acquireWakeLock();
-  }
-}, 30000);
-
-// v3.6: audio self-heal — iOS bg suspend can drop audio streams
-setInterval(() => {
-  Object.entries(audios).forEach(([pid, a]) => {
-    if (!a) return;
-    const streamDead = !a.srcObject || a.srcObject.getTracks().every(t => t.readyState === 'ended');
-    if (a.paused || streamDead) {
-      const pc = peers[pid];
-      if (pc) {
-        const recv = pc.getReceivers().find(r => r.track && r.track.kind === 'audio' && r.track.readyState === 'live');
-        if (recv) {
-          log("audio self-heal " + pid);
-          const fresh = new MediaStream([recv.track]);
-          a.srcObject = fresh;
-          a.muted = false;
-          a.volume = 1.0;
-          a.play().catch(() => {});
-          startInboundLevel(fresh, pid);
-        }
-      }
-    }
-  });
-}, 5000);
 
 window.addEventListener('online', () => {
   log("network online — refreshing connections");
@@ -1239,6 +1223,8 @@ async function doJoin() {
   document.getElementById('joinOvl').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
   acquireWakeLock();
+  startWakeLockWatch();   // v3.6
+  startAudioSelfHeal();   // v3.6
 
   if (_peerLevelTicker) clearInterval(_peerLevelTicker);
   _peerLevelTicker = setInterval(updPeerLevels, 150);
@@ -2462,6 +2448,8 @@ function cleanupRTC() {
     localStream = null;
   }
   if (localLevelTimer) { clearInterval(localLevelTimer); localLevelTimer = null; }
+  if (wakeLockCheckTimer) { clearInterval(wakeLockCheckTimer); wakeLockCheckTimer = null; }
+  if (audioHealTimer) { clearInterval(audioHealTimer); audioHealTimer = null; }
   if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
 }
 
@@ -2667,7 +2655,6 @@ function renderMsg(m) {
   });
 
   c.appendChild(row);
-  row._msgData = m;
   scroll();
 }
 
@@ -2682,33 +2669,7 @@ function renderSys(t) {
 
 function scroll() {
   const e = document.getElementById('msgs');
-  if (!e) return;
-  if (autoScrollEnabled) {
-    e.scrollTop = e.scrollHeight;
-  } else {
-    newMsgCount++;
-    updateNewMsgPill();
-  }
-}
-
-function updateNewMsgPill() {
-  const pill = document.getElementById('newMsgPill');
-  if (!pill) return;
-  if (newMsgCount > 0) {
-    pill.textContent = '\u2193 ' + newMsgCount + ' new message' + (newMsgCount > 1 ? 's' : '');
-    pill.classList.add('show');
-  } else {
-    pill.classList.remove('show');
-  }
-}
-
-function catchUpScroll() {
-  autoScrollEnabled = true;
-  newMsgCount = 0;
-  const pill = document.getElementById('newMsgPill');
-  if (pill) pill.classList.remove('show');
-  const e = document.getElementById('msgs');
-  if (e) e.scrollTop = e.scrollHeight;
+  e.scrollTop = e.scrollHeight;
 }
 
 function esc(t) {
@@ -2763,7 +2724,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.5");
+log("page loaded v3.6");
 </script>
 </body>
 </html>"""
@@ -2786,7 +2747,7 @@ async def keepalive():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot v3.5 SECRET-KEY-COMPATIBLE | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot v3.6 SECRET-KEY-COMPATIBLE | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK}")
     servers = await get_ice_servers()
     print(f"ICE servers configured: {len(servers)} entries")
