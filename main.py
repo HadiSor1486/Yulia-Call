@@ -16,6 +16,10 @@ KEY UPGRADES vs. previous version:
   • FAST relay fallback — 6s connection timeout + 4s disconnect retry + 4s stall detect
   • Bidirectional relay escalation — both sides switch to TURN when either detects trouble
   • Aggressive ICE error logging (onicecandidateerror) for instant STUN/TURN diagnostics
+  • MUTE FIX (v2.1): switched from replaceTrack(null) to track.enabled=false/true
+    The replaceTrack approach left the RTP sender in a zombie state on mobile
+    so voice would vanish after unmute. track.enabled is the W3C-spec way and
+    keeps RTP flowing (DTX silence) so the sender never goes dead.
 
 ═══════════════════════════════════════════════════════════════════════════════
 GETTING REAL TURN CREDENTIALS (READ THIS — IT'S WHY ALGERIA FAILS):
@@ -563,7 +567,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 
 <script>
 // ════════════════════════════════════════════════════════════════════════════
-// SILENT HILL CLIENT — BEAST MODE v2
+// SILENT HILL CLIENT — BEAST MODE v2.1
 // Architecture:
 //   • Mesh WebRTC topology (good for ≤6 voice participants)
 //   • Server-assigned peer IDs prevent glare
@@ -572,8 +576,11 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 //   • Connection escalation: normal → fast ICE restart (6s) → full restart → relay-only
 //   • Bidirectional relay: both sides switch to TURN when quality degrades
 //   • Outbound stall detection — catches one-way-audio failures instantly
-//   • MUTE/UNMUTE FIX: uses replaceTrack() instead of track.enabled to avoid
-//     the mobile browser bug where re-enabling a track leaves RTP dead.
+//   • MUTE/UNMUTE FIX (v2.1): uses track.enabled=false/true (W3C-spec mute).
+//     The previous replaceTrack(null) approach left the RTP sender in a zombie
+//     state on mobile (esp. iOS Safari) — connection stayed "connected" but no
+//     packets ever flowed after unmute. track.enabled keeps RTP flowing with
+//     DTX comfort-noise so the sender never enters that broken state.
 // ════════════════════════════════════════════════════════════════════════════
 
 const ROOM = "__ROOM_ID__", TOKEN = "__TOKEN__";
@@ -848,20 +855,11 @@ function connectWS() {
       }
 
       case 'mute_cmd': {
-        // Server asked us to mute. Use replaceTrack(null) instead of track.enabled=false
-        // to avoid the mobile browser zombie-RTP bug.
+        // Server confirms our mute. Use track.enabled=false (W3C-spec mute).
+        // RTP keeps flowing with DTX comfort-noise — sender never goes zombie.
         if (localStream) {
           const t = localStream.getAudioTracks()[0];
-          if (t) {
-            Object.values(peers).forEach(pc => {
-              pc.getSenders().forEach(sender => {
-                if (sender.track && sender.track.kind === 'audio') {
-                  try { sender.replaceTrack(null); } catch (e) {}
-                }
-              });
-            });
-            t.enabled = false;
-          }
+          if (t) t.enabled = false;
         }
         isMuted = true;
         document.getElementById('muteBtn').classList.add('muted');
@@ -871,25 +869,16 @@ function connectWS() {
         break;
       }
       case 'unmute_cmd': {
-        // Server asked us to unmute. Restore track via replaceTrack(realTrack).
+        // Server confirms our unmute. Just flip track.enabled back on.
+        // No replaceTrack dance needed — sender was alive the whole time.
         if (localStream) {
           const t = localStream.getAudioTracks()[0];
-          if (t) {
-            Object.values(peers).forEach(pc => {
-              pc.getSenders().forEach(sender => {
-                if (sender.track && sender.track.kind === 'audio') {
-                  try { sender.replaceTrack(t); } catch (e) {}
-                }
-              });
-            });
-            t.enabled = true;
-          }
+          if (t) t.enabled = true;
         }
         isMuted = false;
         document.getElementById('muteBtn').classList.remove('muted');
         document.getElementById('muteBtn').innerHTML = '&#127908;';
         document.getElementById('vstat').textContent = 'Connected';
-        setTimeout(() => checkZombiePeers(), 500);
         updPeers();
         break;
       }
@@ -1004,9 +993,9 @@ function updPeerLevels() {
 let _peerLevelTicker = null;
 
 // ── Zombie peer detection ──
-// Detects the "mute/unmute zombie" where connectionState is 'connected' but
-// inbound RTP is dead (ΔR=0, frozen jitter, but ΔS>0). The only cure is a
-// fresh offer/answer renegotiation to force the browser to rebuild transceivers.
+// Detects dead transceivers where connectionState='connected' but no audio.
+// With v2.1 mute fix this should rarely fire — but kept as a safety net for
+// genuine network/codec breakdowns. Skips muted peers (no audio expected).
 let _lastJitters = {}; // pid -> last jitter value
 let _zombieCounts = {};  // pid -> consecutive zombie intervals
 let _zombieCooldowns = {}; // pid -> timestamp of last zombie action (prevent rapid-fire)
@@ -1014,6 +1003,7 @@ let _zombieCooldowns = {}; // pid -> timestamp of last zombie action (prevent ra
 function checkZombiePeers() {
   peerMap.forEach((p, pid) => {
     if (p.connState !== 'connected') return;
+    if (p.muted) return; // peer is muted — silence is expected, not a zombie
     // Cooldown: don't act more than once per 10s to prevent reneg storms
     if (_zombieCooldowns[pid] && Date.now() - _zombieCooldowns[pid] < 10000) return;
     // If recvLevel has been 0 for a while and we know peer isn't muted,
@@ -1052,7 +1042,7 @@ function detectFrozenJitter(pid, jitter) {
     // Jitter hasn't changed at all across two intervals while conn=connected
     // AND we're receiving 0 packets → zombie confirmed
     const p = peerMap.get(pid);
-    if (p && p.connState === 'connected' && (!p.recvLevel || p.recvLevel < 0.005)) {
+    if (p && p.connState === 'connected' && !p.muted && (!p.recvLevel || p.recvLevel < 0.005)) {
       _zombieCooldowns[pid] = Date.now();
       return true;
     }
@@ -1582,10 +1572,13 @@ async function detectRelay(pc, pid) {
 
 // ── Periodic stats with AUTO-QUALITY-DETECTION ──
 // Measures per-interval packet loss and triggers auto-relay when bad.
-// Two trigger conditions:
+// Trigger conditions:
 //   1. Sustained high loss: >5% loss for 8+ seconds (2 intervals at 4s tick)
 //   2. Audio stalled: 0 packets received for 4+ seconds while conn=connected
-//   3. NEW: Outbound stalled — catches one-way audio failures
+//      (skipped when peer is muted — silence is expected)
+//   3. Outbound stalled: 0 packets sent for 8s while connected
+//      (skipped when WE are muted — silence is expected)
+//   4. Frozen jitter: another zombie sign (skipped when peer is muted)
 function startStats(pc, pid) {
   if (statsTimers[pid]) clearInterval(statsTimers[pid]);
   let lastRecv = 0, lastLost = 0;
@@ -1622,8 +1615,9 @@ function startStats(pc, pid) {
       const dSent = sent - lastSent;
       lastRecv = recv; lastLost = lost; lastSent = sent;
 
-      const p = peerMap.get(pid);
-      if (p) { p.lossPct = lossPct; p.recvRate = dRecv / 4; }
+      const peerInfo = peerMap.get(pid);
+      if (peerInfo) { peerInfo.lossPct = lossPct; peerInfo.recvRate = dRecv / 4; }
+      const peerMuted = peerInfo && peerInfo.muted;
 
       log("STATS " + pid + " ΔR=" + dRecv + " ΔL=" + dLost + " (" + lossPct.toFixed(1) + "%) jit=" + jitter.toFixed(3) + " ΔS=" + dSent);
 
@@ -1639,11 +1633,12 @@ function startStats(pc, pid) {
       }
 
       // ── TRIGGER 2: Audio stalled (0 packets for 4s while supposedly connected) ──
+      // Skipped when peer is muted — they're intentionally not sending.
       // This catches the silent NAT-timeout failure mode where the connection
       // claims to be "connected" but no packets are flowing.
-      if (dRecv === 0) {
+      if (dRecv === 0 && !peerMuted) {
         consecutiveStalled++;
-        if (consecutiveStalled >= 1 && !peerRelay[pid]) { // 1 × 4s = 4s of zero packets (was 8s)
+        if (consecutiveStalled >= 1 && !peerRelay[pid]) { // 1 × 4s = 4s of zero packets
           requestRelaySwitch(pid, "stalled (0 pkts/4s)");
           consecutiveStalled = 0;
         }
@@ -1652,8 +1647,10 @@ function startStats(pc, pid) {
       }
 
       // ── TRIGGER 3: Outbound stalled (0 packets sent for 8s while connected) ──
-      // Catches the one-way-audio case where we hear peer but peer can't hear us.
-      if (dSent === 0) {
+      // Skipped when WE are muted — we're intentionally not sending audio.
+      // (With v2.1 mute fix, RTP keeps flowing via DTX so this rarely matters,
+      //  but the guard prevents any false-positives just in case.)
+      if (dSent === 0 && !isMuted) {
         outboundStall++;
         if (outboundStall >= 2 && !peerRelay[pid]) { // 2 × 4s = 8s of zero outbound
           requestRelaySwitch(pid, "outbound stalled (0 sent/8s)");
@@ -1664,8 +1661,8 @@ function startStats(pc, pid) {
       }
 
       // ── TRIGGER 4: Zombie transceiver (frozen jitter + 0 recv while connected) ──
-      // This is the mute/unmute bug: connectionState='connected', ΔR=0, jitter frozen.
-      if (detectFrozenJitter(pid, jitter)) {
+      // Skipped when peer is muted (handled inside detectFrozenJitter).
+      if (!peerMuted && detectFrozenJitter(pid, jitter)) {
         log("ZOMBIE jitter frozen on " + pid + " → full renegotiate");
         if (MY_ID > pid) {
           destroyPeer(pid);
@@ -1835,28 +1832,19 @@ function sendMsg() {
 function toggleMute() {
   if (!localStream) return;
   isMuted = !isMuted;
-  // ── THE MUTE FIX ──
-  // Mobile browsers (Safari especially) have a bug where track.enabled = false
-  // then true leaves the RTP sender in a dead state. The connection stays "connected"
-  // but the peer receives 0 packets (ΔR=0, frozen jitter). The fix: replaceTrack()
-  // with null when muting, and the real track when unmuting. This forces the
-  // browser to tear down and rebuild the sender, avoiding the zombie stream.
+  // ── THE MUTE FIX (v2.1) ──
+  // Use track.enabled = false/true — this is the W3C-spec way to mute.
+  // The track keeps producing silence frames (with DTX comfort-noise) so RTP
+  // KEEPS FLOWING the entire time. The sender object is never put into a
+  // half-broken state, so unmuting is just a flag flip — voice resumes
+  // instantly with no negotiation needed.
+  //
+  // The PREVIOUS approach used sender.replaceTrack(null) on mute and
+  // sender.replaceTrack(realTrack) on unmute. On mobile (especially iOS Safari)
+  // that left the RTP sender in a zombie state: connection stayed "connected"
+  // but no packets ever flowed after unmute. That's why voice would vanish.
   const realTrack = localStream.getAudioTracks()[0];
   if (!realTrack) return;
-
-  Object.values(peers).forEach(pc => {
-    pc.getSenders().forEach(sender => {
-      if (sender.track && sender.track.kind === 'audio') {
-        try {
-          sender.replaceTrack(isMuted ? null : realTrack);
-        } catch (e) {
-          log("replaceTrack err: " + e.message);
-        }
-      }
-    });
-  });
-
-  // Also toggle .enabled for local monitoring (so local analyser sees silence)
   realTrack.enabled = !isMuted;
 
   const b = document.getElementById('muteBtn');
@@ -1868,8 +1856,6 @@ function toggleMute() {
     b.classList.remove('muted');
     b.innerHTML = '&#127908;';
     document.getElementById('vstat').textContent = 'Connected';
-    // After unmuting, check if any peer's inbound is dead — if so, kick a renegotiation
-    setTimeout(() => checkZombiePeers(), 500);
   }
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: isMuted ? 'mute_me' : 'unmute_me' }));
   updPeers();
@@ -1970,7 +1956,7 @@ async def keepalive():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot BEAST MODE v2 | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot BEAST MODE v2.1 | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK}")
     # Pre-warm TURN cache so first call is fast
     servers = await get_ice_servers()
