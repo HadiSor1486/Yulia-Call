@@ -1246,6 +1246,10 @@ function startConnectionTimer(pid) {
 }
 
 async function forceIceRestart(pid) {
+  if (MY_ID <= pid) {
+    log("ICE restart ignored (smaller side, wait for offerer) " + pid);
+    return;
+  }
   const pc = peers[pid];
   if (!pc || pc.connectionState === 'closed') return;
   const p = peerMap.get(pid);
@@ -1278,7 +1282,14 @@ async function forceIceRestart(pid) {
 function destroyPeer(pid, keepAudio) {
   if (peers[pid]) {
     clearConnectionTimer(peers[pid]);
-    try { peers[pid].close(); } catch (e) {}
+    const dying = peers[pid];
+    // Prevent stale event handlers from firing after close and corrupting state
+    dying.onicecandidate = null;
+    dying.onicecandidateerror = null;
+    dying.ontrack = null;
+    dying.onconnectionstatechange = null;
+    dying.oniceconnectionstatechange = null;
+    try { dying.close(); } catch (e) {}
     delete peers[pid];
   }
   // CRITICAL: We do NOT remove the audio element by default.
@@ -1363,6 +1374,9 @@ async function handleOffer(from, sdp) {
   // down the working connection and the audio element keeps playing.
   if (existing && existing.signalingState !== 'closed' && existing.connectionState !== 'failed') {
     try {
+      // Any old connection timer must die before we renegotiate, otherwise it
+      // fires mid-renegotiation and treats the existing PC as stuck.
+      clearConnectionTimer(existing);
       // Glare guard: if WE have a local offer pending, only the smaller-ID
       // (polite) side rolls back. Larger-ID (impolite) ignores incoming offer.
       if (existing.signalingState === 'have-local-offer') {
@@ -1421,8 +1435,11 @@ async function handleOffer(from, sdp) {
     await pc.setLocalDescription(ans);
     ws.send(JSON.stringify({ type: 'webrtc_answer', to: from, sdp: pc.localDescription.sdp }));
     log("answer SENT " + from);
-    // Start guard timer on answerer side too (fresh PC from incoming offer)
-    startConnectionTimer(from);
+    // NOTE: do NOT start a connection timer on the answerer side.
+    // The offerer is responsible for connection health; the answerer
+    // just waits. Starting a timer here causes the smaller side to
+    // spuriously forceIceRestart() when ICE is merely slow, which
+    // violates the larger-ID-initiates rule and creates offer storms.
   } catch (e) {
     log("answer FAIL " + from + ": " + e.message);
   }
@@ -1884,8 +1901,9 @@ async function scheduleRetry(pid) {
     return;
   }
 
-  // ESCALATION: retry 1 = ICE restart, retry 2+ = full rebuild with relay-only
-  if (p.retries >= 2 && !peerRelay[pid]) {
+  // ESCALATION: retry 1 = ICE restart, retry 1+ = force relay for any full rebuild.
+  // must match shouldForceRelay() threshold (retries >= 1).
+  if (p.retries >= 1 && !peerRelay[pid]) {
     peerRelay[pid] = true;  // force relay for this and all future attempts
   }
 
