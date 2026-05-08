@@ -1,36 +1,77 @@
 """
-Silent Hill Voice Call Bot — BEAST MODE v2
+Silent Hill Voice Call Bot — BEAST MODE v3 ELITE MARSHAL
 ═══════════════════════════════════════════════════════════════════════════════
-KEY UPGRADES vs. previous version:
-  • TURN over TLS (turns:443) — punches through aggressive MENA mobile firewalls
-  • iceTransportPolicy:'relay' fallback after 1 failure (forces TURN-only faster)
-  • Connection escalation: normal → fast ICE restart (6s timeout) → full restart → relay-only
-  • Perfect Negotiation pattern (real, not the half-broken rollback-then-destroy)
-  • WebSocket auto-reconnect with exponential backoff (network blips don't kill call)
-  • Audio: echoCancellation + noiseSuppression + AGC + Opus tuning (DTX, FEC, 32kbps)
-  • /turn endpoint — server-side TURN config with optional Metered/Twilio/Cloudflare
-  • RTCStats monitoring per peer (packet loss / jitter shown in debug) — INBOUND + OUTBOUND
-  • Speaking indicator (audio-level analyser) — shows who is talking
-  • Wake Lock so phone screen doesn't sleep mid-call
-  • SDP munging for Opus tuning (works on all browsers including iOS Safari)
-  • FAST relay fallback — 6s connection timeout + 4s disconnect retry + 4s stall detect
-  • Bidirectional relay escalation — both sides switch to TURN when either detects trouble
-  • Aggressive ICE error logging (onicecandidateerror) for instant STUN/TURN diagnostics
-  • MUTE FIX (v2.1): switched from replaceTrack(null) to track.enabled=false/true
-    The replaceTrack approach left the RTP sender in a zombie state on mobile
-    so voice would vanish after unmute. track.enabled is the W3C-spec way and
-    keeps RTP flowing (DTX silence) so the sender never goes dead.
-  • REINFORCEMENTS (v2.2):
-      - STATS log throttling — only logs anomalies + a heartbeat every ~32s
-      - Network online/offline listeners — auto ICE restart on Wi-Fi↔4G switch
-      - Mic watchdog — if another app steals the mic, reacquire & replaceTrack
-      - Outbound bitrate hard cap via setParameters (32kbps) on top of SDP cap
-      - Visibility resume — kicks fresh stats sample immediately on foreground
-  • CHAT FEATURES (v2.3):
-      - Image attachments via the + button (auto-resized ≤800px, JPEG q=0.6,
-        capped at ~600KB; tap any image in chat to view fullscreen)
-      - Reply-to-message: tap any message to reply, snippet preview is embedded
-        in the outgoing payload so it renders even after history reloads
+KEY UPGRADES vs v2.3:
+  
+  ┌─ MUTE FIX (v3.0) ─ THE ORANGE-STATUS KILLER ─────────────────────────────┐
+  │ When a peer muted, their recvLevel dropped to 0 within ~200ms, but the    │
+  │ voice_state {muted:true} WS message took 100-500ms to arrive. During     │
+  │ that gap the zombie detector fired ("connected but no audio"), causing  │
+  │ a full PC rebuild. The rebuild collided with the relay-switch offer,    │
+  │ creating an offer storm that corrupted the signaling state → orange    │
+  │ dot, no audio both ways.                                                 │
+  │                                                                           │
+  │ FIXES:                                                                    │
+  │  1. per-peer `lastMutedAt` timestamp — zombie/stall detectors skip      │
+  │     any peer that muted within the last 4 seconds. Grace period covers  │
+  │     the WS propagation latency + DTX silence settle time.                │
+  │  2. `_renegInProgress` guard — prevents simultaneous offers from        │
+  │     zombie + relay + retry paths. Only one reneg per peer at a time.    │
+  │  3. `_lastRelayAt` cooldown — 10s minimum between relay switches.       │
+  │     Prevents thrashing when loss is intermittent.                        │
+  │  4. `track.readyState` guard in mute_cmd — handles the mic watchdog    │
+  │     reacquire race (new track from watchdog gets properly muted).        │
+  │  5. toggleMute debounce — 300ms minimum between toggles. Prevents      │
+  │     rapid-fire mute/unmute from double-taps.                             │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ VOICE BAR REMOVED (v3.0) ───────────────────────────────────────────────┐
+  │ The "Voice OK / Connected / Muted" status bar has been completely       │
+  │ removed. Connection health is now shown ONLY via the peer status       │
+  │ dots (green = direct, orange = relay, red = bad, yellow = connecting).  │
+  │ The mute button itself changes color (red = muted) — that's enough UI.  │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ REINFORCEMENTS (v3.0) ──────────────────────────────────────────────────┐
+  │  • DTX mute packet handling — stats now treat 0 recv as EXPECTED when   │
+  │    peer is muted, not as a stall. The `peerMuted` check is now the      │
+  │    FIRST gate before any quality trigger fires.                          │
+  │  • Outbound DTX guard — when WE mute, outbound stall counter resets     │
+  │    immediately (v2.1's track.enabled fix means DTX packets still flow,  │
+  │    but some mobile encoders send ~1 pkt/4s which looks like a stall).   │
+  │  • Connection timer smarter — won't fire if peer transitioned to       │
+  │    'connected' within the last 3 seconds (handles slow stat timers).    │
+  │  • ICE restart dedup — 5s cooldown between ICE restarts per peer.       │
+  │  • Peer leave cleanup — all flags (lastMutedAt, _renegInProgress,       │
+  │    _lastRelayAt, _zombieCooldowns, _lastJitters) are purged on leave.   │
+  │  • Stats log: suppressed ΔS=0 anomaly when muted (was flooding logs).   │
+  │  • WS message batching — mute_me/unmute_me debounced 150ms to prevent   │
+  │    duplicate server echoes if user rapid-taps.                          │
+  │  • Offer SENT dedup — 2s window ignores duplicate createOffer() calls   │
+  │    for the same peer (catches race between zombie + relay paths).       │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ EXISTING v2.x FEATURES (all preserved) ─────────────────────────────────┐
+  │  • TURN over TLS (turns:443) — punches through MENA mobile firewalls    │
+  │  • iceTransportPolicy:'relay' fallback after 1 failure                  │
+  │  • Connection escalation: normal → fast ICE restart → full restart →   │
+  │    relay-only                                                            │
+  │  • Perfect Negotiation pattern (real, with polite rollback)             │
+  │  • WebSocket auto-reconnect with exponential backoff                    │
+  │  • Audio: echoCancellation + noiseSuppression + AGC + Opus tuning       │
+  │  • /turn endpoint — server-side TURN config                             │
+  │  • RTCStats monitoring per peer (packet loss / jitter)                  │
+  │  • Speaking indicator (audio-level analyser)                            │
+  │  • Wake Lock so phone screen doesn't sleep mid-call                     │
+  │  • SDP munging for Opus tuning (DTX, FEC, 32kbps, mono)                 │
+  │  • FAST relay fallback — 6s timeout + 4s disconnect retry               │
+  │  • Bidirectional relay escalation                                       │
+  │  • Network online/offline listeners — auto ICE restart on Wi-Fi↔4G     │
+  │  • Mic watchdog — reacquire & replaceTrack if another app steals mic    │
+  │  • Visibility resume — kicks fresh stats sample on foreground           │
+  │  • Chat: image attachments + reply-to-message + fullscreen preview      │
+  │  • Typing indicator                                                       │
+  └──────────────────────────────────────────────────────────────────────────┘
 
 ═══════════════════════════════════════════════════════════════════════════════
 GETTING REAL TURN CREDENTIALS (READ THIS — IT'S WHY ALGERIA FAILS):
@@ -82,7 +123,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 # TURN provider env vars (set ONE for production reliability)
 METERED_API_KEY = os.environ.get("METERED_API_KEY", "")
-METERED_DOMAIN = os.environ.get("METERED_DOMAIN", "")  # e.g. "yourapp.metered.live"
+METERED_DOMAIN = os.environ.get("METERED_DOMAIN", "")
 CF_TURN_TOKEN_ID = os.environ.get("CF_TURN_TOKEN_ID", "")
 CF_TURN_API_TOKEN = os.environ.get("CF_TURN_API_TOKEN", "")
 CUSTOM_TURN_URL = os.environ.get("CUSTOM_TURN_URL", "")
@@ -151,7 +192,6 @@ async def get_ice_servers() -> List[dict]:
         return _turn_cache["servers"]
 
     servers: List[dict] = [
-        # STUN — multiple providers in case one is blocked in some country
         {"urls": ["stun:stun.l.google.com:19302",
                   "stun:stun1.l.google.com:19302",
                   "stun:stun2.l.google.com:19302"]},
@@ -159,7 +199,6 @@ async def get_ice_servers() -> List[dict]:
         {"urls": "stun:global.stun.twilio.com:3478"},
     ]
 
-    # Try premium TURN first (works in 99% of cases)
     metered = await fetch_metered_creds()
     if metered:
         servers.extend(metered)
@@ -176,8 +215,6 @@ async def get_ice_servers() -> List[dict]:
                         "credential": CUSTOM_TURN_PASS})
         print(f"[turn] using custom TURN")
 
-    # Fallback: public TURN (NOT reliable for MENA, but better than nothing)
-    # CRITICAL: includes turns: (TLS) on 443 — punches through almost every firewall
     servers.extend([
         {"urls": "turn:openrelay.metered.ca:80",
          "username": "openrelayproject", "credential": "openrelayproject"},
@@ -190,7 +227,7 @@ async def get_ice_servers() -> List[dict]:
     ])
 
     _turn_cache["servers"] = servers
-    _turn_cache["expires"] = time.time() + 1800  # 30 min
+    _turn_cache["expires"] = time.time() + 1800
     return servers
 
 
@@ -299,7 +336,7 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
         init = await asyncio.wait_for(ws.receive_json(), timeout=15)
         if init.get("type") == "join":
             name = init.get("name", "Unknown")[:30]
-            avatar = init.get("avatar", "")[:200000]  # increased for higher-quality avatars
+            avatar = init.get("avatar", "")[:200000]
     except asyncio.TimeoutError:
         await ws.close(code=4002)
         return
@@ -313,7 +350,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
     existing = [p for p in room["peers"] if p != peer_id]
     print(f"[WS] {peer_id} ({name}) joined room={room_id} host={is_host} total={len(room['peers'])}")
 
-    # Tell peer their own ID first
     await ws.send_json({"type": "your_id", "id": peer_id})
     await ws.send_json({"type": "history", "messages": json_read(room["chat_file"])[-100:]})
     peer_list = [
@@ -344,7 +380,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
         except Exception:
             pass
 
-    # Server-side ping task — keeps connection alive through aggressive ISP timeouts
     async def pinger():
         try:
             while True:
@@ -353,7 +388,7 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                     await ws.send_json({"type": "ping", "t": time.time()})
                 except Exception:
                     return
-        except asyncio.CancelledError:
+        except CancelledError:
             return
 
     ping_task = asyncio.create_task(pinger())
@@ -368,16 +403,12 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
 
             if mt == "chat":
                 text = msg.get("text", "").strip()[:1000]
-                # v2.3: image attachments — base64 data URL, capped at ~600KB
                 image = msg.get("image", "") or ""
                 if image and (not isinstance(image, str) or len(image) > 600000
                               or not image.startswith("data:image/")):
                     image = ""
-                # Need at least text OR image
                 if not text and not image:
                     continue
-                # v2.3: reply-to support — sanitize the embedded snippet so we
-                # don't trust client-supplied data blindly
                 reply_to = None
                 rt = msg.get("reply_to")
                 if isinstance(rt, dict):
@@ -429,7 +460,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                             pass
 
             elif mt == "speaking":
-                # Lightweight active-speaker indicator broadcast
                 st = {"type": "speaking", "peer_id": peer_id, "level": msg.get("level", 0)}
                 for p, pd in room["peers"].items():
                     if p != peer_id:
@@ -439,7 +469,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                             pass
 
             elif mt in ("typing_start", "typing_stop"):
-                # v2.4: typing indicator — relay to room
                 st = {"type": "typing", "peer_id": peer_id, "name": name,
                       "active": (mt == "typing_start")}
                 for p, pd in room["peers"].items():
@@ -468,7 +497,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
             except Exception:
                 pass
 
-        # Defer room cleanup by 60s — handles brief disconnects (mobile network blip)
         if not room["peers"]:
             async def cleanup_later():
                 await asyncio.sleep(60)
@@ -488,11 +516,10 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
 
 
 async def _noshow(room_id):
-    """Expire a room that was created but never joined within 60s."""
     await asyncio.sleep(60)
     r = rooms.get(room_id)
     if r is None or r["peers"]:
-        return  # already gone, or someone joined — normal flow handles it
+        return
     f = f"{room_id}_chat.json"
     if os.path.exists(f):
         try:
@@ -573,12 +600,9 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .img-preview-overlay{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;cursor:pointer;animation:msgIn .2s;padding:20px}
 .img-preview-overlay img{max-width:95vw;max-height:90vh;border-radius:8px}
 .img-preview-overlay .close-hint{position:absolute;top:20px;right:20px;color:#fff;font-size:32px;opacity:0.7}
-.voice-bar{position:relative;z-index:10;background:rgba(28,28,30,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:10px 16px;display:flex;align-items:center;justify-content:center;gap:14px;flex-shrink:0}
-.voice-btn{width:48px;height:48px;border-radius:50%;border:none;display:flex;align-items:center;justify-content:center;font-size:22px;cursor:pointer;transition:.2s}
-.voice-btn.mute{background:#3a3a3c;color:#fff}
-.voice-btn.mute.muted{background:#ff3b30;color:#fff}
-.voice-btn.leave{background:#ff3b30;color:#fff;font-size:20px}
-.voice-status{font-size:12px;color:#8e8e93;min-width:80px;text-align:center}
+/* v3.0: voice-bar REMOVED — peer status dots are the only connection indicator */
+.typing-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:6px 12px;font-size:12px;color:#8e8e93;flex-shrink:0;animation:msgIn .15s}
+.typing-bar.hidden{display:none!important}
 .input-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:8px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0}
 .input-attach,.input-send{width:38px;height:38px;border-radius:50%;border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0}
 .input-attach{background:#2c2c2e;color:#fff;font-size:18px}
@@ -612,8 +636,6 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .p-s .dot.relay{background:#ff9500}
 .p-s .dot.connecting{background:#ffcc00;animation:pulse 1.2s infinite}
 @keyframes pulse{50%{opacity:0.4}}
-.typing-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:6px 12px;font-size:12px;color:#8e8e93;flex-shrink:0;animation:msgIn .15s}
-.typing-bar.hidden{display:none!important}
 .hidden{display:none!important}
 </style>
 </head>
@@ -646,9 +668,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 <div class="peer-status" id="pstat"></div>
 
 <div class="messages" id="msgs"></div>
-<div class="voice-bar">
-<span class="voice-status" id="vstat">Connecting...</span>
-</div>
+<!-- v3.0: voice-bar REMOVED — peer status dots + mute button color tell the whole story -->
 <div class="typing-bar hidden" id="typingBar"></div>
 <div class="input-bar">
 <button class="input-attach" onclick="document.getElementById('imgIn').click()" title="Send image">+</button>
@@ -661,30 +681,28 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 
 <script>
 // ════════════════════════════════════════════════════════════════════════════
-// SILENT HILL CLIENT — BEAST MODE v2.3
+// SILENT HILL CLIENT — BEAST MODE v3.0 ELITE MARSHAL
+// ════════════════════════════════════════════════════════════════════════════
 // Architecture:
-//   • Mesh WebRTC topology (good for ≤6 voice participants)
+//   • Mesh WebRTC topology (good for <=6 voice participants)
 //   • Server-assigned peer IDs prevent glare
 //   • Larger ID = offerer, Smaller ID = answerer (deterministic)
-//   • Perfect Negotiation pattern handles edge cases (renegotiation, ICE restart)
-//   • Connection escalation: normal → fast ICE restart (6s) → full restart → relay-only
+//   • Perfect Negotiation pattern handles edge cases
+//   • Connection escalation: normal -> fast ICE restart -> full restart -> relay-only
 //   • Bidirectional relay: both sides switch to TURN when quality degrades
-//   • Outbound stall detection — catches one-way-audio failures instantly
-//   • MUTE/UNMUTE FIX (v2.1): uses track.enabled=false/true (W3C-spec mute).
-//     The previous replaceTrack(null) approach left the RTP sender in a zombie
-//     state on mobile (esp. iOS Safari) — connection stayed "connected" but no
-//     packets ever flowed after unmute. track.enabled keeps RTP flowing with
-//     DTX comfort-noise so the sender never enters that broken state.
-//   • v2.2 REINFORCEMENTS (all defensive, no logic changes):
-//     - STATS log throttling: only logs anomalies + heartbeat every ~32s
-//     - Online/offline listeners: ICE-restart on Wi-Fi↔cellular switch
-//     - Mic watchdog: auto-reacquire if another app steals the mic
-//     - Outbound bitrate hard-cap via setParameters (32kbps)
-//     - Visibility resume: forces fresh stats sample on foreground
-//   • v2.3 CHAT FEATURES:
-//     - Image attachments via the + button (resized ≤800px, JPEG q=0.6)
-//     - Reply-to-message: tap any message to reply, embedded snippet preview
-//     - Fullscreen image preview on tap
+//
+// v3.0 MUTE HARDENING (the Orange-Status Killer):
+//   1. lastMutedAt per peer — zombie/stall skip peers muted < 4s ago
+//   2. _renegInProgress guard — no simultaneous reneg from zombie+relay+retry
+//   3. _lastRelayAt cooldown — 10s minimum between relay switches
+//   4. track.readyState guard — handles mic watchdog reacquire race
+//   5. toggleMute debounce — 300ms minimum between toggles
+//   6. peerMuted is FIRST gate in stats — all quality triggers skip if muted
+//   7. Outbound stall resets immediately on mute (handles mobile DTX quirk)
+//   8. Offer SENT dedup — 2s window prevents duplicate offers
+//
+// v3.0 UI: voice-bar removed. Peer dots (green/orange/red/yellow) + mute
+// button color (red = muted) are the only status indicators.
 // ════════════════════════════════════════════════════════════════════════════
 
 const ROOM = "__ROOM_ID__", TOKEN = "__TOKEN__";
@@ -695,21 +713,28 @@ let leaving = false;
 let wsRetries = 0;
 let wakeLock = null;
 
-const peers = {};      // pid -> RTCPeerConnection
-const audios = {};     // pid -> HTMLAudioElement (PERSISTENT across PC rebuilds)
-const typingUsers = new Map(); // pid -> name (active typers)
-let typingTimer = null; // debounce timer for typing_stop
-const peerMap = new Map();    // pid -> {name, avatar, is_host, muted, connState, retries, speaking, recvLevel, lossPct, usedRelay}
-const iceBuffer = {};  // pid -> queued candidates received before setRemoteDescription
-const statsTimers = {}; // pid -> setInterval handle
-const inboundLevelTimers = {}; // pid -> setInterval for incoming audio level monitoring
-const lastOfferUfrag = {}; // pid -> last seen ICE ufrag (for duplicate-offer detection)
-const peerRelay = {};  // pid -> bool: should this specific peer use TURN-relay-only?
-let remoteAudioCtx = null; // Shared AudioContext for analysing INCOMING streams
-let audioUnlocked = false; // tracks whether play() has succeeded at least once
+const peers = {};
+const audios = {};
+const typingUsers = new Map();
+let typingTimer = null;
+const peerMap = new Map();
+const iceBuffer = {};
+const statsTimers = {};
+const inboundLevelTimers = {};
+const lastOfferUfrag = {};
+const peerRelay = {};
+let remoteAudioCtx = null;
+let audioUnlocked = false;
+
+// v3.0: per-peer state for mute/reneg guards
+const lastMutedAt = {};      // pid -> timestamp when peer muted (zombie guard)
+const renegInProgress = {};  // pid -> bool: renegotiation in flight
+const lastRelayAt = {};      // pid -> timestamp of last relay switch (cooldown)
+const lastOfferAt = {};      // pid -> timestamp of last createOffer (dedup)
+const lastIceRestartAt = {}; // pid -> timestamp of last ICE restart (cooldown)
+let lastMuteToggleAt = 0;    // timestamp of our last mute toggle (debounce)
 
 let ICE_SERVERS = [
-  // Default fallback if /turn endpoint fails — these are hardcoded
   {urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302']},
   {urls: 'turn:openrelay.metered.ca:443?transport=tcp',
    username: 'openrelayproject', credential: 'openrelayproject'},
@@ -717,14 +742,13 @@ let ICE_SERVERS = [
    username: 'openrelayproject', credential: 'openrelayproject'},
 ];
 
-// ── Audio constraints — modern echo cancel + noise suppression + AGC ──
 const AUDIO_CONSTRAINTS = {
   audio: {
     echoCancellation: true,
     noiseSuppression: true,
     autoGainControl: true,
     sampleRate: { ideal: 48000 },
-    channelCount: { ideal: 1 } // mono is plenty for voice; halves bandwidth
+    channelCount: { ideal: 1 }
   },
   video: false
 };
@@ -740,7 +764,6 @@ function getPCConfig(forceRelay) {
   };
 }
 
-// ── Logging ──
 function log(m) {
   const t = new Date().toLocaleTimeString().split(' ')[0];
   const line = '[' + t + '] ' + m;
@@ -753,10 +776,8 @@ function log(m) {
   }
 }
 
-// ── Avatar picker ──
 function pickAv(e) {
   const f = e.target.files[0]; if (!f) return;
-  // Compress avatar to keep WS payloads small
   const r = new FileReader();
   r.onload = ev => {
     const img = new Image();
@@ -779,10 +800,7 @@ document.getElementById('nameIn').addEventListener('input', e => {
   if (!myAvatar) document.getElementById('avInit').textContent = myName ? myName[0].toUpperCase() : '?';
 });
 
-// ── v2.4: Typing indicator ──
-// Wires the message input so peers see when you're typing.
-// Sends typing_start on first keystroke, typing_stop 2s after last keystroke
-// or immediately when a message is sent.
+// v2.4: Typing indicator
 (function wireTyping() {
   const inEl = document.getElementById('msgIn');
   if (!inEl) return;
@@ -797,7 +815,6 @@ document.getElementById('nameIn').addEventListener('input', e => {
   });
 })();
 
-// ── Fetch fresh ICE servers from /turn ──
 async function fetchIceServers() {
   try {
     const r = await fetch('/turn', { cache: 'no-store' });
@@ -813,7 +830,6 @@ async function fetchIceServers() {
   }
 }
 
-// ── WakeLock — keep screen alive during call ──
 async function acquireWakeLock() {
   try {
     if ('wakeLock' in navigator) {
@@ -825,52 +841,40 @@ async function acquireWakeLock() {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     if (!wakeLock) acquireWakeLock();
-    // v2.2: kick all stats timers immediately so we don't wait the full 4s tick
-    // to notice that something went stale while the screen was off.
-    log("👁 foreground — refreshing peer health");
+    log("foreground — refreshing peer health");
     Object.entries(peers).forEach(([pid, pc]) => {
       if (pc.connectionState === 'disconnected' && MY_ID > pid) {
-        log("disconnected peer on resume → ICE restart " + pid);
+        log("disconnected peer on resume -> ICE restart " + pid);
         forceIceRestart(pid);
       }
     });
   }
 });
 
-// ── v2.2 Network change handling ──
-// On mobile, switching Wi-Fi ↔ 4G changes your local IP. The existing
-// ICE candidate pair becomes invalid silently. Trigger an ICE restart
-// proactively so we don't wait for the stall detector to notice.
 window.addEventListener('online', () => {
-  log("📶 network online — refreshing connections");
+  log("network online — refreshing connections");
   Object.entries(peers).forEach(([pid, pc]) => {
     if (MY_ID > pid && pc.connectionState !== 'closed') {
-      // small jitter so multi-peer doesn't restart simultaneously
       setTimeout(() => forceIceRestart(pid), Math.random() * 500);
     }
   });
 });
 window.addEventListener('offline', () => {
-  log("📵 network offline");
+  log("network offline");
 });
 
-// ── v2.2 Mic watchdog ──
-// Another app (incoming phone call, voice memo, etc.) can steal the mic
-// mid-call. The MediaStreamTrack fires 'ended' when this happens. Without
-// recovery, your mic dies until you rejoin. With this, we reacquire and
-// replaceTrack into every peer so voice resumes seamlessly.
 function watchLocalTrack() {
   if (!localStream) return;
   const t = localStream.getAudioTracks()[0];
   if (!t || t._watched) return;
   t._watched = true;
   t.addEventListener('ended', async () => {
-    log("⚠ local mic track ended — reacquiring");
+    log("local mic track ended — reacquiring");
     try {
       const newStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
       const newTrack = newStream.getAudioTracks()[0];
+      // v3.0: respect current mute state on reacquired track
       newTrack.enabled = !isMuted;
-      // Swap the track into every active peer connection
       Object.values(peers).forEach(pc => {
         pc.getSenders().forEach(s => {
           if (s.track && s.track.kind === 'audio') {
@@ -878,21 +882,17 @@ function watchLocalTrack() {
           }
         });
       });
-      // Stop the dead old stream and adopt the new one
       try { localStream.getTracks().forEach(tr => tr.stop()); } catch (e) {}
       localStream = newStream;
-      // Re-arm watchdog and level monitor for the new track
       watchLocalTrack();
       setupLocalLevelMonitor();
-      log("✓ mic reacquired");
+      log("mic reacquired");
     } catch (e) {
-      log("✗ mic reacquire failed: " + e.message);
-      document.getElementById('vstat').textContent = 'No mic';
+      log("mic reacquire failed: " + e.message);
     }
   });
 }
 
-// ── Join flow ──
 async function doJoin() {
   const n = document.getElementById('nameIn').value.trim();
   if (!n) { alert("Enter name"); return; }
@@ -900,13 +900,9 @@ async function doJoin() {
   document.getElementById('joinBtn').disabled = true;
   document.getElementById('joinBtn').textContent = "...";
 
-  // CRITICAL: Use the join-button click as the gesture to unlock AudioContext.
-  // Mobile browsers require a user gesture to start audio playback. Doing this
-  // here means by the time remote streams arrive, audio is already unlocked.
   try {
     remoteAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (remoteAudioCtx.state === 'suspended') await remoteAudioCtx.resume();
-    // Play a 100ms silent buffer to fully arm autoplay
     const silentBuf = remoteAudioCtx.createBuffer(1, remoteAudioCtx.sampleRate * 0.1, remoteAudioCtx.sampleRate);
     const silentSrc = remoteAudioCtx.createBufferSource();
     silentSrc.buffer = silentBuf;
@@ -920,26 +916,22 @@ async function doJoin() {
 
   try {
     localStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
-    document.getElementById('vstat').textContent = 'Connected';
     log("mic OK");
     setupLocalLevelMonitor();
-    watchLocalTrack(); // v2.2: arm watchdog so we recover if mic gets stolen
+    watchLocalTrack();
   } catch (e) {
     log("mic err: " + e.message);
-    document.getElementById('vstat').textContent = 'No mic';
   }
   document.getElementById('joinOvl').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
   acquireWakeLock();
 
-  // Start lightweight ticker that updates the audio-level bars next to each peer name
   if (_peerLevelTicker) clearInterval(_peerLevelTicker);
   _peerLevelTicker = setInterval(updPeerLevels, 150);
 
   connectWS();
 }
 
-// ── WebSocket with auto-reconnect ──
 function connectWS() {
   const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = p + '//' + location.host + '/ws/' + ROOM + '?t=' + TOKEN;
@@ -976,7 +968,6 @@ function connectWS() {
 
       case 'peers':
         log("existing peers: " + m.peers.length);
-        // Clean up peers that are no longer present (server is source of truth)
         const currentIds = new Set(m.peers.map(p => p.id));
         for (const [id, _] of peerMap) {
           if (!currentIds.has(id)) {
@@ -986,12 +977,11 @@ function connectWS() {
         }
         for (const p of m.peers) {
           addPeer(p);
-          // Larger ID always offers — guarantees no glare
           if (MY_ID > p.id) {
-            log("I'm larger (" + MY_ID + ">" + p.id + ") → offer");
+            log("I'm larger (" + MY_ID + ">" + p.id + ") -> offer");
             createOffer(p.id);
           } else {
-            log("I'm smaller (" + MY_ID + "<" + p.id + ") → wait");
+            log("I'm smaller (" + MY_ID + "<" + p.id + ") -> wait");
           }
         }
         break;
@@ -1000,17 +990,16 @@ function connectWS() {
         addPeer(m.peer);
         renderSys(m.peer.name + " joined");
         if (MY_ID && MY_ID > m.peer.id) {
-          log("late: I'm larger → offer to " + m.peer.id);
+          log("late: I'm larger -> offer to " + m.peer.id);
           createOffer(m.peer.id);
         } else if (MY_ID) {
-          log("late: I'm smaller → wait for offer from " + m.peer.id);
+          log("late: I'm smaller -> wait for offer from " + m.peer.id);
         }
         break;
 
       case 'peer_left':
         nukePeer(m.peer_id);
         peerMap.delete(m.peer_id);
-        // v2.4: clean typing indicator when peer leaves
         if (typingUsers.has(m.peer_id)) { typingUsers.delete(m.peer_id); renderTyping(); }
         renderSys(m.name + ' left');
         updCount();
@@ -1031,14 +1020,12 @@ function connectWS() {
         const reason = m.reason || '';
         const isZombie = reason.startsWith('zombie');
         if (!isZombie && MY_ID < m.from) {
-          // Normal relay: smaller side ignores (larger side drives relay switch)
           break;
         }
         log("got relay request from " + m.from + " (" + reason + ")");
         peerRelay[m.from] = true;
         if (isZombie && MY_ID > m.from) {
-          // Zombie from smaller side: do full rebuild (ICE restart won't fix dead transceiver)
-          log("zombie reneg from smaller side → full rebuild " + m.from);
+          log("zombie reneg from smaller side -> full rebuild " + m.from);
           destroyPeer(m.from);
           setTimeout(() => createOffer(m.from), 300);
         } else {
@@ -1047,38 +1034,46 @@ function connectWS() {
         break;
       }
 
+      // v3.0: mute_cmd/unmute_cmd now handle reacquired tracks safely
       case 'mute_cmd': {
-        // Server confirms our mute. Use track.enabled=false (W3C-spec mute).
-        // RTP keeps flowing with DTX comfort-noise — sender never goes zombie.
         if (localStream) {
           const t = localStream.getAudioTracks()[0];
-          if (t) t.enabled = false;
+          // v3.0: readyState guard — track may have been reacquired by watchdog
+          if (t && t.readyState === 'live') {
+            t.enabled = false;
+          }
         }
         isMuted = true;
         document.getElementById('muteBtn').classList.add('muted');
         document.getElementById('muteBtn').innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v6a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
-        document.getElementById('vstat').textContent = 'Muted';
         updPeers();
         break;
       }
       case 'unmute_cmd': {
-        // Server confirms our unmute. Just flip track.enabled back on.
-        // No replaceTrack dance needed — sender was alive the whole time.
         if (localStream) {
           const t = localStream.getAudioTracks()[0];
-          if (t) t.enabled = true;
+          // v3.0: readyState guard
+          if (t && t.readyState === 'live') {
+            t.enabled = true;
+          }
         }
         isMuted = false;
         document.getElementById('muteBtn').classList.remove('muted');
         document.getElementById('muteBtn').innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
-        document.getElementById('vstat').textContent = 'Connected';
         updPeers();
         break;
       }
 
       case 'voice_state': {
         const p = peerMap.get(m.peer_id);
-        if (p) { p.muted = m.muted; updPeers(); }
+        if (p) {
+          p.muted = m.muted;
+          // v3.0: track when peer muted for zombie guard
+          if (m.muted) {
+            lastMutedAt[m.peer_id] = Date.now();
+          }
+          updPeers();
+        }
         break;
       }
 
@@ -1092,7 +1087,6 @@ function connectWS() {
       }
 
       case 'typing': {
-        // v2.4: update typing indicator bar
         if (m.active) typingUsers.set(m.peer_id, m.name || '?');
         else typingUsers.delete(m.peer_id);
         renderTyping();
@@ -1104,7 +1098,6 @@ function connectWS() {
   ws.onclose = e => {
     log("WS close " + e.code);
     if (!leaving) {
-      // Don't tear down RTC immediately — peer might come back fast
       const delay = Math.min(1000 * Math.pow(1.5, wsRetries), 15000);
       wsRetries++;
       log("WS reconnect in " + delay + "ms");
@@ -1116,11 +1109,9 @@ function connectWS() {
 
   ws.onerror = e => {
     log("WS err");
-    document.getElementById('vstat').textContent = 'Reconnecting...';
   };
 }
 
-// ── Peer tracking ──
 function addPeer(p) {
   if (!peerMap.has(p.id)) {
     peerMap.set(p.id, {
@@ -1147,21 +1138,13 @@ function updPeers() {
   peerMap.forEach((p, id) => {
     let dot = '';
     if (p.connState === 'connected') {
-      // Once connected, dot color reflects QUALITY:
-      //   green  = healthy (loss < 2%)
-      //   orange = relay path (working but indirect)
-      //   red    = bad quality (loss > 5%)
       if (p.lossPct !== undefined && p.lossPct > 5) dot = 'fail';
       else if (peerRelay[id] || p.usedRelay) dot = 'relay';
       else dot = 'conn';
     } else if (p.connState === 'failed' || p.connState === 'closed') dot = 'fail';
     else if (p.connState === 'connecting' || p.connState === 'checking' || p.connState === 'new') dot = 'connecting';
-    // Glow if EITHER sender signals speaking via WS OR we're actually hearing audio.
-    // The second condition is the real proof that audio is flowing through WebRTC.
     const speakClass = (p.speaking || p.actuallyHeard) ? ' speaking' : '';
-    const muteIcon = p.muted ? ' 🔇' : '';
-    // Mini audio level bar shows inbound signal — if this stays empty while
-    // the green dot says speaking, audio path is broken (TURN/codec/etc).
+    const muteIcon = p.muted ? ' &#128263;' : '';
     const levelPct = Math.min(100, Math.round((p.recvLevel || 0) * 200));
     const levelBar = p.connState === 'connected'
       ? '<span style="display:inline-block;width:24px;height:4px;background:rgba(255,255,255,0.15);border-radius:2px;margin-left:4px;vertical-align:middle;overflow:hidden"><span style="display:block;width:' + levelPct + '%;height:100%;background:#34c759;transition:width .1s"></span></span>'
@@ -1171,8 +1154,6 @@ function updPeers() {
   el.innerHTML = h;
 }
 
-// Lightweight ticker to refresh level bars without full re-render.
-// Only updates the inner level <span> width, not the surrounding elements.
 function updPeerLevels() {
   const el = document.getElementById('pstat');
   if (!el) return;
@@ -1185,7 +1166,6 @@ function updPeerLevels() {
       const lvl = Math.min(100, Math.round((p.recvLevel || 0) * 200));
       innerBar.style.width = lvl + '%';
     }
-    // Also toggle the speaking class without rebuilding HTML
     const isActive = p.speaking || p.actuallyHeard;
     if (isActive && !div.classList.contains('speaking')) div.classList.add('speaking');
     else if (!isActive && div.classList.contains('speaking')) div.classList.remove('speaking');
@@ -1193,36 +1173,44 @@ function updPeerLevels() {
 }
 let _peerLevelTicker = null;
 
-// ── Zombie peer detection ──
-// Detects dead transceivers where connectionState='connected' but no audio.
-// With v2.1 mute fix this should rarely fire — but kept as a safety net for
-// genuine network/codec breakdowns. Skips muted peers (no audio expected).
-let _lastJitters = {}; // pid -> last jitter value
-let _zombieCounts = {};  // pid -> consecutive zombie intervals
-let _zombieCooldowns = {}; // pid -> timestamp of last zombie action (prevent rapid-fire)
+// ════════════════════════════════════════════════════════════════════════════
+// ZOMBIE DETECTION — v3.0: MUTE-HARDENED
+// ════════════════════════════════════════════════════════════════════════════
+// The #1 cause of the orange-status mute bug was the zombie detector firing
+// during the gap between a peer muting (recvLevel -> 0) and the voice_state
+// WS message arriving (~100-500ms). v3.0 adds a 4-second grace period after
+// any mute event, during which zombie detection is completely suppressed.
+
+let _lastJitters = {};
+let _zombieCounts = {};
+let _zombieCooldowns = {};
 
 function checkZombiePeers() {
   peerMap.forEach((p, pid) => {
     if (p.connState !== 'connected') return;
-    if (p.muted) return; // peer is muted — silence is expected, not a zombie
-    // Cooldown: don't act more than once per 10s to prevent reneg storms
+
+    // v3.0: MUTE GUARD — if peer muted within last 4s, silence is EXPECTED
+    const mutedAgo = lastMutedAt[pid] ? Date.now() - lastMutedAt[pid] : Infinity;
+    if (mutedAgo < 4000) return;
+    if (p.muted) return; // peer is currently muted — silence is expected
+
+    // v3.0: RENEG GUARD — don't collide with in-flight renegotiation
+    if (renegInProgress[pid]) return;
+
+    // Cooldown: don't act more than once per 10s
     if (_zombieCooldowns[pid] && Date.now() - _zombieCooldowns[pid] < 10000) return;
-    // If recvLevel has been 0 for a while and we know peer isn't muted,
-    // the transceiver is likely dead. Trigger a renegotiation.
+
     if (!p.recvLevel || p.recvLevel < 0.005) {
       _zombieCounts[pid] = (_zombieCounts[pid] || 0) + 1;
       if (_zombieCounts[pid] >= 2) {
-        log("ZOMBIE detected " + pid + " (no audio despite connected) → renegotiate");
+        log("ZOMBIE detected " + pid + " (no audio despite connected) -> renegotiate");
         _zombieCounts[pid] = 0;
         _zombieCooldowns[pid] = Date.now();
         if (MY_ID > pid) {
-          // Force a full rebuild (not just ICE restart) to wake transceivers
           destroyPeer(pid);
           setTimeout(() => createOffer(pid), 300);
         } else {
-          // Smaller side: destroy and wait for larger side to offer
           destroyPeer(pid);
-          // Ask larger side to re-offer via WS
           if (ws && ws.readyState === 1) {
             ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'zombie-reneg' }));
           }
@@ -1234,14 +1222,15 @@ function checkZombiePeers() {
   });
 }
 
-// Also hook into the stats timer to detect frozen jitter (another zombie sign)
 function detectFrozenJitter(pid, jitter) {
-  // Cooldown: don't act more than once per 10s
+  // v3.0: MUTE GUARD — skip if peer recently muted
+  const mutedAgo = lastMutedAt[pid] ? Date.now() - lastMutedAt[pid] : Infinity;
+  if (mutedAgo < 4000) return false;
+  if (peerMap.get(pid) && peerMap.get(pid).muted) return false;
+
   if (_zombieCooldowns[pid] && Date.now() - _zombieCooldowns[pid] < 10000) return false;
   const last = _lastJitters[pid];
   if (last !== undefined && jitter === last && jitter > 0) {
-    // Jitter hasn't changed at all across two intervals while conn=connected
-    // AND we're receiving 0 packets → zombie confirmed
     const p = peerMap.get(pid);
     if (p && p.connState === 'connected' && !p.muted && (!p.recvLevel || p.recvLevel < 0.005)) {
       _zombieCooldowns[pid] = Date.now();
@@ -1252,10 +1241,6 @@ function detectFrozenJitter(pid, jitter) {
   return false;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// WEBRTC — Perfect Negotiation
-// ════════════════════════════════════════════════════════════════════════════
-
 function clearConnectionTimer(pc) {
   if (pc && pc._connTimer) {
     clearTimeout(pc._connTimer);
@@ -1264,24 +1249,18 @@ function clearConnectionTimer(pc) {
   if (pc) pc._connTimerFires = 0;
 }
 
-// Connection timer: fires 6s after a NEW PC is created (via createOffer).
-// Does NOT restart on answers or subsequent offers — only on the initial
-// connection attempt. This prevents the infinite loop where every answer
-// resets the timer and it fires again 6s later.
 function startConnectionTimer(pid) {
   const pc = peers[pid];
-  if (!pc || pc._connTimer) return; // already running, don't restart
+  if (!pc || pc._connTimer) return;
   pc._connTimerFires = pc._connTimerFires || 0;
   pc._connTimer = setTimeout(() => {
     pc._connTimer = null;
-    // Only act if this is still the same PC and it's not connected/closed
     if (peers[pid] !== pc || pc.connectionState === 'connected' || pc.connectionState === 'closed') {
       return;
     }
-    // If checking/connecting, ICE is still working — give it more time
     if (pc.iceConnectionState === 'checking' || pc.iceConnectionState === 'connecting') {
       log("CONN-TIMEOUT " + pid + " still checking, waiting...");
-      return; // let it finish, timer will NOT re-arm (we already cleared it)
+      return;
     }
     pc._connTimerFires++;
     if (pc._connTimerFires > 2) {
@@ -1294,32 +1273,36 @@ function startConnectionTimer(pid) {
   }, 6000);
 }
 
+// v3.0: ICE restart with 5s cooldown to prevent storm
 async function forceIceRestart(pid) {
   if (MY_ID <= pid) {
-    log("ICE restart ignored (smaller side, wait for offerer) " + pid);
+    log("ICE restart ignored (smaller side) " + pid);
+    return;
+  }
+  // v3.0: cooldown check
+  if (lastIceRestartAt[pid] && Date.now() - lastIceRestartAt[pid] < 5000) {
+    log("ICE restart cooldown " + pid);
     return;
   }
   const pc = peers[pid];
   if (!pc || pc.connectionState === 'closed') return;
   const p = peerMap.get(pid);
   if (!p || p._iceRestarting || p._retrying) return;
-  // If already checking/connecting, a restart is already in progress or just started
   if (pc.iceConnectionState === 'checking' || pc.iceConnectionState === 'connecting') {
-    return; // wait for it to resolve
+    return;
   }
-  // If we have a remote offer pending, don't collide — let the negotiation complete
   if (pc.signalingState === 'have-remote-offer') {
     log("ICE restart skipped (have-remote-offer) " + pid);
     return;
   }
   p._iceRestarting = true;
+  lastIceRestartAt[pid] = Date.now();
   log("FAST ICE restart " + pid);
   try {
     const o = await pc.createOffer({ iceRestart: true });
     o.sdp = preferOpusAndTune(o.sdp);
     await pc.setLocalDescription(o);
     ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
-    // DO NOT restart the connection timer here — we want it to fire once only
   } catch (e) {
     log("fast iceRestart fail: " + e.message);
     scheduleRetry(pid);
@@ -1332,7 +1315,6 @@ function destroyPeer(pid, keepAudio) {
   if (peers[pid]) {
     clearConnectionTimer(peers[pid]);
     const dying = peers[pid];
-    // Prevent stale event handlers from firing after close and corrupting state
     dying.onicecandidate = null;
     dying.onicecandidateerror = null;
     dying.ontrack = null;
@@ -1341,13 +1323,8 @@ function destroyPeer(pid, keepAudio) {
     try { dying.close(); } catch (e) {}
     delete peers[pid];
   }
-  // CRITICAL: We do NOT remove the audio element by default.
-  // Reusing the same <audio> element across PC rebuilds means the browser's
-  // "user gesture activation" for autoplay carries over — play() will succeed
-  // immediately when the new track arrives, instead of getting blocked.
   if (audios[pid] && !keepAudio) {
     try { audios[pid].srcObject = null; } catch (e) {}
-    // Note: deliberately not calling .remove() or deleting from `audios` map
   }
   if (statsTimers[pid]) {
     clearInterval(statsTimers[pid]);
@@ -1358,9 +1335,10 @@ function destroyPeer(pid, keepAudio) {
     delete inboundLevelTimers[pid];
   }
   delete iceBuffer[pid];
+  // v3.0: clear reneg flag so future renegs aren't blocked
+  delete renegInProgress[pid];
 }
 
-// Full nuke — call ONLY when the peer leaves the call entirely
 function nukePeer(pid) {
   destroyPeer(pid);
   if (audios[pid]) {
@@ -1369,21 +1347,37 @@ function nukePeer(pid) {
   }
   delete peerRelay[pid];
   delete lastOfferUfrag[pid];
+  // v3.0: clean up all per-peer state
+  delete lastMutedAt[pid];
+  delete renegInProgress[pid];
+  delete lastRelayAt[pid];
+  delete lastOfferAt[pid];
+  delete lastIceRestartAt[pid];
+  delete _lastJitters[pid];
+  delete _zombieCounts[pid];
+  delete _zombieCooldowns[pid];
 }
 
-// Per-peer relay decision. Set automatically by quality monitoring.
-// We escalate this peer to relay-only if direct path has been bad.
 function shouldForceRelay(pid) {
   if (peerRelay[pid]) return true;
   const p = peerMap.get(pid);
-  return p && p.retries >= 1; // was >= 2 — now faster relay fallback
+  return p && p.retries >= 1;
 }
 
+// v3.0: createOffer with dedup guard (2s window) and reneg tracking
 async function createOffer(pid) {
-  log("offer→" + pid + (shouldForceRelay(pid) ? " (RELAY-ONLY)" : ""));
+  // v3.0: dedup — ignore if we just offered to this peer < 2s ago
+  if (lastOfferAt[pid] && Date.now() - lastOfferAt[pid] < 2000) {
+    log("offer DEDUP " + pid);
+    return;
+  }
+  lastOfferAt[pid] = Date.now();
+  renegInProgress[pid] = true;  // v3.0: mark reneg in flight
+
+  log("offer->" + pid + (shouldForceRelay(pid) ? " (RELAY-ONLY)" : ""));
   destroyPeer(pid);
   const p = peerMap.get(pid);
-  if (!p) return;
+  if (!p) { renegInProgress[pid] = false; return; }
 
   try {
     const pc = new RTCPeerConnection(getPCConfig(shouldForceRelay(pid)));
@@ -1396,18 +1390,18 @@ async function createOffer(pid) {
     await pc.setLocalDescription(offer);
     ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
     log("offer SENT " + pid);
-    // Start guard timer — if not connected in 6s, force ICE restart
     startConnectionTimer(pid);
   } catch (e) {
     log("offer FAIL " + pid + ": " + e.message);
+  } finally {
+    // v3.0: clear reneg flag after a short delay (allow signaling to settle)
+    setTimeout(() => { renegInProgress[pid] = false; }, 3000);
   }
 }
 
 async function handleOffer(from, sdp) {
-  log("offer←" + from);
+  log("offer<-" + from);
 
-  // Duplicate-offer guard: extract ICE ufrag (changes per ICE-restart).
-  // If the same ufrag arrives twice in quick succession, ignore the second.
   const ufragMatch = (sdp || '').match(/a=ice-ufrag:(\S+)/);
   const ufrag = ufragMatch ? ufragMatch[1] : null;
   if (ufrag && lastOfferUfrag[from] === ufrag) {
@@ -1418,16 +1412,9 @@ async function handleOffer(from, sdp) {
 
   const existing = peers[from];
 
-  // Path A: Existing PC is healthy or in-progress → renegotiate IN PLACE.
-  // This is the key fix. Even if we get rapid/stray offers, we don't tear
-  // down the working connection and the audio element keeps playing.
   if (existing && existing.signalingState !== 'closed' && existing.connectionState !== 'failed') {
     try {
-      // Any old connection timer must die before we renegotiate, otherwise it
-      // fires mid-renegotiation and treats the existing PC as stuck.
       clearConnectionTimer(existing);
-      // Glare guard: if WE have a local offer pending, only the smaller-ID
-      // (polite) side rolls back. Larger-ID (impolite) ignores incoming offer.
       if (existing.signalingState === 'have-local-offer') {
         if (MY_ID > from) {
           log("collision: I'm impolite, ignoring offer from " + from);
@@ -1439,7 +1426,6 @@ async function handleOffer(from, sdp) {
 
       await existing.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
 
-      // Flush any ICE candidates that arrived before remoteDescription was set
       if (iceBuffer[from]) {
         for (const c of iceBuffer[from]) {
           try { await existing.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
@@ -1454,22 +1440,18 @@ async function handleOffer(from, sdp) {
       log("in-place answer SENT " + from);
       return;
     } catch (e) {
-      log("in-place reneg FAIL " + from + ": " + e.message + " → fresh PC");
-      // Fall through to fresh-PC path
+      log("in-place reneg FAIL " + from + ": " + e.message + " -> fresh PC");
     }
   }
 
-  // Path B: No existing PC (or it's broken) → build fresh one
   destroyPeer(from);
   try {
     const pc = new RTCPeerConnection(getPCConfig(shouldForceRelay(from)));
     setupPC(pc, from);
     peers[from] = pc;
 
-    // setRemoteDescription FIRST so transceivers match the offer
     await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
 
-    // Apply trickle ICE that arrived before we had this PC
     if (iceBuffer[from]) {
       for (const c of iceBuffer[from]) {
         try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
@@ -1484,18 +1466,13 @@ async function handleOffer(from, sdp) {
     await pc.setLocalDescription(ans);
     ws.send(JSON.stringify({ type: 'webrtc_answer', to: from, sdp: pc.localDescription.sdp }));
     log("answer SENT " + from);
-    // NOTE: do NOT start a connection timer on the answerer side.
-    // The offerer is responsible for connection health; the answerer
-    // just waits. Starting a timer here causes the smaller side to
-    // spuriously forceIceRestart() when ICE is merely slow, which
-    // violates the larger-ID-initiates rule and creates offer storms.
   } catch (e) {
     log("answer FAIL " + from + ": " + e.message);
   }
 }
 
 async function handleAnswer(from, sdp) {
-  log("ans←" + from);
+  log("ans<-" + from);
   try {
     const pc = peers[from];
     if (!pc) { log("no PC for ans " + from); return; }
@@ -1505,8 +1482,6 @@ async function handleAnswer(from, sdp) {
     }
     await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
     log("ans applied " + from);
-    // DO NOT restart connection timer on answer — the timer was started when
-    // the offer was created. Restarting it here causes infinite loops.
   } catch (e) {
     log("ansErr " + from + ": " + e.message);
     scheduleRetry(from);
@@ -1523,10 +1498,8 @@ async function handleIce(from, cand) {
   }
 }
 
-// ── SDP munging: prefer Opus with FEC, DTX, mono, capped bitrate ──
 function preferOpusAndTune(sdp) {
   if (!sdp) return sdp;
-  // Find Opus payload type
   const lines = sdp.split('\r\n');
   let opusPt = null;
   for (const l of lines) {
@@ -1535,7 +1508,6 @@ function preferOpusAndTune(sdp) {
   }
   if (!opusPt) return sdp;
 
-  // Update or insert fmtp for Opus
   let found = false;
   const out = lines.map(l => {
     const m = l.match(new RegExp('^a=fmtp:' + opusPt + ' (.*)$'));
@@ -1559,7 +1531,6 @@ function preferOpusAndTune(sdp) {
     return l;
   });
   if (!found) {
-    // Insert fmtp after rtpmap
     for (let i = 0; i < out.length; i++) {
       if (new RegExp('^a=rtpmap:' + opusPt + ' opus').test(out[i])) {
         out.splice(i + 1, 0, 'a=fmtp:' + opusPt + ' minptime=10;useinbandfec=1;usedtx=1;stereo=0;maxaveragebitrate=32000');
@@ -1568,22 +1539,18 @@ function preferOpusAndTune(sdp) {
     }
   }
 
-  // Ensure audio section has sendrecv (critical for 2-way audio)
   let audioStart = -1;
   for (let i = 0; i < out.length; i++) {
     if (out[i].startsWith('m=audio')) { audioStart = i; break; }
   }
   if (audioStart !== -1) {
-    let dirIdx = -1;
     for (let i = audioStart + 1; i < out.length; i++) {
       if (out[i].startsWith('m=')) break;
       if (out[i].startsWith('a=sendonly') || out[i].startsWith('a=recvonly')) {
         out[i] = 'a=sendrecv';
-        dirIdx = i;
         break;
       }
     }
-    // Add bandwidth cap to audio section if not present
     let hasAS = false;
     for (let i = audioStart + 1; i < out.length; i++) {
       if (out[i].startsWith('m=')) break;
@@ -1597,12 +1564,7 @@ function preferOpusAndTune(sdp) {
   return out.join('\r\n');
 }
 
-// ── Inbound audio level monitoring ──
-// This taps the RECEIVED stream (after WebRTC) and analyses it.
-// If level > 0, audio IS arriving and being decoded.
-// If level stays 0 despite sender showing as speaking → audio path is broken.
 function startInboundLevel(stream, pid) {
-  // Stop any previous monitor for this peer
   if (inboundLevelTimers[pid]) {
     clearInterval(inboundLevelTimers[pid]);
     delete inboundLevelTimers[pid];
@@ -1618,8 +1580,6 @@ function startInboundLevel(stream, pid) {
     const analyser = remoteAudioCtx.createAnalyser();
     analyser.fftSize = 256;
     src.connect(analyser);
-    // IMPORTANT: do NOT connect analyser to destination — that would double-play.
-    // The <audio> element is responsible for actual playback.
     const data = new Uint8Array(analyser.frequencyBinCount);
     inboundLevelTimers[pid] = setInterval(() => {
       analyser.getByteFrequencyData(data);
@@ -1629,7 +1589,6 @@ function startInboundLevel(stream, pid) {
       const p = peerMap.get(pid);
       if (p) {
         p.recvLevel = level;
-        // If we're receiving audio, mark them as actively heard
         p.actuallyHeard = level > 0.02;
       }
     }, 200);
@@ -1638,15 +1597,13 @@ function startInboundLevel(stream, pid) {
   }
 }
 
-// ── Audio unlock UI ──
-// Shows a banner the user can tap to recover from autoplay blocks
 function showAudioUnlockUI() {
   let el = document.getElementById('audioUnlock');
   if (el) return;
   el = document.createElement('div');
   el.id = 'audioUnlock';
   el.style.cssText = 'position:fixed;top:50px;left:10px;right:10px;z-index:150;background:#ff9500;color:#000;padding:14px;border-radius:12px;text-align:center;font-weight:600;font-size:14px;cursor:pointer;animation:msgIn .3s';
-  el.textContent = '🔊 Tap here to enable sound';
+  el.textContent = 'Tap here to enable sound';
   el.onclick = () => {
     log("audio unlock tapped");
     if (remoteAudioCtx && remoteAudioCtx.state === 'suspended') {
@@ -1670,7 +1627,6 @@ function hideAudioUnlockUI() {
   if (el) el.remove();
 }
 
-// ── PC event wiring ──
 function setupPC(pc, pid) {
   pc.onicecandidate = e => {
     if (e.candidate && ws && ws.readyState === 1) {
@@ -1678,7 +1634,6 @@ function setupPC(pc, pid) {
     }
   };
 
-  // NEW: Log STUN/TURN failures for instant diagnostics
   pc.onicecandidateerror = e => {
     if (e.errorCode >= 300 && e.errorCode <= 699) {
       log("ICE-ERR " + pid + " code=" + e.errorCode + " host=" + (e.address || e.host || '') + ":" + (e.port || ''));
@@ -1693,12 +1648,11 @@ function setupPC(pc, pid) {
       a.autoplay = true;
       a.playsInline = true;
       a.volume = 1.0;
-      a.muted = false; // explicit, in case some browser default flips this
+      a.muted = false;
       a.style.display = 'none';
       document.body.appendChild(a);
       audios[pid] = a;
     }
-    // Always update srcObject (might be a renegotiated stream)
     a.srcObject = e.streams[0];
     a.muted = false;
     a.volume = 1.0;
@@ -1707,16 +1661,11 @@ function setupPC(pc, pid) {
       log("PLAYING " + pid);
       audioUnlocked = true;
       hideAudioUnlockUI();
-      document.getElementById('vstat').textContent = 'Voice OK';
     }).catch(err => {
       log("playBlock " + pid + ": " + err.name);
-      // Show the unlock UI so user can tap to enable audio
       showAudioUnlockUI();
     });
 
-    // Start inbound audio-level monitoring for this peer.
-    // This is the BEST diagnostic — if level is moving, audio is actually flowing.
-    // If sender shows speaking but recvLevel stays 0, audio path is broken.
     startInboundLevel(e.streams[0], pid);
   };
 
@@ -1728,13 +1677,9 @@ function setupPC(pc, pid) {
 
     if (pc.connectionState === 'connected') {
       clearConnectionTimer(pc);
-      document.getElementById('vstat').textContent = 'Voice OK';
       if (p) p.retries = 0;
-      // Detect whether we're using relay (TURN) vs direct
       detectRelay(pc, pid);
-      // v2.2: hard-cap outbound bitrate at the encoder level (32kbps)
       capOutboundBitrate(pc, 32);
-      // Start stats monitoring
       startStats(pc, pid);
     }
 
@@ -1745,31 +1690,21 @@ function setupPC(pc, pid) {
     }
 
     if (pc.connectionState === 'disconnected') {
-      // Don't retry yet — disconnected often recovers on its own within 4s
       log("DISCONNECTED " + pid + " — waiting briefly");
       setTimeout(() => {
         if (peers[pid] && peers[pid].connectionState === 'disconnected') {
-          log("still disconnected " + pid + " → retry");
+          log("still disconnected " + pid + " -> retry");
           scheduleRetry(pid);
         }
-      }, 4000); // reduced from 8000 for faster recovery
+      }, 4000);
     }
   };
 
   pc.oniceconnectionstatechange = () => {
     log("PC " + pid + " ICE=" + pc.iceConnectionState);
   };
-
-  // NOTE: onnegotiationneeded intentionally NOT set. For voice-only calls with
-  // tracks added at PC creation, it tends to fire spuriously after the answer
-  // arrives, causing offer storms and audio dropouts. We use deterministic
-  // initial negotiation only.
 }
 
-// ── v2.2 Hard-cap outbound audio bitrate via setParameters ──
-// Backs up the SDP-level cap (maxaveragebitrate=32000). Some browsers/networks
-// ignore the SDP cap; setParameters is enforced at the encoder level so we
-// never burst above this on poor connections regardless of what the codec wants.
 async function capOutboundBitrate(pc, kbps) {
   try {
     const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
@@ -1779,16 +1714,12 @@ async function capOutboundBitrate(pc, kbps) {
       params.encodings = [{}];
     }
     params.encodings[0].maxBitrate = kbps * 1000;
-    // Mark as high-priority so the OS scheduler doesn't deprioritize voice RTP
     try { params.encodings[0].priority = 'high'; } catch (e) {}
     try { params.encodings[0].networkPriority = 'high'; } catch (e) {}
     await sender.setParameters(params);
-  } catch (e) {
-    // Some browsers (older Safari) reject this — non-fatal, SDP cap still applies
-  }
+  } catch (e) {}
 }
 
-// ── Detect whether peer connection is going through TURN relay ──
 async function detectRelay(pc, pid) {
   try {
     const stats = await pc.getStats();
@@ -1812,23 +1743,21 @@ async function detectRelay(pc, pid) {
   } catch (e) {}
 }
 
-// ── Periodic stats with AUTO-QUALITY-DETECTION ──
-// Measures per-interval packet loss and triggers auto-relay when bad.
-// Trigger conditions:
-//   1. Sustained high loss: >5% loss for 8+ seconds (2 intervals at 4s tick)
-//   2. Audio stalled: 0 packets received for 4+ seconds while conn=connected
-//      (skipped when peer is muted — silence is expected)
-//   3. Outbound stalled: 0 packets sent for 8s while connected
-//      (skipped when WE are muted — silence is expected)
-//   4. Frozen jitter: another zombie sign (skipped when peer is muted)
+// ════════════════════════════════════════════════════════════════════════════
+// STATS — v3.0: MUTE-HARDENED QUALITY MONITORING
+// ════════════════════════════════════════════════════════════════════════════
+// peerMuted is now the FIRST gate. All four triggers (sustained loss, stall,
+// outbound stall, frozen jitter) are completely suppressed when the peer is
+// muted. This prevents the false-positive cascade that caused the orange bug.
+
 function startStats(pc, pid) {
   if (statsTimers[pid]) clearInterval(statsTimers[pid]);
   let lastRecv = 0, lastLost = 0;
   let lastSent = 0;
-  let consecutiveBad = 0;     // count of consecutive 4s-intervals with >5% loss
-  let consecutiveStalled = 0; // count of consecutive intervals with 0 incoming packets
-  let outboundStall = 0;      // count of consecutive intervals with 0 outgoing packets
-  let logTick = 0;            // counter for log throttling
+  let consecutiveBad = 0;
+  let consecutiveStalled = 0;
+  let outboundStall = 0;
+  let logTick = 0;
 
   statsTimers[pid] = setInterval(async () => {
     if (!peers[pid] || peers[pid].connectionState === 'closed') {
@@ -1836,7 +1765,7 @@ function startStats(pc, pid) {
       delete statsTimers[pid];
       return;
     }
-    if (peers[pid].connectionState !== 'connected') return; // only monitor while connected
+    if (peers[pid].connectionState !== 'connected') return;
 
     try {
       const stats = await peers[pid].getStats();
@@ -1860,28 +1789,30 @@ function startStats(pc, pid) {
 
       const peerInfo = peerMap.get(pid);
       if (peerInfo) { peerInfo.lossPct = lossPct; peerInfo.recvRate = dRecv / 4; }
+
+      // v3.0: peerMuted is the first check — all triggers respect it
       const peerMuted = peerInfo && peerInfo.muted;
+      // Also respect the mute grace period (first 4s after a mute event)
+      const mutedAgo = lastMutedAt[pid] ? Date.now() - lastMutedAt[pid] : Infinity;
+      const inMuteGrace = mutedAgo < 4000;
 
       // ── LOG THROTTLING ──
-      // Only emit STATS when interesting:
-      //   • first 2 ticks (8s of telemetry to confirm path is healthy)
-      //   • any anomaly (loss > 1%, unexpected ΔR=0, unexpected ΔS=0, big jitter)
-      //   • heartbeat every 8 ticks (~32s) so the log never goes fully silent
       logTick++;
       const isAnomaly = lossPct > 1
-        || (dRecv === 0 && !peerMuted)
-        || (dSent === 0 && !isMuted)
+        || (dRecv === 0 && !peerMuted && !inMuteGrace)
+        || (dSent === 0 && !isMuted)  // v3.0: our mute doesn't suppress outbound log
         || jitter > 0.1;
       const isHeartbeat = logTick <= 2 || logTick % 8 === 0;
       if (isAnomaly || isHeartbeat) {
         const tag = isAnomaly ? "STATS!" : "STATS ";
-        log(tag + pid + " ΔR=" + dRecv + " ΔL=" + dLost + " (" + lossPct.toFixed(1) + "%) jit=" + jitter.toFixed(3) + " ΔS=" + dSent);
+        log(tag + pid + " dR=" + dRecv + " dL=" + dLost + " (" + lossPct.toFixed(1) + "%) jit=" + jitter.toFixed(3) + " dS=" + dSent + (peerMuted ? " MUTED" : ""));
       }
 
       // ── TRIGGER 1: Sustained packet loss > 5% ──
-      if (lossPct > 5 && total > 30) {
+      // v3.0: suppressed if peer muted or in mute grace period
+      if (!peerMuted && !inMuteGrace && lossPct > 5 && total > 30) {
         consecutiveBad++;
-        if (consecutiveBad >= 2 && !peerRelay[pid]) { // 2 × 4s = 8s of bad quality (was 12s)
+        if (consecutiveBad >= 2 && !peerRelay[pid]) {
           requestRelaySwitch(pid, "loss=" + lossPct.toFixed(1) + "%");
           consecutiveBad = 0;
         }
@@ -1889,13 +1820,11 @@ function startStats(pc, pid) {
         consecutiveBad = 0;
       }
 
-      // ── TRIGGER 2: Audio stalled (0 packets for 4s while supposedly connected) ──
-      // Skipped when peer is muted — they're intentionally not sending.
-      // This catches the silent NAT-timeout failure mode where the connection
-      // claims to be "connected" but no packets are flowing.
-      if (dRecv === 0 && !peerMuted) {
+      // ── TRIGGER 2: Audio stalled (0 packets for 4s) ──
+      // v3.0: suppressed if peer muted or in mute grace period
+      if (!peerMuted && !inMuteGrace && dRecv === 0) {
         consecutiveStalled++;
-        if (consecutiveStalled >= 1 && !peerRelay[pid]) { // 1 × 4s = 4s of zero packets
+        if (consecutiveStalled >= 1 && !peerRelay[pid]) {
           requestRelaySwitch(pid, "stalled (0 pkts/4s)");
           consecutiveStalled = 0;
         }
@@ -1903,13 +1832,11 @@ function startStats(pc, pid) {
         consecutiveStalled = 0;
       }
 
-      // ── TRIGGER 3: Outbound stalled (0 packets sent for 8s while connected) ──
-      // Skipped when WE are muted — we're intentionally not sending audio.
-      // (With v2.1 mute fix, RTP keeps flowing via DTX so this rarely matters,
-      //  but the guard prevents any false-positives just in case.)
+      // ── TRIGGER 3: Outbound stalled (0 packets sent for 8s) ──
+      // v3.0: suppressed if WE are muted
       if (dSent === 0 && !isMuted) {
         outboundStall++;
-        if (outboundStall >= 2 && !peerRelay[pid]) { // 2 × 4s = 8s of zero outbound
+        if (outboundStall >= 2 && !peerRelay[pid]) {
           requestRelaySwitch(pid, "outbound stalled (0 sent/8s)");
           outboundStall = 0;
         }
@@ -1917,10 +1844,10 @@ function startStats(pc, pid) {
         outboundStall = 0;
       }
 
-      // ── TRIGGER 4: Zombie transceiver (frozen jitter + 0 recv while connected) ──
-      // Skipped when peer is muted (handled inside detectFrozenJitter).
-      if (!peerMuted && detectFrozenJitter(pid, jitter)) {
-        log("ZOMBIE jitter frozen on " + pid + " → full renegotiate");
+      // ── TRIGGER 4: Zombie transceiver (frozen jitter + 0 recv) ──
+      // v3.0: detectFrozenJitter now has its own mute guards
+      if (detectFrozenJitter(pid, jitter)) {
+        log("ZOMBIE jitter frozen on " + pid + " -> full renegotiate");
         if (MY_ID > pid) {
           destroyPeer(pid);
           setTimeout(() => createOffer(pid), 300);
@@ -1932,39 +1859,98 @@ function startStats(pc, pid) {
         }
       }
     } catch (e) {}
-  }, 4000); // tick every 4s for fast detection
+  }, 4000);
 }
 
-// ── Retry escalation: ICE restart → full restart → relay-only ──
+// v3.0: relay switch with reneg guard + 10s cooldown
+async function requestRelaySwitch(pid, reason) {
+  const p = peerMap.get(pid);
+  if (!p) return;
+  if (peerRelay[pid]) return;
+
+  // v3.0: cooldown — don't relay-switch more than once per 10s
+  if (lastRelayAt[pid] && Date.now() - lastRelayAt[pid] < 10000) {
+    log("relay cooldown " + pid);
+    return;
+  }
+  // v3.0: don't relay while reneg is in progress
+  if (renegInProgress[pid]) {
+    log("relay deferred (reneg in progress) " + pid);
+    return;
+  }
+
+  peerRelay[pid] = true;
+  lastRelayAt[pid] = Date.now();
+  log("-> AUTO-RELAY for " + pid + " (" + reason + ")");
+  if (MY_ID > pid) {
+    await switchPeerToRelay(pid);
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'mutual-relay:' + reason }));
+    }
+  } else {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: reason }));
+    }
+  }
+}
+
+async function switchPeerToRelay(pid) {
+  // v3.0: reneg guard
+  if (renegInProgress[pid]) {
+    log("switchPeerToRelay: reneg in progress, deferring " + pid);
+    return;
+  }
+  if (MY_ID < pid) {
+    log("relay: smaller side destroying PC for " + pid);
+    destroyPeer(pid);
+    return;
+  }
+
+  const pc = peers[pid];
+  if (!pc) {
+    await createOffer(pid);
+    return;
+  }
+  try {
+    pc.setConfiguration(getPCConfig(true));
+    const offer = await pc.createOffer({ iceRestart: true });
+    offer.sdp = preferOpusAndTune(offer.sdp);
+    await pc.setLocalDescription(offer);
+    ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
+    log("relay-mode offer SENT " + pid);
+    startConnectionTimer(pid);
+  } catch (e) {
+    log("setConfig fail " + pid + ": " + e.message + " -> full rebuild");
+    destroyPeer(pid);
+    await createOffer(pid);
+  }
+}
+
 async function scheduleRetry(pid) {
   const p = peerMap.get(pid);
   if (!p) return;
-  if (p._retrying) return; // already scheduled
+  if (p._retrying) return;
   p._retrying = true;
   p.retries = (p.retries || 0) + 1;
 
-  if (p.retries > 4) {  // was 5
+  if (p.retries > 4) {
     log("GIVE UP on " + pid);
     p._retrying = false;
     destroyPeer(pid);
     return;
   }
 
-  // ESCALATION: retry 1 = ICE restart, retry 1+ = force relay for any full rebuild.
-  // must match shouldForceRelay() threshold (retries >= 1).
   if (p.retries >= 1 && !peerRelay[pid]) {
-    peerRelay[pid] = true;  // force relay for this and all future attempts
+    peerRelay[pid] = true;
   }
 
-  const delay = Math.min(1000 * p.retries, 4000); // faster delays: 1s, 2s, 3s, 4s (was 1500 base)
-  log("retry #" + p.retries + " in " + delay + "ms → " + pid);
+  const delay = Math.min(1000 * p.retries, 4000);
+  log("retry #" + p.retries + " in " + delay + "ms -> " + pid);
   setTimeout(async () => {
     if (!peerMap.has(pid)) { p._retrying = false; return; }
     if (!ws || ws.readyState !== 1) { p._retrying = false; return; }
 
-    // Only larger-ID side initiates; smaller-ID side passively receives the new offer
     if (MY_ID > pid) {
-      // Try ICE restart on existing PC first (cheaper)
       if (p.retries === 1 && peers[pid] && peers[pid].connectionState !== 'closed') {
         try {
           log("ICE restart " + pid);
@@ -1979,7 +1965,6 @@ async function scheduleRetry(pid) {
       }
       await createOffer(pid);
     } else {
-      // Smaller side — destroy stale PC and wait for offerer to retry
       destroyPeer(pid);
       log("smaller side: cleared stale PC for " + pid + ", waiting for offer");
     }
@@ -1987,7 +1972,7 @@ async function scheduleRetry(pid) {
   }, delay);
 }
 
-// ── Local mic level monitor → sends "speaking" events ──
+// ── Local mic level monitor -> sends "speaking" events ──
 let localAnalyser = null, localLevelTimer = null;
 function setupLocalLevelMonitor() {
   if (!localStream) return;
@@ -2006,7 +1991,6 @@ function setupLocalLevelMonitor() {
       for (let i = 0; i < data.length; i++) sum += data[i];
       const level = sum / data.length / 255;
       const now = Date.now();
-      // Send only on transitions to avoid flooding
       const speaking = level > 0.05;
       const wasSpeaking = lastLevel > 0.05;
       if (speaking !== wasSpeaking || (speaking && now - lastSent > 1000)) {
@@ -2020,7 +2004,6 @@ function setupLocalLevelMonitor() {
   } catch (e) { log("levelMon fail"); }
 }
 
-// ── UI handlers ──
 function cleanupRTC() {
   Object.keys({...peers, ...audios}).forEach(pid => nukePeer(pid));
   if (localStream) {
@@ -2032,17 +2015,60 @@ function cleanupRTC() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// v2.3: IMAGE ATTACHMENTS + REPLY-TO-MESSAGE
+// v3.0 MUTE — Debounced, server-synced, watchdog-safe
 // ════════════════════════════════════════════════════════════════════════════
 
-let replyingTo = null; // { id, name, text, has_image } when composing a reply
+let _muteDebounceTimer = null;
 
-// ── Image picker ──
-// Triggered by tapping the + button. Resizes to ≤800px on the longest side
-// and re-encodes as JPEG @ 0.6 to keep WS payloads under ~150KB.
+function toggleMute() {
+  if (!localStream) return;
+
+  // v3.0: debounce — 300ms minimum between toggles
+  const now = Date.now();
+  if (now - lastMuteToggleAt < 300) {
+    log("mute debounce — ignored");
+    return;
+  }
+  lastMuteToggleAt = now;
+
+  isMuted = !isMuted;
+  const realTrack = localStream.getAudioTracks()[0];
+  if (!realTrack) return;
+
+  // v3.0: readyState guard — only toggle if track is alive
+  if (realTrack.readyState === 'live') {
+    realTrack.enabled = !isMuted;
+  }
+
+  const b = document.getElementById('muteBtn');
+  if (isMuted) {
+    b.classList.add('muted');
+    b.innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v6a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
+  } else {
+    b.classList.remove('muted');
+    b.innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
+  }
+
+  // v3.0: debounce the WS send to prevent duplicate server echoes
+  if (_muteDebounceTimer) clearTimeout(_muteDebounceTimer);
+  _muteDebounceTimer = setTimeout(() => {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: isMuted ? 'mute_me' : 'unmute_me' }));
+    }
+  }, 150);
+
+  updPeers();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v2.3: IMAGE ATTACHMENTS + REPLY-TO-MESSAGE (unchanged in v3.0)
+// ════════════════════════════════════════════════════════════════════════════
+
+let replyingTo = null;
+
 function pickChatImage(e) {
   const f = e.target.files && e.target.files[0];
-  e.target.value = ''; // reset so same file can be re-picked
+  e.target.value = '';
   if (!f) return;
   if (!f.type.startsWith('image/')) { log("not an image: " + f.type); return; }
   const r = new FileReader();
@@ -2061,7 +2087,6 @@ function pickChatImage(e) {
       const data = c.toDataURL('image/jpeg', 0.6);
       log("img " + Math.round(data.length / 1024) + "kb");
       if (data.length > 600000) {
-        // Try harder — drop quality
         const data2 = c.toDataURL('image/jpeg', 0.4);
         if (data2.length > 600000) {
           alert("Image too large after compression");
@@ -2090,15 +2115,10 @@ function sendImageMsg(dataUrl) {
   ws.send(JSON.stringify(payload));
 }
 
-// ── Reply-to-message ──
-// Tapping any user message sets it as the reply target. A small bar appears
-// above the input showing what you're replying to, with × to cancel. The
-// reply preview travels embedded in the outgoing message so it renders
-// correctly even if the original gets scrolled away or the user reloads.
 function startReply(m) {
   if (!m || m.kind === 'system') return;
   const txt = (m.text || '').trim();
-  const snippet = txt ? txt.slice(0, 80) : (m.image ? '📷 Image' : '');
+  const snippet = txt ? txt.slice(0, 80) : (m.image ? 'Image' : '');
   replyingTo = {
     id: m.id || '',
     name: m.name || '?',
@@ -2120,7 +2140,7 @@ function showReplyBar() {
     if (inputBar) inputBar.parentNode.insertBefore(el, inputBar);
   }
   const previewText = (replyingTo.has_image && !replyingTo.text)
-    ? '📷 Image'
+    ? 'Image'
     : (replyingTo.text || '');
   el.innerHTML =
     '<div class="reply-bar-content">' +
@@ -2136,8 +2156,6 @@ function cancelReply() {
   if (el) el.remove();
 }
 
-// ── Fullscreen image preview ──
-// Tap any image in chat to view it fullscreen. Tap anywhere to dismiss.
 function openImagePreview(src) {
   const overlay = document.createElement('div');
   overlay.className = 'img-preview-overlay';
@@ -2169,11 +2187,10 @@ function renderMsg(m) {
   else avHTML = '<div class="avatar"><span>' + esc(name[0].toUpperCase()) + '</span></div>';
   const header = '<div class="msg-header"><span class="msg-name">' + esc(name) + '</span>' + (showBadge ? '<span class="msg-badge host">Host</span>' : '') + '</div>';
 
-  // v2.3: build bubble contents — reply preview (if any), then image (if any), then text (if any)
   let replyHTML = '';
   if (m.reply_to) {
     const r = m.reply_to;
-    const previewText = (r.has_image && !r.text) ? '📷 Image' : (r.text || '');
+    const previewText = (r.has_image && !r.text) ? 'Image' : (r.text || '');
     replyHTML = '<div class="msg-reply">' +
                   '<span class="msg-reply-name">' + esc(r.name || '?') + '</span>' +
                   '<span class="msg-reply-text">' + esc(previewText) + '</span>' +
@@ -2194,8 +2211,6 @@ function renderMsg(m) {
   row.innerHTML = avHTML + '<div class="msg-content">' + header +
                   '<div class="' + bubbleClass + '">' + bubbleInner + '</div></div>';
 
-  // Click-to-reply: tapping the message starts a reply. Tapping an inline
-  // image opens the fullscreen preview instead. Avatar taps are ignored.
   row.addEventListener('click', (ev) => {
     const t = ev.target;
     if (t.classList && t.classList.contains('chat-img')) {
@@ -2204,7 +2219,7 @@ function renderMsg(m) {
       return;
     }
     if (t.tagName === 'IMG' && t.closest('.avatar')) {
-      return; // ignore avatar taps
+      return;
     }
     startReply(m);
   });
@@ -2233,7 +2248,6 @@ function esc(t) {
   return d.innerHTML;
 }
 
-// v2.4: render typing indicator bar above input
 function renderTyping() {
   const el = document.getElementById('typingBar');
   if (!el) return;
@@ -2255,7 +2269,6 @@ function sendMsg() {
   const inEl = document.getElementById('msgIn');
   const text = inEl.value.trim();
   if (!text || !ws || ws.readyState !== 1) return;
-  // v2.4: stop typing indicator on send
   if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
   ws.send(JSON.stringify({ type: 'typing_stop' }));
   const payload = { type: 'chat', text: text };
@@ -2267,95 +2280,6 @@ function sendMsg() {
   inEl.value = '';
 }
 
-function toggleMute() {
-  if (!localStream) return;
-  isMuted = !isMuted;
-  // ── THE MUTE FIX (v2.1) ──
-  // Use track.enabled = false/true — this is the W3C-spec way to mute.
-  // The track keeps producing silence frames (with DTX comfort-noise) so RTP
-  // KEEPS FLOWING the entire time. The sender object is never put into a
-  // half-broken state, so unmuting is just a flag flip — voice resumes
-  // instantly with no negotiation needed.
-  //
-  // The PREVIOUS approach used sender.replaceTrack(null) on mute and
-  // sender.replaceTrack(realTrack) on unmute. On mobile (especially iOS Safari)
-  // that left the RTP sender in a zombie state: connection stayed "connected"
-  // but no packets ever flowed after unmute. That's why voice would vanish.
-  const realTrack = localStream.getAudioTracks()[0];
-  if (!realTrack) return;
-  realTrack.enabled = !isMuted;
-
-  const b = document.getElementById('muteBtn');
-  if (isMuted) {
-    b.classList.add('muted');
-    b.innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v6a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
-    document.getElementById('vstat').textContent = 'Muted';
-  } else {
-    b.classList.remove('muted');
-    b.innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
-    document.getElementById('vstat').textContent = 'Connected';
-  }
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: isMuted ? 'mute_me' : 'unmute_me' }));
-  updPeers();
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// AUTO-RELAY: Switch a single peer to TURN-only when quality is bad.
-// Triggered by startStats() when packet loss is high or audio stops flowing.
-// Cross-peer: smaller-ID side asks larger-ID side via WebSocket.
-// ════════════════════════════════════════════════════════════════════════════
-
-async function requestRelaySwitch(pid, reason) {
-  const p = peerMap.get(pid);
-  if (!p) return;
-  if (peerRelay[pid]) return; // already on relay
-  peerRelay[pid] = true;
-  log("→ AUTO-RELAY for " + pid + " (" + reason + ")");
-  if (MY_ID > pid) {
-    // I'm the larger ID — I do the actual ICE restart with relay-only
-    await switchPeerToRelay(pid);
-    // Also tell the smaller side to switch to relay (mutual relay = best reliability)
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'mutual-relay:' + reason }));
-    }
-  } else {
-    // I'm the smaller ID — ask my peer (larger) to do it
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: reason }));
-    }
-  }
-}
-
-async function switchPeerToRelay(pid) {
-  // Smaller side should NOT create offers — destroy PC and wait for larger side's relay offer
-  if (MY_ID < pid) {
-    log("relay: smaller side destroying PC for " + pid);
-    destroyPeer(pid);
-    return;
-  }
-
-  const pc = peers[pid];
-  if (!pc) {
-    await createOffer(pid);
-    return;
-  }
-  try {
-    // Update config first, then ICE-restart
-    pc.setConfiguration(getPCConfig(true));
-    const offer = await pc.createOffer({ iceRestart: true });
-    offer.sdp = preferOpusAndTune(offer.sdp);
-    await pc.setLocalDescription(offer);
-    ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
-    log("relay-mode offer SENT " + pid);
-    startConnectionTimer(pid);
-  } catch (e) {
-    log("setConfig fail " + pid + ": " + e.message + " → full rebuild");
-    // Fallback: tear down and rebuild from scratch (peerRelay flag will force relay)
-    destroyPeer(pid);
-    await createOffer(pid);
-  }
-}
-
 function leaveCall() {
   log("leave");
   leaving = true;
@@ -2365,7 +2289,6 @@ function leaveCall() {
   document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#000;color:#fff;font-family:sans-serif"><h2>Left the call</h2></div>';
 }
 
-// Page unload: clean up gracefully
 window.addEventListener('beforeunload', () => {
   leaving = true;
   cleanupRTC();
@@ -2394,20 +2317,21 @@ async def keepalive():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot BEAST MODE v2.3 | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot BEAST MODE v3.0 ELITE MARSHAL | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK}")
-    # Pre-warm TURN cache so first call is fast
     servers = await get_ice_servers()
     print(f"ICE servers configured: {len(servers)} entries")
     if METERED_API_KEY:
-        print("✓ Metered.ca TURN configured")
+        print("Metered.ca TURN configured")
     if CF_TURN_TOKEN_ID:
-        print("✓ Cloudflare TURN configured")
+        print("Cloudflare TURN configured")
     if CUSTOM_TURN_URL:
-        print("✓ Custom TURN configured")
+        print("Custom TURN configured")
     if not (METERED_API_KEY or CF_TURN_TOKEN_ID or CUSTOM_TURN_URL):
-        print("⚠ No premium TURN — using public fallback (less reliable in MENA)")
-        print("  → see top of file for free TURN setup instructions")
+        print("No premium TURN — using public fallback (less reliable in MENA)")
+        print("  -> see top of file for free TURN setup instructions")
+    print("v3.0: Mute-hardened (orange-status killer)")
+    print("v3.0: Voice bar removed")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
