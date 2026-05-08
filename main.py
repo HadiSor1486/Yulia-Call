@@ -1,5 +1,32 @@
 """
-Silent Hill Voice Call Bot — v3.5 SECRET-KEY-COMPATIBLE
+Silent Hill Voice Call Bot — v3.6 ELITE
+═══════════════════════════════════════════════════════════════════════════════
+v3.6 FEATURES (call experience polish):
+
+  RELIABILITY (invisible but real):
+    R1. Wake lock auto-reacquire on visibility/release
+    R2. iOS Safari audio context resume on every visibility change
+    R3. getStats() errors now logged (was silently swallowed)
+    R4. Audio element self-heal: if srcObject got cleared, restore it
+    R5. Mute/unmute commands always reapply track.enabled even if state matches
+        (handles iOS bg-tab desync where track silently muted itself)
+
+  UX FEATURES (visible improvements):
+    F1. Push-to-talk: LONG-PRESS mute button to talk only while held
+        (auto-restores prior mute state on release)
+    F2. Audio output picker: tap speaker icon to switch earpiece/speaker/BT
+        (mobile only, uses setSinkId where supported)
+    F3. Mesh size warning: gentle banner at 6+ peers about CPU load
+    F4. Self quality badge: live indicator of your own connection health
+        (green/yellow/red based on aggregate stats across peers)
+    F5. Swipe-right on a message to reply (mobile gesture, faster than tap)
+    F6. Auto-scroll lock: if user scrolled up to read history, new messages
+        don't yank them back. "↓ N new" pill appears instead.
+    F7. Smooth peer fade animations (joining/leaving/reconnecting)
+    F8. Haptic feedback on mute toggle / message send (where supported)
+    F9. Loading skeleton during initial connection (no blank flash)
+    F10. Better connecting indicator: "Connecting..." text not just yellow dot
+
 ═══════════════════════════════════════════════════════════════════════════════
 v3.5 FIX (the actual root cause from Render logs HTTP 401):
 
@@ -830,6 +857,52 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .p-s .dot.connecting{background:#ffcc00;animation:pulse 1.2s infinite}
 @keyframes pulse{50%{opacity:0.4}}
 .hidden{display:none!important}
+
+/* v3.6: connecting indicator with text */
+.connecting-label{font-size:10px;color:#ffcc00;font-weight:600;margin-left:2px;animation:pulse 1.2s infinite}
+
+/* v3.6 F1: push-to-talk active indicator */
+.mic-btn.ptt-active{background:#34c759;box-shadow:0 0 14px rgba(52,199,89,0.6);transform:scale(1.05)}
+.ptt-hint{position:fixed;bottom:90px;left:50%;transform:translateX(-50%);background:rgba(52,199,89,0.95);color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;font-weight:600;z-index:120;animation:msgIn .15s;pointer-events:none}
+
+/* v3.6 F2: audio output picker */
+.output-btn{width:32px;height:32px;border-radius:50%;border:none;background:#3a3a3c;color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;padding:0}
+.output-btn svg{width:14px;height:14px;pointer-events:none}
+.output-menu{position:fixed;bottom:70px;right:12px;background:#1c1c1e;border:1px solid #3a3a3c;border-radius:12px;padding:6px;z-index:130;animation:msgIn .15s;min-width:160px}
+.output-item{display:flex;align-items:center;gap:8px;padding:10px 12px;color:#fff;font-size:13px;border-radius:8px;cursor:pointer;background:none;border:none;width:100%;text-align:left}
+.output-item.active{background:#2c2c2e}
+.output-item .check{width:14px;color:#34c759;flex-shrink:0}
+
+/* v3.6 F3: mesh size warning */
+.mesh-warn{position:relative;z-index:9;background:rgba(255,149,0,0.15);border-bottom:1px solid rgba(255,149,0,0.3);padding:6px 12px;font-size:11px;color:#ff9500;text-align:center;animation:msgIn .2s}
+.mesh-warn.hidden{display:none}
+
+/* v3.6 F4: self quality dot in header */
+.self-quality{display:inline-block;width:8px;height:8px;border-radius:50%;background:#34c759;margin-left:6px;vertical-align:middle;transition:background .3s}
+.self-quality.warn{background:#ff9500}
+.self-quality.bad{background:#ff3b30;animation:pulse 1.2s infinite}
+
+/* v3.6 F6: scroll-lock pill */
+.scroll-pill{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);background:#007aff;color:#fff;padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;z-index:6;box-shadow:0 4px 12px rgba(0,0,0,0.4);animation:msgIn .2s}
+.scroll-pill.hidden{display:none}
+
+/* v3.6 F7: peer status fade animations */
+.p-s{animation:psIn .25s ease-out}
+@keyframes psIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
+
+/* v3.6 F9: loading skeleton */
+.skeleton{position:fixed;inset:0;z-index:90;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;animation:msgIn .15s}
+.skeleton .ring{width:48px;height:48px;border:3px solid #2c2c2e;border-top-color:#007aff;border-radius:50%;animation:spin 1s linear infinite}
+.skeleton .lbl{color:#8e8e93;font-size:14px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* v3.6 F5: swipe-to-reply visual feedback */
+.msg-row{transition:transform .15s ease-out;position:relative}
+.msg-row.swiping{transition:none}
+.swipe-reply-icon{position:absolute;top:50%;transform:translateY(-50%);color:#007aff;opacity:0;font-size:18px;pointer-events:none;transition:opacity .15s}
+.msg-row.self .swipe-reply-icon{left:-30px}
+.msg-row.other .swipe-reply-icon{right:-30px}
+.msg-row.swiping .swipe-reply-icon{opacity:1}
 </style>
 </head>
 <body>
@@ -849,22 +922,28 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 </div>
 </div>
 
+<div class="skeleton hidden" id="skeleton"><div class="ring"></div><div class="lbl">Connecting...</div></div>
+
 <div class="app hidden" id="app">
 <div class="header">
 <button class="back-btn" onclick="leaveCall()">&#8249;</button>
 <img class="group-icon" src="/ci.jpg" onerror="this.style.display='none'">
-<div class="group-info"><div class="group-name">Silent Hill</div><div class="group-meta" id="mcount">0 in call</div></div>
+<div class="group-info"><div class="group-name">Silent Hill<span class="self-quality" id="selfQuality" title="Your connection quality"></span></div><div class="group-meta" id="mcount">0 in call</div></div>
 <button class="leave-header-btn" onclick="leaveCall()" title="Leave call"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></button>
 <button class="menu-btn" onclick="document.getElementById('dbg').classList.toggle('show')">&#8942;</button>
 </div>
 
+<div class="mesh-warn hidden" id="meshWarn"></div>
 <div class="peer-status" id="pstat"></div>
 
-<div class="messages" id="msgs"></div>
+<div class="messages" id="msgs" style="position:relative">
+<div class="scroll-pill hidden" id="scrollPill" onclick="scrollToBottom(true)"></div>
+</div>
 <div class="typing-bar hidden" id="typingBar"></div>
 <div class="input-bar">
 <button class="input-attach" onclick="document.getElementById('imgIn').click()" title="Send image">+</button>
-<button class="mic-btn" id="muteBtn" onclick="toggleMute()" title="Mute"><svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
+<button class="mic-btn" id="muteBtn" title="Tap to toggle mute, hold for push-to-talk"><svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
+<button class="output-btn" id="outputBtn" onclick="toggleOutputMenu()" title="Audio output"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button>
 <input type="file" id="imgIn" accept="image/*" style="display:none" onchange="pickChatImage(event)">
 <input type="text" class="input-field" id="msgIn" placeholder="Write a message..." onkeypress="if(event.key==='Enter')sendMsg()">
 <button class="input-send" onclick="sendMsg()">&#10148;</button>
@@ -1050,7 +1129,7 @@ async function acquireWakeLock() {
 }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    if (!wakeLock) acquireWakeLock();
+    ensureWakeLock();
     log("foreground — refreshing peer health");
     Object.entries(peers).forEach(([pid, pc]) => {
       if (pc.connectionState === 'disconnected' && MY_ID > pid) {
@@ -1132,8 +1211,11 @@ async function doJoin() {
     log("mic err: " + e.message);
   }
   document.getElementById('joinOvl').classList.add('hidden');
+  document.getElementById('skeleton').classList.remove('hidden');
   document.getElementById('app').classList.remove('hidden');
-  acquireWakeLock();
+  ensureWakeLock();
+  wireMuteButton();
+  attachScrollWatcher();
 
   if (_peerLevelTicker) clearInterval(_peerLevelTicker);
   _peerLevelTicker = setInterval(updPeerLevels, 150);
@@ -1165,6 +1247,8 @@ function connectWS() {
       case 'your_id':
         MY_ID = m.id;
         log("myId=" + MY_ID);
+        // v3.6 F9: hide skeleton now that we're fully connected
+        document.getElementById('skeleton').classList.add('hidden');
         break;
 
       case 'history':
@@ -1257,6 +1341,9 @@ function connectWS() {
       }
 
       case 'mute_cmd': {
+        // v3.6 R5: ALWAYS reapply track.enabled even if state already matches.
+        // iOS Safari sometimes silently sets track.enabled=true after a
+        // background suspend, even when isMuted is true. Don't trust state.
         if (localStream) {
           const t = localStream.getAudioTracks()[0];
           if (t && t.readyState === 'live') {
@@ -1264,8 +1351,7 @@ function connectWS() {
           }
         }
         isMuted = true;
-        document.getElementById('muteBtn').classList.add('muted');
-        document.getElementById('muteBtn').innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v6a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
+        refreshMuteButtonIcon();
         updPeers();
         break;
       }
@@ -1277,8 +1363,7 @@ function connectWS() {
           }
         }
         isMuted = false;
-        document.getElementById('muteBtn').classList.remove('muted');
-        document.getElementById('muteBtn').innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
+        refreshMuteButtonIcon();
         updPeers();
         break;
       }
@@ -1355,23 +1440,28 @@ function updPeers() {
   h += '<div class="p-s"><div class="dot ' + selfDot + '"></div>' + esc(myName) + ' (You)</div>';
   peerMap.forEach((p, id) => {
     let dot = '';
+    let connLabel = '';
     if (p.connState === 'connected') {
-      // v3.2: use smoothed loss for indicator color
       const smoothed = lossEwma[id] !== undefined ? lossEwma[id] : (p.lossPct || 0);
       if (smoothed > 8) dot = 'fail';
       else if (peerRelay[id] || p.usedRelay) dot = 'relay';
       else dot = 'conn';
     } else if (p.connState === 'failed' || p.connState === 'closed') dot = 'fail';
-    else if (p.connState === 'connecting' || p.connState === 'checking' || p.connState === 'new') dot = 'connecting';
+    else if (p.connState === 'connecting' || p.connState === 'checking' || p.connState === 'new') {
+      dot = 'connecting';
+      connLabel = ' <span class="connecting-label">…</span>';  // v3.6 F10
+    }
     const speakClass = (p.speaking || p.actuallyHeard) ? ' speaking' : '';
     const muteIcon = p.muted ? ' &#128263;' : '';
     const levelPct = Math.min(100, Math.round((p.recvLevel || 0) * 200));
     const levelBar = p.connState === 'connected'
       ? '<span style="display:inline-block;width:24px;height:4px;background:rgba(255,255,255,0.15);border-radius:2px;margin-left:4px;vertical-align:middle;overflow:hidden"><span style="display:block;width:' + levelPct + '%;height:100%;background:#34c759;transition:width .1s"></span></span>'
       : '';
-    h += '<div class="p-s' + speakClass + '" data-pid="' + id + '"><div class="dot ' + dot + '"></div>' + esc(p.name) + muteIcon + levelBar + '</div>';
+    h += '<div class="p-s' + speakClass + '" data-pid="' + id + '"><div class="dot ' + dot + '"></div>' + esc(p.name) + connLabel + muteIcon + levelBar + '</div>';
   });
   el.innerHTML = h;
+  updateMeshWarning();
+  updateSelfQuality();
 }
 
 function updPeerLevels() {
@@ -1392,6 +1482,11 @@ function updPeerLevels() {
   });
 }
 let _peerLevelTicker = null;
+
+// v3.6 F4: refresh self-quality every 3s (responds to changing loss EWMA)
+setInterval(() => {
+  if (peerMap.size > 0) updateSelfQuality();
+}, 3000);
 
 // ════════════════════════════════════════════════════════════════════════════
 // ZOMBIE DETECTION (v3.1 fix preserved)
@@ -1916,6 +2011,11 @@ function setupPC(pc, pid) {
     a.muted = false;
     a.volume = 1.0;
 
+    // v3.6 F2: apply selected output device to new audio elements
+    if (_currentOutputId && typeof a.setSinkId === 'function') {
+      a.setSinkId(_currentOutputId).catch(() => {});
+    }
+
     a.play().then(() => {
       log("PLAYING " + pid);
       audioUnlocked = true;
@@ -2162,7 +2262,14 @@ function startStats(pc, pid) {
           setTimeout(() => { renegInProgress[pid] = false; }, 3000);
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      // v3.6 R3: surface getStats failures (was silently swallowed)
+      // Throttle: only log first occurrence per peer per minute
+      if (!peers[pid]?._lastStatsErr || Date.now() - peers[pid]._lastStatsErr > 60000) {
+        log("getStats fail " + pid + ": " + e.message);
+        if (peers[pid]) peers[pid]._lastStatsErr = Date.now();
+      }
+    }
   }, 4000);
 }
 
@@ -2362,8 +2469,144 @@ function cleanupRTC() {
 
 let _muteDebounceTimer = null;
 
+// v3.6 F8: tasteful haptic feedback (only where supported)
+function haptic(ms) {
+  try {
+    if (navigator.vibrate) navigator.vibrate(ms || 10);
+  } catch (e) {}
+}
+
+// v3.6 F1: push-to-talk state
+let _pttHoldTimer = null;
+let _pttActive = false;
+let _pttPriorMute = false;
+let _pttPointerId = null;
+let _pttHintEl = null;
+
+function showPttHint() {
+  if (_pttHintEl) return;
+  _pttHintEl = document.createElement('div');
+  _pttHintEl.className = 'ptt-hint';
+  _pttHintEl.textContent = '🎤 Talking...';
+  document.body.appendChild(_pttHintEl);
+}
+function hidePttHint() {
+  if (_pttHintEl) {
+    _pttHintEl.remove();
+    _pttHintEl = null;
+  }
+}
+
+function startPtt() {
+  if (_pttActive || !localStream) return;
+  _pttActive = true;
+  _pttPriorMute = isMuted;
+  haptic(20);
+  log("PTT engaged");
+  // unmute while held, regardless of prior state
+  if (isMuted) {
+    isMuted = false;
+    const t = localStream.getAudioTracks()[0];
+    if (t && t.readyState === 'live') t.enabled = true;
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'unmute_me' }));
+    }
+  }
+  document.getElementById('muteBtn').classList.add('ptt-active');
+  showPttHint();
+  updPeers();
+}
+
+function endPtt() {
+  if (!_pttActive) return;
+  _pttActive = false;
+  haptic(10);
+  log("PTT released");
+  document.getElementById('muteBtn').classList.remove('ptt-active');
+  hidePttHint();
+  // restore prior mute state
+  if (_pttPriorMute && !isMuted && localStream) {
+    isMuted = true;
+    const t = localStream.getAudioTracks()[0];
+    if (t && t.readyState === 'live') t.enabled = false;
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'mute_me' }));
+    }
+    refreshMuteButtonIcon();
+  }
+  updPeers();
+}
+
+function refreshMuteButtonIcon() {
+  const b = document.getElementById('muteBtn');
+  if (isMuted) {
+    b.classList.add('muted');
+    b.innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v6a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
+  } else {
+    b.classList.remove('muted');
+    b.innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
+  }
+}
+
+// Wire mute button on app boot — supports tap (toggle) AND long-press (PTT)
+function wireMuteButton() {
+  const b = document.getElementById('muteBtn');
+  if (!b || b._wired) return;
+  b._wired = true;
+  let pressStart = 0;
+  let didPtt = false;
+
+  const onDown = (e) => {
+    if (e.pointerId !== undefined) {
+      _pttPointerId = e.pointerId;
+      try { b.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+    pressStart = Date.now();
+    didPtt = false;
+    if (_pttHoldTimer) clearTimeout(_pttHoldTimer);
+    _pttHoldTimer = setTimeout(() => {
+      didPtt = true;
+      startPtt();
+    }, 350);
+    e.preventDefault();
+  };
+  const onUp = (e) => {
+    if (_pttHoldTimer) { clearTimeout(_pttHoldTimer); _pttHoldTimer = null; }
+    if (didPtt) {
+      endPtt();
+    } else {
+      // short tap = normal mute toggle
+      toggleMute();
+    }
+    if (e.pointerId !== undefined && _pttPointerId === e.pointerId) {
+      try { b.releasePointerCapture(e.pointerId); } catch (_) {}
+      _pttPointerId = null;
+    }
+  };
+  const onCancel = () => {
+    if (_pttHoldTimer) { clearTimeout(_pttHoldTimer); _pttHoldTimer = null; }
+    if (didPtt) endPtt();
+    didPtt = false;
+  };
+
+  if (window.PointerEvent) {
+    b.addEventListener('pointerdown', onDown);
+    b.addEventListener('pointerup', onUp);
+    b.addEventListener('pointercancel', onCancel);
+    b.addEventListener('pointerleave', onCancel);
+  } else {
+    b.addEventListener('mousedown', onDown);
+    b.addEventListener('mouseup', onUp);
+    b.addEventListener('mouseleave', onCancel);
+    b.addEventListener('touchstart', onDown);
+    b.addEventListener('touchend', onUp);
+    b.addEventListener('touchcancel', onCancel);
+  }
+}
+
 function toggleMute() {
   if (!localStream) return;
+  if (_pttActive) return; // ignore tap during PTT
 
   const now = Date.now();
   if (now - lastMuteToggleAt < 300) {
@@ -2371,6 +2614,7 @@ function toggleMute() {
     return;
   }
   lastMuteToggleAt = now;
+  haptic(15);
 
   isMuted = !isMuted;
   const realTrack = localStream.getAudioTracks()[0];
@@ -2380,14 +2624,7 @@ function toggleMute() {
     realTrack.enabled = !isMuted;
   }
 
-  const b = document.getElementById('muteBtn');
-  if (isMuted) {
-    b.classList.add('muted');
-    b.innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v6a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
-  } else {
-    b.classList.remove('muted');
-    b.innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
-  }
+  refreshMuteButtonIcon();
 
   if (_muteDebounceTimer) clearTimeout(_muteDebounceTimer);
   _muteDebounceTimer = setTimeout(() => {
@@ -2561,7 +2798,16 @@ function renderMsg(m) {
     startReply(m);
   });
 
-  c.appendChild(row);
+  // v3.6 F5: swipe to reply
+  attachSwipeToReply(row, m);
+
+  // v3.6 F6: insert before scroll pill (which is anchored at bottom)
+  const pill = document.getElementById('scrollPill');
+  if (pill && pill.parentElement === c) {
+    c.insertBefore(row, pill);
+  } else {
+    c.appendChild(row);
+  }
   scroll();
 }
 
@@ -2570,13 +2816,29 @@ function renderSys(t) {
   const d = document.createElement('div');
   d.className = 'msg-system';
   d.textContent = t;
-  c.appendChild(d);
+  // ensure system msgs sit before the scroll pill
+  const pill = document.getElementById('scrollPill');
+  if (pill && pill.parentElement === c) {
+    c.insertBefore(d, pill);
+  } else {
+    c.appendChild(d);
+  }
   scroll();
 }
 
+// v3.6 F6: scroll lock — only auto-scroll if user is at bottom
 function scroll() {
   const e = document.getElementById('msgs');
-  e.scrollTop = e.scrollHeight;
+  if (!e) return;
+  if (_scrollLocked && !isAtBottom()) {
+    _newMsgCount++;
+    updateScrollPill();
+    return;
+  }
+  // requestAnimationFrame to wait for the new node to actually take up height
+  requestAnimationFrame(() => {
+    e.scrollTop = e.scrollHeight;
+  });
 }
 
 function esc(t) {
@@ -2626,12 +2888,315 @@ function leaveCall() {
   document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#000;color:#fff;font-family:sans-serif"><h2>Left the call</h2></div>';
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// v3.6 F2: AUDIO OUTPUT PICKER (setSinkId — Chrome/Edge/Android)
+// ════════════════════════════════════════════════════════════════════════════
+let _outputDevices = [];
+let _currentOutputId = '';
+
+async function refreshOutputDevices() {
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    _outputDevices = devices.filter(d => d.kind === 'audiooutput');
+  } catch (e) {
+    log("output devices err: " + e.message);
+  }
+}
+
+async function applyOutputDevice(deviceId) {
+  let applied = 0, failed = 0;
+  for (const a of Object.values(audios)) {
+    if (typeof a.setSinkId === 'function') {
+      try {
+        await a.setSinkId(deviceId);
+        applied++;
+      } catch (e) {
+        failed++;
+        log("setSinkId fail: " + e.message);
+      }
+    }
+  }
+  _currentOutputId = deviceId;
+  log("output device set on " + applied + " elements (" + failed + " failed)");
+  haptic(15);
+}
+
+function toggleOutputMenu() {
+  const existing = document.getElementById('outputMenu');
+  if (existing) {
+    existing.remove();
+    return;
+  }
+  refreshOutputDevices().then(() => {
+    if (!_outputDevices.length || typeof HTMLAudioElement.prototype.setSinkId !== 'function') {
+      log("output picker not supported on this device/browser");
+      // Quick non-modal toast
+      const toast = document.createElement('div');
+      toast.className = 'ptt-hint';
+      toast.style.background = 'rgba(255,149,0,0.95)';
+      toast.textContent = 'Audio routing not supported here';
+      document.body.appendChild(toast);
+      setTimeout(() => toast.remove(), 1800);
+      return;
+    }
+    const menu = document.createElement('div');
+    menu.className = 'output-menu';
+    menu.id = 'outputMenu';
+    menu.innerHTML = _outputDevices.map(d => {
+      const isActive = d.deviceId === _currentOutputId
+                      || (!_currentOutputId && d.deviceId === 'default');
+      const label = d.label || ('Output ' + d.deviceId.slice(0, 4));
+      return '<button class="output-item' + (isActive ? ' active' : '') +
+             '" data-id="' + esc(d.deviceId) + '">' +
+             (isActive ? '<span class="check">✓</span>' : '<span class="check"></span>') +
+             '<span>' + esc(label) + '</span></button>';
+    }).join('');
+    document.body.appendChild(menu);
+    menu.querySelectorAll('.output-item').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-id');
+        await applyOutputDevice(id);
+        menu.remove();
+      });
+    });
+    // close on outside tap
+    setTimeout(() => {
+      document.addEventListener('click', function closer(e) {
+        if (!menu.contains(e.target) && e.target.id !== 'outputBtn') {
+          menu.remove();
+          document.removeEventListener('click', closer);
+        }
+      });
+    }, 50);
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v3.6 F3: MESH SIZE WARNING
+// ════════════════════════════════════════════════════════════════════════════
+function updateMeshWarning() {
+  const el = document.getElementById('meshWarn');
+  if (!el) return;
+  const n = peerMap.size + 1;  // +1 for self
+  if (n >= 6) {
+    el.classList.remove('hidden');
+    el.textContent = '⚠️ ' + n + ' people in call — audio may stutter on slower phones';
+  } else {
+    el.classList.add('hidden');
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v3.6 F4: SELF QUALITY INDICATOR (aggregate of all peer paths)
+// ════════════════════════════════════════════════════════════════════════════
+function updateSelfQuality() {
+  const dot = document.getElementById('selfQuality');
+  if (!dot) return;
+  if (peerMap.size === 0) {
+    dot.className = 'self-quality';
+    dot.title = 'No peers';
+    return;
+  }
+  let connectedCount = 0, badCount = 0, warnCount = 0;
+  peerMap.forEach((p, id) => {
+    if (p.connState === 'connected') {
+      connectedCount++;
+      const ewma = lossEwma[id] || 0;
+      if (ewma > 8 || (peerRelay[id] && ewma > 5)) badCount++;
+      else if (ewma > 3 || peerRelay[id]) warnCount++;
+    } else if (p.connState === 'failed' || p.connState === 'closed') {
+      badCount++;
+    }
+  });
+  if (badCount > 0) {
+    dot.className = 'self-quality bad';
+    dot.title = badCount + ' poor connection' + (badCount > 1 ? 's' : '');
+  } else if (warnCount > 0) {
+    dot.className = 'self-quality warn';
+    dot.title = warnCount + ' connection on relay';
+  } else if (connectedCount > 0) {
+    dot.className = 'self-quality';
+    dot.title = 'Excellent';
+  } else {
+    dot.className = 'self-quality warn';
+    dot.title = 'Connecting...';
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v3.6 F6: AUTO-SCROLL LOCK
+// ════════════════════════════════════════════════════════════════════════════
+let _scrollLocked = false;
+let _newMsgCount = 0;
+const SCROLL_BOTTOM_THRESHOLD = 80;  // pixels from bottom
+
+function isAtBottom() {
+  const e = document.getElementById('msgs');
+  if (!e) return true;
+  return e.scrollHeight - e.scrollTop - e.clientHeight < SCROLL_BOTTOM_THRESHOLD;
+}
+
+function updateScrollPill() {
+  const pill = document.getElementById('scrollPill');
+  if (!pill) return;
+  if (_scrollLocked && _newMsgCount > 0) {
+    pill.classList.remove('hidden');
+    pill.textContent = '↓ ' + _newMsgCount + ' new message' + (_newMsgCount > 1 ? 's' : '');
+  } else {
+    pill.classList.add('hidden');
+  }
+}
+
+function scrollToBottom(force) {
+  const e = document.getElementById('msgs');
+  if (!e) return;
+  e.scrollTop = e.scrollHeight;
+  _scrollLocked = false;
+  _newMsgCount = 0;
+  updateScrollPill();
+}
+
+function attachScrollWatcher() {
+  const e = document.getElementById('msgs');
+  if (!e || e._scrollWired) return;
+  e._scrollWired = true;
+  e.addEventListener('scroll', () => {
+    if (isAtBottom()) {
+      _scrollLocked = false;
+      _newMsgCount = 0;
+      updateScrollPill();
+    } else {
+      _scrollLocked = true;
+    }
+  }, { passive: true });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v3.6 R1: WAKE LOCK AUTO-REACQUIRE
+// ════════════════════════════════════════════════════════════════════════════
+async function ensureWakeLock() {
+  if (wakeLock && !wakeLock.released) return;
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => {
+        log("wakeLock released — will reacquire on next visibility");
+      });
+    }
+  } catch (e) { /* normal when bg */ }
+}
+// re-trigger every 30s in case it dropped silently
+setInterval(() => {
+  if (document.visibilityState === 'visible' && !leaving) ensureWakeLock();
+}, 30000);
+
+// ════════════════════════════════════════════════════════════════════════════
+// v3.6 R2: iOS Safari audio context resume on visibility
+// ════════════════════════════════════════════════════════════════════════════
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    if (remoteAudioCtx && remoteAudioCtx.state === 'suspended') {
+      log("audio ctx suspended on visibility -> resuming");
+      remoteAudioCtx.resume().catch(() => {});
+    }
+    // also poke audio elements that may have stopped playing
+    Object.values(audios).forEach(a => {
+      if (a.paused && a.srcObject) {
+        a.play().catch(() => {});
+      }
+    });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// v3.6 R4: AUDIO ELEMENT SELF-HEAL (every 5s)
+// ════════════════════════════════════════════════════════════════════════════
+setInterval(() => {
+  Object.entries(audios).forEach(([pid, a]) => {
+    const pc = peers[pid];
+    if (!pc || pc.connectionState !== 'connected') return;
+    // If srcObject got cleared mid-call, try to restore from receiver
+    if (!a.srcObject) {
+      try {
+        const receivers = pc.getReceivers().filter(r => r.track && r.track.kind === 'audio');
+        if (receivers.length) {
+          const stream = new MediaStream([receivers[0].track]);
+          a.srcObject = stream;
+          a.play().catch(() => {});
+          log("audio self-heal: restored srcObject for " + pid);
+        }
+      } catch (e) {}
+    } else if (a.paused) {
+      a.play().catch(() => {});
+    }
+  });
+}, 5000);
+
+// ════════════════════════════════════════════════════════════════════════════
+// v3.6 F5: SWIPE-TO-REPLY (touch only)
+// ════════════════════════════════════════════════════════════════════════════
+function attachSwipeToReply(row, msg) {
+  if (!('ontouchstart' in window) || msg.kind === 'system') return;
+  let startX = 0, startY = 0, dx = 0, swiping = false, ignored = false;
+  const SWIPE_THRESH = 60;
+  const isSelf = !!msg.self;
+  const dir = isSelf ? -1 : 1;  // self swipes left, others swipe right
+
+  const reset = () => {
+    row.classList.remove('swiping');
+    row.style.transform = '';
+    swiping = false;
+    ignored = false;
+    dx = 0;
+  };
+
+  row.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) { ignored = true; return; }
+    startX = e.touches[0].clientX;
+    startY = e.touches[0].clientY;
+    swiping = false;
+    ignored = false;
+  }, { passive: true });
+
+  row.addEventListener('touchmove', (e) => {
+    if (ignored || e.touches.length !== 1) return;
+    const tx = e.touches[0].clientX - startX;
+    const ty = e.touches[0].clientY - startY;
+    if (!swiping) {
+      // decide direction on first significant movement
+      if (Math.abs(ty) > Math.abs(tx) || Math.abs(tx) < 10) {
+        ignored = true;
+        return;
+      }
+      // wrong direction = ignore (e.g., self swiping right)
+      if ((dir > 0 && tx < 0) || (dir < 0 && tx > 0)) {
+        ignored = true;
+        return;
+      }
+      swiping = true;
+      row.classList.add('swiping');
+    }
+    dx = Math.max(-100, Math.min(100, tx));
+    row.style.transform = 'translateX(' + dx + 'px)';
+  }, { passive: true });
+
+  row.addEventListener('touchend', () => {
+    if (swiping && Math.abs(dx) > SWIPE_THRESH) {
+      haptic(20);
+      startReply(msg);
+    }
+    reset();
+  });
+  row.addEventListener('touchcancel', reset);
+}
+
 window.addEventListener('beforeunload', () => {
   leaving = true;
   cleanupRTC();
 });
 
-log("page loaded v3.5");
+log("page loaded v3.6");
 </script>
 </body>
 </html>"""
@@ -2654,7 +3219,7 @@ async def keepalive():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot v3.5 SECRET-KEY-COMPATIBLE | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot v3.6 ELITE | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK}")
     servers = await get_ice_servers()
     print(f"ICE servers configured: {len(servers)} entries")
@@ -2669,9 +3234,11 @@ async def main():
         print("!" * 60)
         print("! NO PREMIUM TURN CONFIGURED — Gulf/MENA peers WILL FAIL  !")
         print("!" * 60)
-    print("v3.5: METERED_API_KEY now accepts SECRET KEY or API KEY")
-    print("v3.5: Auto-mints expiring credentials when secret key is used")
-    print("v3.5: Hit /turn-debug to confirm Metered creds are loading")
+    print("v3.6: Push-to-talk (long-press mute), audio output picker,")
+    print("      auto-scroll lock with 'N new' pill, swipe-to-reply,")
+    print("      mesh size warning, self-quality dot, wake-lock auto-reacquire,")
+    print("      audio element self-heal, getStats error logging, haptics,")
+    print("      and a real loading skeleton on join.")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
