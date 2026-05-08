@@ -26,6 +26,11 @@ KEY UPGRADES vs. previous version:
       - Mic watchdog — if another app steals the mic, reacquire & replaceTrack
       - Outbound bitrate hard cap via setParameters (32kbps) on top of SDP cap
       - Visibility resume — kicks fresh stats sample immediately on foreground
+  • CHAT FEATURES (v2.3):
+      - Image attachments via the + button (auto-resized ≤800px, JPEG q=0.6,
+        capped at ~600KB; tap any image in chat to view fullscreen)
+      - Reply-to-message: tap any message to reply, snippet preview is embedded
+        in the outgoing payload so it renders even after history reloads
 
 ═══════════════════════════════════════════════════════════════════════════════
 GETTING REAL TURN CREDENTIALS (READ THIS — IT'S WHY ALGERIA FAILS):
@@ -361,12 +366,35 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                 continue
 
             if mt == "chat":
-                text = msg.get("text", "").strip()[:500]
-                if not text:
+                text = msg.get("text", "").strip()[:1000]
+                # v2.3: image attachments — base64 data URL, capped at ~600KB
+                image = msg.get("image", "") or ""
+                if image and (not isinstance(image, str) or len(image) > 600000
+                              or not image.startswith("data:image/")):
+                    image = ""
+                # Need at least text OR image
+                if not text and not image:
                     continue
-                cm = {"type": "chat", "kind": "user", "peer_id": peer_id,
+                # v2.3: reply-to support — sanitize the embedded snippet so we
+                # don't trust client-supplied data blindly
+                reply_to = None
+                rt = msg.get("reply_to")
+                if isinstance(rt, dict):
+                    reply_to = {
+                        "id": str(rt.get("id", ""))[:64],
+                        "name": str(rt.get("name", ""))[:30],
+                        "text": str(rt.get("text", ""))[:80],
+                        "has_image": bool(rt.get("has_image")),
+                    }
+                cm = {"type": "chat", "kind": "user",
+                      "id": str(uuid.uuid4())[:12],
+                      "peer_id": peer_id,
                       "name": name, "avatar": avatar, "text": text,
                       "time": datetime.now().isoformat()}
+                if image:
+                    cm["image"] = image
+                if reply_to:
+                    cm["reply_to"] = reply_to
                 _append_msg(room_id, cm)
                 for p, pd in room["peers"].items():
                     try:
@@ -494,6 +522,26 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .msg-bubble{padding:8px 14px;border-radius:18px;font-size:14px;line-height:1.4;word-break:break-word;white-space:pre-wrap}
 .msg-row.other .msg-bubble{background:#2c2c2e;border-bottom-left-radius:4px}
 .msg-row.self .msg-bubble{background:#007aff;border-bottom-right-radius:4px}
+.msg-row{cursor:pointer;transition:opacity .15s}
+.msg-row:active{opacity:0.6}
+.msg-row.system{cursor:default}
+.msg-row.system:active{opacity:1}
+.chat-img{max-width:240px;max-height:300px;border-radius:12px;display:block;cursor:pointer;margin:2px 0}
+.msg-bubble.has-img{padding:4px;overflow:hidden}
+.msg-bubble.has-img.has-text{padding-bottom:8px}
+.msg-bubble.has-img .msg-text{padding:4px 10px 0}
+.msg-reply{border-left:3px solid rgba(255,255,255,0.55);padding:4px 8px;margin-bottom:4px;font-size:12px;background:rgba(255,255,255,0.08);border-radius:6px;display:flex;flex-direction:column;gap:1px;max-width:240px}
+.msg-bubble.has-img .msg-reply{margin:4px 4px 4px}
+.msg-reply-name{font-weight:600;color:rgba(255,255,255,0.95);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.msg-reply-text{opacity:0.75;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.reply-bar{position:relative;z-index:10;background:rgba(28,28,30,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:8px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0;animation:msgIn .15s}
+.reply-bar-content{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0;border-left:3px solid #007aff;padding-left:8px}
+.reply-bar-label{font-size:11px;color:#007aff;font-weight:600}
+.reply-bar-text{font-size:13px;color:#8e8e93;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.reply-bar-close{width:28px;height:28px;border-radius:50%;border:none;background:#3a3a3c;color:#fff;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;line-height:1}
+.img-preview-overlay{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;cursor:pointer;animation:msgIn .2s;padding:20px}
+.img-preview-overlay img{max-width:95vw;max-height:90vh;border-radius:8px}
+.img-preview-overlay .close-hint{position:absolute;top:20px;right:20px;color:#fff;font-size:32px;opacity:0.7}
 .voice-bar{position:relative;z-index:10;background:rgba(28,28,30,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:10px 16px;display:flex;align-items:center;justify-content:center;gap:14px;flex-shrink:0}
 .voice-btn{width:48px;height:48px;border-radius:50%;border:none;display:flex;align-items:center;justify-content:center;font-size:22px;cursor:pointer;transition:.2s}
 .voice-btn.mute{background:#3a3a3c;color:#fff}
@@ -565,7 +613,8 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 <button class="voice-btn leave" onclick="leaveCall()">&#10005;</button>
 </div>
 <div class="input-bar">
-<button class="input-attach">+</button>
+<button class="input-attach" onclick="document.getElementById('imgIn').click()" title="Send image">+</button>
+<input type="file" id="imgIn" accept="image/*" style="display:none" onchange="pickChatImage(event)">
 <input type="text" class="input-field" id="msgIn" placeholder="Write a message..." onkeypress="if(event.key==='Enter')sendMsg()">
 <button class="input-send" onclick="sendMsg()">&#10148;</button>
 </div>
@@ -573,7 +622,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 
 <script>
 // ════════════════════════════════════════════════════════════════════════════
-// SILENT HILL CLIENT — BEAST MODE v2.2
+// SILENT HILL CLIENT — BEAST MODE v2.3
 // Architecture:
 //   • Mesh WebRTC topology (good for ≤6 voice participants)
 //   • Server-assigned peer IDs prevent glare
@@ -593,6 +642,10 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 //     - Mic watchdog: auto-reacquire if another app steals the mic
 //     - Outbound bitrate hard-cap via setParameters (32kbps)
 //     - Visibility resume: forces fresh stats sample on foreground
+//   • v2.3 CHAT FEATURES:
+//     - Image attachments via the + button (resized ≤800px, JPEG q=0.6)
+//     - Reply-to-message: tap any message to reply, embedded snippet preview
+//     - Fullscreen image preview on tap
 // ════════════════════════════════════════════════════════════════════════════
 
 const ROOM = "__ROOM_ID__", TOKEN = "__TOKEN__";
@@ -1891,6 +1944,119 @@ function cleanupRTC() {
   if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// v2.3: IMAGE ATTACHMENTS + REPLY-TO-MESSAGE
+// ════════════════════════════════════════════════════════════════════════════
+
+let replyingTo = null; // { id, name, text, has_image } when composing a reply
+
+// ── Image picker ──
+// Triggered by tapping the + button. Resizes to ≤800px on the longest side
+// and re-encodes as JPEG @ 0.6 to keep WS payloads under ~150KB.
+function pickChatImage(e) {
+  const f = e.target.files && e.target.files[0];
+  e.target.value = ''; // reset so same file can be re-picked
+  if (!f) return;
+  if (!f.type.startsWith('image/')) { log("not an image: " + f.type); return; }
+  const r = new FileReader();
+  r.onload = ev => {
+    const img = new Image();
+    img.onload = () => {
+      let w = img.width, h = img.height;
+      const MAX = 800;
+      if (w > MAX || h > MAX) {
+        if (w > h) { h = Math.round(h * (MAX / w)); w = MAX; }
+        else       { w = Math.round(w * (MAX / h)); h = MAX; }
+      }
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      c.getContext('2d').drawImage(img, 0, 0, w, h);
+      const data = c.toDataURL('image/jpeg', 0.6);
+      log("img " + Math.round(data.length / 1024) + "kb");
+      if (data.length > 600000) {
+        // Try harder — drop quality
+        const data2 = c.toDataURL('image/jpeg', 0.4);
+        if (data2.length > 600000) {
+          alert("Image too large after compression");
+          return;
+        }
+        sendImageMsg(data2);
+      } else {
+        sendImageMsg(data);
+      }
+    };
+    img.onerror = () => log("img decode fail");
+    img.src = ev.target.result;
+  };
+  r.readAsDataURL(f);
+}
+
+function sendImageMsg(dataUrl) {
+  if (!ws || ws.readyState !== 1) return;
+  const payload = { type: 'chat', text: '', image: dataUrl };
+  if (replyingTo) {
+    payload.reply_to = replyingTo;
+    cancelReply();
+  }
+  ws.send(JSON.stringify(payload));
+}
+
+// ── Reply-to-message ──
+// Tapping any user message sets it as the reply target. A small bar appears
+// above the input showing what you're replying to, with × to cancel. The
+// reply preview travels embedded in the outgoing message so it renders
+// correctly even if the original gets scrolled away or the user reloads.
+function startReply(m) {
+  if (!m || m.kind === 'system') return;
+  const txt = (m.text || '').trim();
+  const snippet = txt ? txt.slice(0, 80) : (m.image ? '📷 Image' : '');
+  replyingTo = {
+    id: m.id || '',
+    name: m.name || '?',
+    text: snippet,
+    has_image: !!m.image
+  };
+  showReplyBar();
+  const inEl = document.getElementById('msgIn');
+  if (inEl) inEl.focus();
+}
+
+function showReplyBar() {
+  let el = document.getElementById('replyBar');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'replyBar';
+    el.className = 'reply-bar';
+    const inputBar = document.querySelector('.input-bar');
+    if (inputBar) inputBar.parentNode.insertBefore(el, inputBar);
+  }
+  const previewText = (replyingTo.has_image && !replyingTo.text)
+    ? '📷 Image'
+    : (replyingTo.text || '');
+  el.innerHTML =
+    '<div class="reply-bar-content">' +
+      '<span class="reply-bar-label">Replying to ' + esc(replyingTo.name) + '</span>' +
+      '<span class="reply-bar-text">' + esc(previewText) + '</span>' +
+    '</div>' +
+    '<button class="reply-bar-close" onclick="cancelReply()" aria-label="Cancel reply">&times;</button>';
+}
+
+function cancelReply() {
+  replyingTo = null;
+  const el = document.getElementById('replyBar');
+  if (el) el.remove();
+}
+
+// ── Fullscreen image preview ──
+// Tap any image in chat to view it fullscreen. Tap anywhere to dismiss.
+function openImagePreview(src) {
+  const overlay = document.createElement('div');
+  overlay.className = 'img-preview-overlay';
+  overlay.innerHTML = '<span class="close-hint">&times;</span><img src="' + esc(src) + '">';
+  overlay.onclick = () => overlay.remove();
+  document.body.appendChild(overlay);
+}
+
 function renderMsg(m) {
   const c = document.getElementById('msgs'); if (!c) return;
   if (m.kind === 'system') {
@@ -1914,7 +2080,47 @@ function renderMsg(m) {
   if (avSrc) avHTML = '<div class="avatar"><img src="' + esc(avSrc) + '"></div>';
   else avHTML = '<div class="avatar"><span>' + esc(name[0].toUpperCase()) + '</span></div>';
   const header = '<div class="msg-header"><span class="msg-name">' + esc(name) + '</span><span class="msg-badge ' + bClass + '">' + badge + '</span></div>';
-  row.innerHTML = avHTML + '<div class="msg-content">' + header + '<div class="msg-bubble">' + esc(m.text) + '</div></div>';
+
+  // v2.3: build bubble contents — reply preview (if any), then image (if any), then text (if any)
+  let replyHTML = '';
+  if (m.reply_to) {
+    const r = m.reply_to;
+    const previewText = (r.has_image && !r.text) ? '📷 Image' : (r.text || '');
+    replyHTML = '<div class="msg-reply">' +
+                  '<span class="msg-reply-name">' + esc(r.name || '?') + '</span>' +
+                  '<span class="msg-reply-text">' + esc(previewText) + '</span>' +
+                '</div>';
+  }
+  let imgHTML = '';
+  if (m.image) {
+    imgHTML = '<img class="chat-img" src="' + esc(m.image) + '" alt="image">';
+  }
+  let textHTML = '';
+  if (m.text) {
+    textHTML = '<div class="msg-text">' + esc(m.text) + '</div>';
+  }
+  let bubbleClass = 'msg-bubble';
+  if (m.image) bubbleClass += ' has-img';
+  if (m.image && m.text) bubbleClass += ' has-text';
+  const bubbleInner = replyHTML + imgHTML + (textHTML || (m.image ? '' : esc(m.text)));
+  row.innerHTML = avHTML + '<div class="msg-content">' + header +
+                  '<div class="' + bubbleClass + '">' + bubbleInner + '</div></div>';
+
+  // Click-to-reply: tapping the message starts a reply. Tapping an inline
+  // image opens the fullscreen preview instead. Avatar taps are ignored.
+  row.addEventListener('click', (ev) => {
+    const t = ev.target;
+    if (t.classList && t.classList.contains('chat-img')) {
+      ev.stopPropagation();
+      openImagePreview(t.src);
+      return;
+    }
+    if (t.tagName === 'IMG' && t.closest('.avatar')) {
+      return; // ignore avatar taps
+    }
+    startReply(m);
+  });
+
   c.appendChild(row);
   scroll();
 }
@@ -1943,7 +2149,12 @@ function sendMsg() {
   const inEl = document.getElementById('msgIn');
   const text = inEl.value.trim();
   if (!text || !ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ type: 'chat', text: text }));
+  const payload = { type: 'chat', text: text };
+  if (replyingTo) {
+    payload.reply_to = replyingTo;
+    cancelReply();
+  }
+  ws.send(JSON.stringify(payload));
   inEl.value = '';
 }
 
@@ -2074,7 +2285,7 @@ async def keepalive():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot BEAST MODE v2.2 | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot BEAST MODE v2.3 | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK}")
     # Pre-warm TURN cache so first call is fast
     servers = await get_ice_servers()
