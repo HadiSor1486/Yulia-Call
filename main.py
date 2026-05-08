@@ -575,6 +575,11 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .input-field::placeholder{color:#8e8e93}
 .input-send{background:#007aff;color:#fff;font-size:16px}
 .input-send:active{transform:scale(.92)}
+.mic-btn{width:32px;height:32px;border-radius:50%;border:none;background:#3a3a3c;color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:.2s;padding:0}
+.mic-btn.muted{background:#ff3b30}
+.mic-btn svg{width:16px;height:16px;pointer-events:none}
+.leave-header-btn{width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:none;border:none;color:#ff3b30;cursor:pointer;padding:0}
+.leave-header-btn svg{width:20px;height:20px}
 .overlay{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.88);display:flex;align-items:center;justify-content:center}
 .o-box{background:#1c1c1e;border-radius:16px;padding:24px;width:90%;max-width:340px;text-align:center}
 .o-box h2{font-size:18px;margin-bottom:8px}
@@ -621,6 +626,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 <button class="back-btn" onclick="leaveCall()">&#8249;</button>
 <img class="group-icon" src="/ci.jpg" onerror="this.style.display='none'">
 <div class="group-info"><div class="group-name">Silent Hill</div><div class="group-meta" id="mcount">0 in call</div></div>
+<button class="leave-header-btn" onclick="leaveCall()" title="Leave call"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></button>
 <button class="menu-btn" onclick="document.getElementById('dbg').classList.toggle('show')">&#8942;</button>
 </div>
 
@@ -628,12 +634,11 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 
 <div class="messages" id="msgs"></div>
 <div class="voice-bar">
-<button class="voice-btn mute" id="muteBtn" onclick="toggleMute()" title="Mute">&#127908;</button>
 <span class="voice-status" id="vstat">Connecting...</span>
-<button class="voice-btn leave" onclick="leaveCall()">&#10005;</button>
 </div>
 <div class="input-bar">
 <button class="input-attach" onclick="document.getElementById('imgIn').click()" title="Send image">+</button>
+<button class="mic-btn" id="muteBtn" onclick="toggleMute()" title="Mute"><svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
 <input type="file" id="imgIn" accept="image/*" style="display:none" onchange="pickChatImage(event)">
 <input type="text" class="input-field" id="msgIn" placeholder="Write a message..." onkeypress="if(event.key==='Enter')sendMsg()">
 <button class="input-send" onclick="sendMsg()">&#10148;</button>
@@ -1015,7 +1020,7 @@ function connectWS() {
         }
         isMuted = true;
         document.getElementById('muteBtn').classList.add('muted');
-        document.getElementById('muteBtn').innerHTML = '&#128263;';
+        document.getElementById('muteBtn').innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v6a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
         document.getElementById('vstat').textContent = 'Muted';
         updPeers();
         break;
@@ -1029,7 +1034,7 @@ function connectWS() {
         }
         isMuted = false;
         document.getElementById('muteBtn').classList.remove('muted');
-        document.getElementById('muteBtn').innerHTML = '&#127908;';
+        document.getElementById('muteBtn').innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
         document.getElementById('vstat').textContent = 'Connected';
         updPeers();
         break;
@@ -2217,11 +2222,11 @@ function toggleMute() {
   const b = document.getElementById('muteBtn');
   if (isMuted) {
     b.classList.add('muted');
-    b.innerHTML = '&#128263;';
+    b.innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v6a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
     document.getElementById('vstat').textContent = 'Muted';
   } else {
     b.classList.remove('muted');
-    b.innerHTML = '&#127908;';
+    b.innerHTML = '<svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
     document.getElementById('vstat').textContent = 'Connected';
   }
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: isMuted ? 'mute_me' : 'unmute_me' }));
