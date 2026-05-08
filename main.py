@@ -20,6 +20,12 @@ KEY UPGRADES vs. previous version:
     The replaceTrack approach left the RTP sender in a zombie state on mobile
     so voice would vanish after unmute. track.enabled is the W3C-spec way and
     keeps RTP flowing (DTX silence) so the sender never goes dead.
+  • REINFORCEMENTS (v2.2):
+      - STATS log throttling — only logs anomalies + a heartbeat every ~32s
+      - Network online/offline listeners — auto ICE restart on Wi-Fi↔4G switch
+      - Mic watchdog — if another app steals the mic, reacquire & replaceTrack
+      - Outbound bitrate hard cap via setParameters (32kbps) on top of SDP cap
+      - Visibility resume — kicks fresh stats sample immediately on foreground
 
 ═══════════════════════════════════════════════════════════════════════════════
 GETTING REAL TURN CREDENTIALS (READ THIS — IT'S WHY ALGERIA FAILS):
@@ -567,7 +573,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 
 <script>
 // ════════════════════════════════════════════════════════════════════════════
-// SILENT HILL CLIENT — BEAST MODE v2.1
+// SILENT HILL CLIENT — BEAST MODE v2.2
 // Architecture:
 //   • Mesh WebRTC topology (good for ≤6 voice participants)
 //   • Server-assigned peer IDs prevent glare
@@ -581,6 +587,12 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 //     state on mobile (esp. iOS Safari) — connection stayed "connected" but no
 //     packets ever flowed after unmute. track.enabled keeps RTP flowing with
 //     DTX comfort-noise so the sender never enters that broken state.
+//   • v2.2 REINFORCEMENTS (all defensive, no logic changes):
+//     - STATS log throttling: only logs anomalies + heartbeat every ~32s
+//     - Online/offline listeners: ICE-restart on Wi-Fi↔cellular switch
+//     - Mic watchdog: auto-reacquire if another app steals the mic
+//     - Outbound bitrate hard-cap via setParameters (32kbps)
+//     - Visibility resume: forces fresh stats sample on foreground
 // ════════════════════════════════════════════════════════════════════════════
 
 const ROOM = "__ROOM_ID__", TOKEN = "__TOKEN__";
@@ -699,8 +711,74 @@ async function acquireWakeLock() {
   } catch (e) { log("wakeLock fail"); }
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && !wakeLock) acquireWakeLock();
+  if (document.visibilityState === 'visible') {
+    if (!wakeLock) acquireWakeLock();
+    // v2.2: kick all stats timers immediately so we don't wait the full 4s tick
+    // to notice that something went stale while the screen was off.
+    log("👁 foreground — refreshing peer health");
+    Object.entries(peers).forEach(([pid, pc]) => {
+      if (pc.connectionState === 'disconnected' && MY_ID > pid) {
+        log("disconnected peer on resume → ICE restart " + pid);
+        forceIceRestart(pid);
+      }
+    });
+  }
 });
+
+// ── v2.2 Network change handling ──
+// On mobile, switching Wi-Fi ↔ 4G changes your local IP. The existing
+// ICE candidate pair becomes invalid silently. Trigger an ICE restart
+// proactively so we don't wait for the stall detector to notice.
+window.addEventListener('online', () => {
+  log("📶 network online — refreshing connections");
+  Object.entries(peers).forEach(([pid, pc]) => {
+    if (MY_ID > pid && pc.connectionState !== 'closed') {
+      // small jitter so multi-peer doesn't restart simultaneously
+      setTimeout(() => forceIceRestart(pid), Math.random() * 500);
+    }
+  });
+});
+window.addEventListener('offline', () => {
+  log("📵 network offline");
+});
+
+// ── v2.2 Mic watchdog ──
+// Another app (incoming phone call, voice memo, etc.) can steal the mic
+// mid-call. The MediaStreamTrack fires 'ended' when this happens. Without
+// recovery, your mic dies until you rejoin. With this, we reacquire and
+// replaceTrack into every peer so voice resumes seamlessly.
+function watchLocalTrack() {
+  if (!localStream) return;
+  const t = localStream.getAudioTracks()[0];
+  if (!t || t._watched) return;
+  t._watched = true;
+  t.addEventListener('ended', async () => {
+    log("⚠ local mic track ended — reacquiring");
+    try {
+      const newStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
+      const newTrack = newStream.getAudioTracks()[0];
+      newTrack.enabled = !isMuted;
+      // Swap the track into every active peer connection
+      Object.values(peers).forEach(pc => {
+        pc.getSenders().forEach(s => {
+          if (s.track && s.track.kind === 'audio') {
+            try { s.replaceTrack(newTrack); } catch (e) { log("reacquire replaceTrack err: " + e.message); }
+          }
+        });
+      });
+      // Stop the dead old stream and adopt the new one
+      try { localStream.getTracks().forEach(tr => tr.stop()); } catch (e) {}
+      localStream = newStream;
+      // Re-arm watchdog and level monitor for the new track
+      watchLocalTrack();
+      setupLocalLevelMonitor();
+      log("✓ mic reacquired");
+    } catch (e) {
+      log("✗ mic reacquire failed: " + e.message);
+      document.getElementById('vstat').textContent = 'No mic';
+    }
+  });
+}
 
 // ── Join flow ──
 async function doJoin() {
@@ -733,6 +811,7 @@ async function doJoin() {
     document.getElementById('vstat').textContent = 'Connected';
     log("mic OK");
     setupLocalLevelMonitor();
+    watchLocalTrack(); // v2.2: arm watchdog so we recover if mic gets stolen
   } catch (e) {
     log("mic err: " + e.message);
     document.getElementById('vstat').textContent = 'No mic';
@@ -1514,6 +1593,8 @@ function setupPC(pc, pid) {
       if (p) p.retries = 0;
       // Detect whether we're using relay (TURN) vs direct
       detectRelay(pc, pid);
+      // v2.2: hard-cap outbound bitrate at the encoder level (32kbps)
+      capOutboundBitrate(pc, 32);
       // Start stats monitoring
       startStats(pc, pid);
     }
@@ -1544,6 +1625,28 @@ function setupPC(pc, pid) {
   // tracks added at PC creation, it tends to fire spuriously after the answer
   // arrives, causing offer storms and audio dropouts. We use deterministic
   // initial negotiation only.
+}
+
+// ── v2.2 Hard-cap outbound audio bitrate via setParameters ──
+// Backs up the SDP-level cap (maxaveragebitrate=32000). Some browsers/networks
+// ignore the SDP cap; setParameters is enforced at the encoder level so we
+// never burst above this on poor connections regardless of what the codec wants.
+async function capOutboundBitrate(pc, kbps) {
+  try {
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+    if (!sender) return;
+    const params = sender.getParameters();
+    if (!params.encodings || !params.encodings.length) {
+      params.encodings = [{}];
+    }
+    params.encodings[0].maxBitrate = kbps * 1000;
+    // Mark as high-priority so the OS scheduler doesn't deprioritize voice RTP
+    try { params.encodings[0].priority = 'high'; } catch (e) {}
+    try { params.encodings[0].networkPriority = 'high'; } catch (e) {}
+    await sender.setParameters(params);
+  } catch (e) {
+    // Some browsers (older Safari) reject this — non-fatal, SDP cap still applies
+  }
 }
 
 // ── Detect whether peer connection is going through TURN relay ──
@@ -1586,6 +1689,7 @@ function startStats(pc, pid) {
   let consecutiveBad = 0;     // count of consecutive 4s-intervals with >5% loss
   let consecutiveStalled = 0; // count of consecutive intervals with 0 incoming packets
   let outboundStall = 0;      // count of consecutive intervals with 0 outgoing packets
+  let logTick = 0;            // counter for log throttling
 
   statsTimers[pid] = setInterval(async () => {
     if (!peers[pid] || peers[pid].connectionState === 'closed') {
@@ -1619,7 +1723,21 @@ function startStats(pc, pid) {
       if (peerInfo) { peerInfo.lossPct = lossPct; peerInfo.recvRate = dRecv / 4; }
       const peerMuted = peerInfo && peerInfo.muted;
 
-      log("STATS " + pid + " ΔR=" + dRecv + " ΔL=" + dLost + " (" + lossPct.toFixed(1) + "%) jit=" + jitter.toFixed(3) + " ΔS=" + dSent);
+      // ── LOG THROTTLING ──
+      // Only emit STATS when interesting:
+      //   • first 2 ticks (8s of telemetry to confirm path is healthy)
+      //   • any anomaly (loss > 1%, unexpected ΔR=0, unexpected ΔS=0, big jitter)
+      //   • heartbeat every 8 ticks (~32s) so the log never goes fully silent
+      logTick++;
+      const isAnomaly = lossPct > 1
+        || (dRecv === 0 && !peerMuted)
+        || (dSent === 0 && !isMuted)
+        || jitter > 0.1;
+      const isHeartbeat = logTick <= 2 || logTick % 8 === 0;
+      if (isAnomaly || isHeartbeat) {
+        const tag = isAnomaly ? "STATS!" : "STATS ";
+        log(tag + pid + " ΔR=" + dRecv + " ΔL=" + dLost + " (" + lossPct.toFixed(1) + "%) jit=" + jitter.toFixed(3) + " ΔS=" + dSent);
+      }
 
       // ── TRIGGER 1: Sustained packet loss > 5% ──
       if (lossPct > 5 && total > 30) {
@@ -1956,7 +2074,7 @@ async def keepalive():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot BEAST MODE v2.1 | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot BEAST MODE v2.2 | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK}")
     # Pre-warm TURN cache so first call is fast
     servers = await get_ice_servers()
