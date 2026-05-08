@@ -163,7 +163,7 @@ except ImportError:
 EMAIL = os.getenv("BOT_EMAIL", "hadidaoud.ha@gmail.com")
 PASSWORD = os.getenv("BOT_PASSWORD", "yulia123")
 DEVICE_ID = os.getenv("BOT_DEVICE_ID", "870d649515ce700797d6a56965689f3aaa7d5e82dfdce994b239e00e37238184")
-CHAT_ID = os.getenv("BOT_CHAT_ID", "cmh2gy89r01pvt33exijh1wr3")
+CHAT_ID = os.getenv("BOT_CHAT_ID", "cmoxe9k5y1nqw0jdmeky1hya7")
 CIRCLE_ID = os.getenv("BOT_CIRCLE_ID", "cm9bylrbn00hmux6t43mczt2o")
 WEB_APP_URL = os.environ.get("WEB_APP_URL", "http://localhost:8000")
 PORT = int(os.environ.get("PORT", "8000"))
