@@ -1,5 +1,27 @@
 """
-Silent Hill Voice Call Bot — v3.4 TURN-DIAGNOSTIC
+Silent Hill Voice Call Bot — v3.5 SECRET-KEY-COMPATIBLE
+═══════════════════════════════════════════════════════════════════════════════
+v3.5 FIX (the actual root cause from Render logs HTTP 401):
+
+  THE REAL PROBLEM: User pasted Metered's SECRET KEY into METERED_API_KEY,
+  but the GET /api/v1/turn/credentials?apiKey=... endpoint requires a
+  per-credential API KEY (different thing). Result: HTTP 401 every fetch.
+
+  CONFUSING UI: Metered's dashboard "Developers" page prominently shows
+  "SECRET KEY" — and warns "never expose it" — which makes users assume
+  it's the right value for backend env vars. But the apiKey is actually
+  on the separate "TURN Server" page, generated per-credential.
+
+  v3.5 FIX: fetch_metered_creds now tries TWO paths:
+    1. POST /credential with secretKey (mints a fresh expiring cred,
+       then uses returned apiKey to fetch ICE servers)
+    2. GET /credentials with apiKey (original v3.4 behavior, fallback)
+  Whichever value the user pasted into METERED_API_KEY now works.
+
+  CREDS REFRESH: Since attempt 1 mints credentials with 1-hour expiry,
+  the existing 30-min cache stays in sync — credentials never expire
+  while in cache.
+
 ═══════════════════════════════════════════════════════════════════════════════
 v3.4 FIXES (Metered configured but maybe not loading):
 
@@ -180,9 +202,59 @@ def json_read(p: str, default=None):
 
 # ─── TURN CREDENTIAL FETCHING ───────────────────────────────────────────────
 async def fetch_metered_creds() -> List[dict]:
-    """Fetch fresh TURN creds from Metered.ca. v3.4: VISIBLE errors."""
+    """Fetch fresh TURN creds from Metered.ca.
+    v3.5: tries SECRET KEY first (POST /credential), falls back to API KEY
+    (GET /credentials). Either way, METERED_API_KEY env var is honored.
+    Why: Metered's dashboard 'Developers' page exposes a SECRET KEY,
+    while the per-credential 'API Key' is on a different page. People
+    naturally paste the secret. We accept both."""
     if not METERED_API_KEY or not METERED_DOMAIN:
         return []
+
+    # ATTEMPT 1: treat as SECRET KEY (POST to create a fresh credential)
+    # This is the path most users will hit because the Developers page
+    # in the Metered dashboard prominently displays the secret key.
+    try:
+        create_url = f"https://{METERED_DOMAIN}/api/v1/turn/credential?secretKey={METERED_API_KEY}"
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                create_url,
+                json={"expiryInSeconds": 3600, "label": "silenthill-bot"},
+                timeout=10,
+            ) as r:
+                body = await r.text()
+                if r.status == 200:
+                    try:
+                        cred = json.loads(body)
+                    except Exception:
+                        cred = None
+                    if isinstance(cred, dict) and cred.get("apiKey"):
+                        # Now use the returned apiKey to fetch ICE servers
+                        list_url = f"https://{METERED_DOMAIN}/api/v1/turn/credentials?apiKey={cred['apiKey']}"
+                        async with s.get(list_url, timeout=10) as r2:
+                            list_body = await r2.text()
+                            if r2.status == 200:
+                                try:
+                                    data = json.loads(list_body)
+                                except Exception as e:
+                                    print(f"[turn] METERED list JSON err: {e}")
+                                    data = None
+                                if isinstance(data, list) and data:
+                                    print(f"[turn] METERED OK via SECRET KEY ({len(data)} ICE entries)")
+                                    return data
+                                print(f"[turn] METERED list shape unexpected: {list_body[:200]}")
+                            else:
+                                print(f"[turn] METERED list HTTP {r2.status}: {list_body[:200]}")
+                    else:
+                        print(f"[turn] METERED secret-key POST returned no apiKey; body={body[:200]}")
+                # 401 here means the value isn't a valid SECRET KEY either —
+                # but it might be a valid APIKEY. Fall through to attempt 2.
+    except asyncio.TimeoutError:
+        print(f"[turn] METERED secret-key POST TIMEOUT — Render can't reach {METERED_DOMAIN}")
+    except Exception as e:
+        print(f"[turn] METERED secret-key POST EXCEPTION: {type(e).__name__}: {e}")
+
+    # ATTEMPT 2: treat as API KEY (GET — original v3.4 behavior)
     try:
         url = f"https://{METERED_DOMAIN}/api/v1/turn/credentials?apiKey={METERED_API_KEY}"
         async with aiohttp.ClientSession() as s:
@@ -192,23 +264,27 @@ async def fetch_metered_creds() -> List[dict]:
                     try:
                         data = json.loads(body_text)
                     except Exception as e:
-                        print(f"[turn] METERED JSON parse error: {e}; body={body_text[:200]}")
+                        print(f"[turn] METERED apikey JSON err: {e}; body={body_text[:200]}")
                         return []
-                    # Metered returns a JSON array directly
                     if isinstance(data, list) and len(data) > 0:
-                        print(f"[turn] METERED OK: {len(data)} ICE entries")
+                        print(f"[turn] METERED OK via API KEY ({len(data)} ICE entries)")
                         return data
-                    else:
-                        print(f"[turn] METERED unexpected shape: {type(data).__name__}, len={len(data) if hasattr(data, '__len__') else '?'}; body={body_text[:200]}")
-                        return []
-                else:
-                    print(f"[turn] METERED HTTP {r.status}: {body_text[:300]}")
+                    print(f"[turn] METERED apikey shape unexpected: {body_text[:200]}")
                     return []
+                print(f"[turn] METERED apikey HTTP {r.status}: {body_text[:300]}")
+                if r.status == 401:
+                    print(f"[turn] !!! Both SECRET KEY and API KEY rejected with 401")
+                    print(f"[turn] !!! In Metered dashboard, go to TURN Server page,")
+                    print(f"[turn] !!! click 'Show API Key' on a credential, paste THAT")
+                    print(f"[turn] !!! into METERED_API_KEY env var. The Developers")
+                    print(f"[turn] !!! page secret should also work — but check it's not")
+                    print(f"[turn] !!! truncated or has trailing whitespace.")
+                return []
     except asyncio.TimeoutError:
-        print(f"[turn] METERED TIMEOUT (>10s) — Render server can't reach {METERED_DOMAIN}")
+        print(f"[turn] METERED apikey TIMEOUT — Render can't reach {METERED_DOMAIN}")
         return []
     except Exception as e:
-        print(f"[turn] METERED EXCEPTION: {type(e).__name__}: {e}")
+        print(f"[turn] METERED apikey EXCEPTION: {type(e).__name__}: {e}")
     return []
 
 
@@ -2555,7 +2631,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.4");
+log("page loaded v3.5");
 </script>
 </body>
 </html>"""
@@ -2578,7 +2654,7 @@ async def keepalive():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot v3.4 TURN-DIAGNOSTIC | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot v3.5 SECRET-KEY-COMPATIBLE | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK}")
     servers = await get_ice_servers()
     print(f"ICE servers configured: {len(servers)} entries")
@@ -2593,9 +2669,9 @@ async def main():
         print("!" * 60)
         print("! NO PREMIUM TURN CONFIGURED — Gulf/MENA peers WILL FAIL  !")
         print("!" * 60)
-    print("v3.4: Metered fetch errors are now VISIBLE in logs")
-    print("v3.4: Failed premium fetches retry every 60s (not 30 min)")
-    print("v3.4: Hit /turn-debug in browser to inspect actual ICE config")
+    print("v3.5: METERED_API_KEY now accepts SECRET KEY or API KEY")
+    print("v3.5: Auto-mints expiring credentials when secret key is used")
+    print("v3.5: Hit /turn-debug to confirm Metered creds are loading")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
