@@ -797,7 +797,6 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .typing-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:6px 12px;font-size:12px;color:#8e8e93;flex-shrink:0;animation:msgIn .15s}
 .typing-bar.hidden{display:none!important}
 .new-msg-pill{position:fixed;bottom:76px;left:50%;transform:translateX(-50%) scale(0.9);background:#007aff;color:#fff;padding:8px 18px;border-radius:20px;font-size:13px;font-weight:600;z-index:20;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.45);opacity:0;transition:opacity .15s,transform .15s;pointer-events:none}.new-msg-pill.show{opacity:1;transform:translateX(-50%) scale(1);pointer-events:auto}
-.msg-row{position:relative;overflow:hidden;touch-action:pan-y}
 .input-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:8px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0}
 .input-attach,.input-send{width:38px;height:38px;border-radius:50%;border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0}
 .input-attach{background:#2c2c2e;color:#fff;font-size:18px}
@@ -1084,7 +1083,7 @@ document.getElementById('nameIn').addEventListener('input', e => {
   }, { passive: true });
 })();
 
-async function fetchIceServers()
+async function fetchIceServers() {
   try {
     const r = await fetch('/turn', { cache: 'no-store' });
     if (r.ok) {
