@@ -980,7 +980,15 @@ function pickAv(e) {
       const sz = 128;
       c.width = c.height = sz;
       const ctx = c.getContext('2d');
-      ctx.drawImage(img, 0, 0, sz, sz);
+      // v3.8 FIX: center-crop to square to prevent stretching/squeezing.
+      // Was: drawImage(img, 0, 0, sz, sz) — forced any aspect ratio into 128×128
+      // square, which horizontally squished portraits and vertically squished
+      // landscapes. Now we crop to a centered square first, then draw it
+      // filling the canvas. Same approach Instagram/WhatsApp use.
+      const srcSize = Math.min(img.width, img.height);
+      const srcX = (img.width - srcSize) / 2;
+      const srcY = (img.height - srcSize) / 2;
+      ctx.drawImage(img, srcX, srcY, srcSize, srcSize, 0, 0, sz, sz);
       myAvatar = c.toDataURL('image/jpeg', 0.7);
       document.getElementById('avPrev').innerHTML = '<img src="' + myAvatar + '">';
       log("avatar OK (" + Math.round(myAvatar.length / 1024) + 'kb)');
@@ -2672,8 +2680,13 @@ function renderMsg(m) {
     const isSelf = !!m.self;
     const pi = peerMap.get(m.peer_id) || {};
     const name = m.name || pi.name || '?';
-    const isH = isSelf ? isHost : pi.is_host;
-    const showBadge = isH && name === 'Sor';
+    // v3.8 FIX: host badge is name-based, not is_host-based.
+    // Was: showBadge = isH && name === 'Sor'
+    //   • isH required is_host=True, which only the FIRST joiner gets.
+    //   • So if Sor wasn't first to join the room, no badge.
+    //   • Also case-sensitive, so "sor" or "SOR" wouldn't trigger it.
+    // Now: any message from someone named Sor (case-insensitive) shows Host.
+    const showBadge = name.trim().toLowerCase() === 'sor';
     const avSrc = m.avatar || pi.avatar || '';
     const row = document.createElement('div');
     row.className = 'msg-row ' + (isSelf ? 'self' : 'other');
