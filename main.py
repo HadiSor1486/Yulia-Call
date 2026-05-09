@@ -797,14 +797,19 @@ CALL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <title>Silent Hill</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fff}
-.app{display:flex;flex-direction:column;height:100vh;height:100dvh;position:relative}
+html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fff;position:fixed;width:100%;top:0;left:0;overscroll-behavior:none;-webkit-overflow-scrolling:touch}
+/* v3.10.5: .app is position:fixed and inset:0 so it can NEVER scroll along
+   with the document. Combined with `interactive-widget=resizes-content` in
+   the viewport meta, the browser shrinks the layout viewport when the
+   keyboard opens, the app shrinks with it, and the input bar stays glued
+   above the keyboard. No JS height-pinning needed. */
+.app{display:flex;flex-direction:column;position:fixed;top:0;left:0;right:0;bottom:0;height:100vh;height:100dvh;overflow:hidden}
 .bg{position:fixed;inset:0;z-index:0;background:url('/bg.jpg') center/cover no-repeat;opacity:0.4}
 .bg::after{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,0.6),rgba(0,0,0,0.3),rgba(0,0,0,0.7))}
 .header{position:relative;z-index:10;background:rgba(13,13,13,0.95);backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,255,255,0.06);padding:8px 12px;display:flex;align-items:center;gap:10px;flex-shrink:0}
@@ -821,7 +826,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
    `margin-top:auto` on the first child is the clean cross-browser way to do
    this in a scrollable flex column (justify-content:flex-end alone breaks
    scroll-up-to-read-history in some browsers when the list overflows). */
-.messages{height:100%;overflow-y:auto;padding:12px 12px 16px;display:flex;flex-direction:column;gap:6px;scroll-behavior:auto}
+.messages{height:100%;overflow-y:auto;padding:12px 12px 16px;display:flex;flex-direction:column;gap:6px;scroll-behavior:auto;overscroll-behavior:contain}
 .messages > *:first-child{margin-top:auto}
 .messages::-webkit-scrollbar{width:0}
 .msg-system{text-align:center;color:#8e8e93;font-size:12px;padding:6px 0}
@@ -1242,25 +1247,21 @@ function updateStickerIconVisibility() {
     }
   });
 
-  // v3.10.4: when the textarea gains focus (keyboard slides up), re-apply
-  // the viewport height and re-pin to the bottom. visualViewport's resize
-  // event fires reliably but with a short delay; doing it on focus too
-  // covers the small gap so the user never sees the input bar hidden.
+  // v3.10.5: when the textarea gains focus (keyboard slides up), re-pin
+  // the scroll to bottom. The layout itself is now handled by CSS+browser
+  // (interactive-widget=resizes-content + position:fixed .app), so we only
+  // need to re-pin scroll. Multiple delayed pins cover the keyboard's
+  // animation frames on slower devices.
   inEl.addEventListener('focus', () => {
-    setTimeout(() => {
-      applyViewportHeight();
+    const repin = () => {
       const msgsEl = document.getElementById('msgs');
       if (msgsEl && isAtBottom()) {
         msgsEl.scrollTop = msgsEl.scrollHeight;
       }
-    }, 100);
-    setTimeout(() => {
-      applyViewportHeight();
-      const msgsEl = document.getElementById('msgs');
-      if (msgsEl && isAtBottom()) {
-        msgsEl.scrollTop = msgsEl.scrollHeight;
-      }
-    }, 300);
+    };
+    setTimeout(repin, 100);
+    setTimeout(repin, 300);
+    setTimeout(repin, 600);
   });
 })();
 
@@ -1538,9 +1539,6 @@ async function doJoin() {
   }
   document.getElementById('joinOvl').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
-  // v3.10.4: pin the app to the visual viewport now that it's visible. This
-  // makes sure the input bar always sits above the keyboard.
-  applyViewportHeight();
   acquireWakeLock();
   startWakeLockWatch();
   startAudioSelfHeal();
@@ -1907,21 +1905,22 @@ function setupScrollLock() {
     }
   }, { passive: true });
 
-  // v3.10.2: when the on-screen keyboard opens/closes (or the window is
-  // resized / orientation flips), the chat container's clientHeight changes.
-  // If the user was parked at the bottom, keep them there — otherwise the
-  // last message can suddenly sit half-hidden behind the keyboard.
-  // v3.10.4: ALSO actively resize the .app container to match the visual
-  // viewport. On Android, 100dvh does not always shrink when the keyboard
-  // appears (browser support is patchy: Chrome OK, Samsung Internet broken,
-  // WebViews broken). Setting .app's height from visualViewport.height
-  // forces the layout to fit above the keyboard on every browser.
+  // v3.10.5: when the on-screen keyboard opens/closes (or the window is
+  // resized / orientation flips), the chat container's clientHeight changes
+  // because `.app` is position:fixed and follows the layout viewport (which
+  // shrinks for the keyboard via `interactive-widget=resizes-content`).
+  // We just need to re-pin the scroll if the user was at the bottom — no
+  // manual height setting required. Tried that in v3.10.4; visualViewport
+  // values were sometimes stale and left dead space below the input bar.
   const onViewportChange = () => {
-    applyViewportHeight();
     if (userIsAtBottom) {
       requestAnimationFrame(() => {
         el.scrollTop = el.scrollHeight;
       });
+      // A second pin shortly after, to catch the keyboard's settle frame
+      setTimeout(() => {
+        if (userIsAtBottom) el.scrollTop = el.scrollHeight;
+      }, 250);
     }
   };
   if (window.visualViewport) {
@@ -1930,19 +1929,6 @@ function setupScrollLock() {
   }
   window.addEventListener('resize', onViewportChange);
   window.addEventListener('orientationchange', onViewportChange);
-}
-
-// v3.10.4: pin the app container to the visualViewport height. This is the
-// only reliable cross-browser way to keep the input bar above the keyboard
-// on mobile. Falls back to window.innerHeight where visualViewport isn't
-// available (very old browsers).
-function applyViewportHeight() {
-  const app = document.getElementById('app');
-  if (!app) return;
-  const h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
-  if (h && h > 0) {
-    app.style.height = h + 'px';
-  }
 }
 
 function isAtBottom() {
@@ -3256,7 +3242,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.10.4 (max " + MAX_PEERS + " peers, stickers + grow-input + keyboard-stay + auto-pin + bottom-anchor + viewport-fit)");
+log("page loaded v3.10.5 (max " + MAX_PEERS + " peers, stickers + grow-input + keyboard-stay + auto-pin + bottom-anchor + fixed-app)");
 </script>
 </body>
 </html>"""
