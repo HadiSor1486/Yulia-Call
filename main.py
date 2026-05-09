@@ -814,7 +814,15 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .group-name{font-size:15px;font-weight:600}
 .group-meta{font-size:12px;color:#8e8e93}
 .messages-wrap{flex:1;position:relative;z-index:5;overflow:hidden}
+/* v3.10.3: anchor messages to the BOTTOM of the container, WhatsApp-style.
+   When the room only has a few messages, they sit just above the input bar
+   instead of pinned to the top of an empty scroll area — so when the
+   keyboard opens the layout shrinks from the top and messages stay visible.
+   `margin-top:auto` on the first child is the clean cross-browser way to do
+   this in a scrollable flex column (justify-content:flex-end alone breaks
+   scroll-up-to-read-history in some browsers when the list overflows). */
 .messages{height:100%;overflow-y:auto;padding:12px 12px 16px;display:flex;flex-direction:column;gap:6px;scroll-behavior:auto}
+.messages > *:first-child{margin-top:auto}
 .messages::-webkit-scrollbar{width:0}
 .msg-system{text-align:center;color:#8e8e93;font-size:12px;padding:6px 0}
 .msg-row{display:flex;gap:8px;max-width:85%;animation:msgIn .2s ease-out;align-items:flex-start}
@@ -3204,7 +3212,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.10.2 (max " + MAX_PEERS + " peers, stickers + grow-input + keyboard-stay + auto-pin)");
+log("page loaded v3.10.3 (max " + MAX_PEERS + " peers, stickers + grow-input + keyboard-stay + auto-pin + bottom-anchor)");
 </script>
 </body>
 </html>"""
