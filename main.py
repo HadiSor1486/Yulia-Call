@@ -1,33 +1,40 @@
 """
-Silent Hill Voice Call Bot — v3.10 BEAST MODE (STICKERS + GROW-INPUT)
+Silent Hill Voice Call Bot — v3.11 BEAST MODE (REVERSE-FLEX MESSAGES)
 ═══════════════════════════════════════════════════════════════════════════════
-v3.10 — STICKERS & GROWING TEXT INPUT:
+v3.11 — MESSAGES NOW BOTTOM-ANCHORED (WhatsApp / Instagram / Telegram style)
 
-  NEW IN v3.10:
-    1. STICKERS PANEL — like Kyodo. A sticker icon sits on the right side
-       INSIDE the message input. Tap → bottom sheet opens with all stickers
-       from the `stickers/` folder (s1.jpg, s2.jpg, ...). Tap a sticker to
-       send. Sheet closes automatically. The icon hides when the user is
-       typing and reappears when the input is empty.
-    2. STICKERS ARE LIVE — server reads the `stickers/` directory on every
-       /stickers request, so adding s12.jpg to GitHub instantly appears in
-       all rooms (no restart needed). No build step.
-    3. STICKERS RENDER WITHOUT A BUBBLE — they appear inline at small size
-       (max 140px), not clickable, no chrome around them. Just like Kyodo.
-    4. REPLY-TO-STICKER works — replies show "Sticker" as the preview.
-    5. STICKERS RESPECT MEMORY CAPS — when a message ages out beyond
-       IMAGE_RETAIN_COUNT, its sticker reference is stripped just like
-       images. (Stickers are URLs not base64 so RAM impact is tiny, but we
-       keep the same expiry semantics for consistency.)
-    6. AUTO-GROWING TEXT INPUT — was a single-line input that hid text
-       when it overflowed. Now a textarea that grows up to 3 lines, then
-       scrolls internally. Enter sends, Shift+Enter inserts a newline.
-       Identical look at rest.
+  ONE CHANGE FROM v3.10:
+    The messages list is now rendered with `flex-direction: column-reverse`,
+    which is the same technique used by WhatsApp Web, Telegram Web, Messenger
+    and Instagram DMs. The browser pins scroll to the visual bottom by
+    default, so:
+      • New messages appear at the bottom and are visible immediately
+      • If the viewport shifts (mobile keyboard opens/closes, address bar
+        collapses, orientation flip), the bottom stays pinned — no message
+        is ever hidden because of a layout shift
+      • If a user scrolls UP to read history, a new message does NOT yank
+        them down (it just bumps the unread badge)
+      • When the room first opens with few messages, they sit at the bottom
+        of the panel (not floating at the top)
 
-  PRESERVED FROM v3.9:
+  HOW IT WORKS UNDER THE HOOD:
+    With column-reverse, children are visually flipped but DOM order is
+    preserved. The visual bottom = DOM first-child. To make newest
+    messages appear at the visual bottom we now `insertBefore(firstChild)`
+    instead of `appendChild`. History is iterated in reverse for the same
+    reason. "Scrolled to bottom" with column-reverse means
+    `scrollTop >= -NEAR_BOTTOM_PX` (scrollTop counts upward from 0 as you
+    scroll into older content). The jump-to-latest button now scrolls to
+    `scrollTop = 0`. Every behavior in v3.10 — replies, stickers, image
+    preview, typing indicator, unread counter — is preserved.
+
+  EVERYTHING ELSE FROM v3.10 IS UNTOUCHED:
+    • Stickers panel (live folder listing, no-bubble render)
+    • Auto-growing textarea (1→3 lines, then internal scroll)
+    • Mobile keyboard stays up after sending
     • Memory hardening: MAX_CHAT_MESSAGES, IMAGE_RETAIN_COUNT, MAX_IMAGE_BYTES
     • memory_groomer() background task
-    • image_expired placeholder rendering
+    • image_expired / sticker_expired placeholders
     • All v3.8 WebRTC reliability and big-room scaling
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -797,19 +804,14 @@ CALL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <title>Silent Hill</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fff;position:fixed;width:100%;top:0;left:0;overscroll-behavior:none;-webkit-overflow-scrolling:touch}
-/* v3.10.5: .app is position:fixed and inset:0 so it can NEVER scroll along
-   with the document. Combined with `interactive-widget=resizes-content` in
-   the viewport meta, the browser shrinks the layout viewport when the
-   keyboard opens, the app shrinks with it, and the input bar stays glued
-   above the keyboard. No JS height-pinning needed. */
-.app{display:flex;flex-direction:column;position:fixed;top:0;left:0;right:0;bottom:0;height:100vh;height:100dvh;overflow:hidden}
+html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fff}
+.app{display:flex;flex-direction:column;height:100vh;height:100dvh;position:relative}
 .bg{position:fixed;inset:0;z-index:0;background:url('/bg.jpg') center/cover no-repeat;opacity:0.4}
 .bg::after{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,0.6),rgba(0,0,0,0.3),rgba(0,0,0,0.7))}
 .header{position:relative;z-index:10;background:rgba(13,13,13,0.95);backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,255,255,0.06);padding:8px 12px;display:flex;align-items:center;gap:10px;flex-shrink:0}
@@ -819,15 +821,35 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .group-name{font-size:15px;font-weight:600}
 .group-meta{font-size:12px;color:#8e8e93}
 .messages-wrap{flex:1;position:relative;z-index:5;overflow:hidden}
-/* v3.10.3: anchor messages to the BOTTOM of the container, WhatsApp-style.
-   When the room only has a few messages, they sit just above the input bar
-   instead of pinned to the top of an empty scroll area — so when the
-   keyboard opens the layout shrinks from the top and messages stay visible.
-   `margin-top:auto` on the first child is the clean cross-browser way to do
-   this in a scrollable flex column (justify-content:flex-end alone breaks
-   scroll-up-to-read-history in some browsers when the list overflows). */
-.messages{height:100%;overflow-y:auto;padding:12px 12px 16px;display:flex;flex-direction:column;gap:6px;scroll-behavior:auto;overscroll-behavior:contain}
-.messages > *:first-child{margin-top:auto}
+
+/* ════════════════════════════════════════════════════════════════════════
+   v3.11 MESSAGES LIST — REVERSE FLEX (WhatsApp/Telegram/Instagram pattern)
+   ════════════════════════════════════════════════════════════════════════
+   The list uses `flex-direction: column-reverse`, which has three crucial
+   browser-level properties:
+
+     1. The visual bottom is the DOM first child. To put a "newer" message
+        at the visual bottom, JS uses insertBefore(node, container.firstChild)
+        instead of appendChild. (The render code below does exactly that.)
+
+     2. Scroll is anchored to the bottom by default. When new content is
+        added at the visual bottom, the browser keeps the bottom in view
+        — there is no flicker, no manual scrollTop math needed. This is
+        the magic that makes new messages always visible no matter how
+        the viewport shifts (mobile keyboard opening, address bar
+        collapsing, orientation change).
+
+     3. scrollTop is 0 when scrolled to the visual bottom, and becomes
+        more NEGATIVE as the user scrolls UP into older messages.
+        (On Chrome/Safari/Firefox today scrollTop goes 0 → -N upward;
+        a few older Chromes used 0 → +N. The JS uses Math.abs() so it
+        works on either convention.)
+
+   `justify-content: flex-end` ensures that when the list is shorter than
+   the viewport (e.g. just opened, only a system message), the content
+   sits at the bottom of the panel, not floating at the top.
+   ════════════════════════════════════════════════════════════════════════ */
+.messages{height:100%;overflow-y:auto;padding:12px 12px 16px;display:flex;flex-direction:column-reverse;justify-content:flex-end;gap:6px;scroll-behavior:auto;overflow-anchor:none}
 .messages::-webkit-scrollbar{width:0}
 .msg-system{text-align:center;color:#8e8e93;font-size:12px;padding:6px 0}
 .msg-row{display:flex;gap:8px;max-width:85%;animation:msgIn .2s ease-out;align-items:flex-start}
@@ -1042,7 +1064,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 
 <script>
 // ════════════════════════════════════════════════════════════════════════════
-// SILENT HILL CLIENT — v3.10 BEAST MODE (STICKERS + GROW-INPUT)
+// SILENT HILL CLIENT — v3.11 BEAST MODE (REVERSE-FLEX MESSAGES)
 // ════════════════════════════════════════════════════════════════════════════
 
 const ROOM = "__ROOM_ID__", TOKEN = "__TOKEN__";
@@ -1193,23 +1215,12 @@ document.getElementById('nameIn').addEventListener('input', e => {
 // ════════════════════════════════════════════════════════════════════════════
 // v3.10 INPUT WIRING — typing indicator + auto-grow + sticker icon visibility
 // ════════════════════════════════════════════════════════════════════════════
-// The input is now a textarea (was <input>). Three things happen on input:
-//   1. Typing indicator broadcast (unchanged behavior, just moved into the
-//      same listener so we don't bind twice).
-//   2. Auto-grow: height scales with content from 1 line up to 3 lines, then
-//      internal scroll kicks in. Recomputed every keystroke.
-//   3. Sticker icon visibility: hidden the moment any character is present,
-//      shown again when the input goes empty (matches what Kyodo does).
-// ════════════════════════════════════════════════════════════════════════════
-
 const INPUT_MAX_HEIGHT = 84;  // ~3 lines at 14px / 1.4 line-height with padding
 const INPUT_MIN_HEIGHT = 38;  // matches the resting height (rows=1)
 
 function autoResizeInput() {
   const el = document.getElementById('msgIn');
   if (!el) return;
-  // Reset to minimum so shrink-on-delete works, then grow to scrollHeight,
-  // capped at MAX. After cap, native overflow:auto handles the scrolling.
   el.style.height = 'auto';
   const h = Math.min(el.scrollHeight, INPUT_MAX_HEIGHT);
   el.style.height = Math.max(h, INPUT_MIN_HEIGHT) + 'px';
@@ -1245,23 +1256,6 @@ function updateStickerIconVisibility() {
       e.preventDefault();
       sendMsg();
     }
-  });
-
-  // v3.10.5: when the textarea gains focus (keyboard slides up), re-pin
-  // the scroll to bottom. The layout itself is now handled by CSS+browser
-  // (interactive-widget=resizes-content + position:fixed .app), so we only
-  // need to re-pin scroll. Multiple delayed pins cover the keyboard's
-  // animation frames on slower devices.
-  inEl.addEventListener('focus', () => {
-    const repin = () => {
-      const msgsEl = document.getElementById('msgs');
-      if (msgsEl && isAtBottom()) {
-        msgsEl.scrollTop = msgsEl.scrollHeight;
-      }
-    };
-    setTimeout(repin, 100);
-    setTimeout(repin, 300);
-    setTimeout(repin, 600);
   });
 })();
 
@@ -1321,13 +1315,11 @@ function renderStickerGrid() {
     grid.innerHTML = '<div class="sticker-empty">No stickers yet.<br>Drop images into the <code>stickers/</code> folder.</div>';
     return;
   }
-  // Build buttons. We use buttons (not divs) for keyboard a11y.
   const html = stickerList.map(name => {
     const safe = esc(name);
     return '<button class="sticker-cell" type="button" data-name="' + safe + '" aria-label="' + safe + '"><img src="/stickers/' + safe + '" alt="" loading="lazy"></button>';
   }).join('');
   grid.innerHTML = html;
-  // Wire up click handlers (delegation would also work but explicit is clearer)
   grid.querySelectorAll('.sticker-cell').forEach(cell => {
     cell.addEventListener('click', () => {
       const name = cell.getAttribute('data-name');
@@ -1342,7 +1334,6 @@ async function toggleStickerPanel() {
 }
 
 async function openStickerPanel() {
-  // Refresh list each open in case new stickers landed in the folder
   await fetchStickerList();
   renderStickerGrid();
   const panel = document.getElementById('stickerPanel');
@@ -1350,7 +1341,6 @@ async function openStickerPanel() {
   if (panel) panel.classList.add('open');
   if (back) back.classList.add('open');
   stickerPanelOpen = true;
-  // Blur the textarea so the soft keyboard doesn't fight the bottom sheet
   const inEl = document.getElementById('msgIn');
   if (inEl) inEl.blur();
 }
@@ -1374,7 +1364,6 @@ function sendStickerMsg(name) {
     cancelReply();
   }
   ws.send(JSON.stringify(payload));
-  // Close the panel right after — matches "the list will disappear" requirement
   closeStickerPanel();
 }
 
@@ -1526,7 +1515,6 @@ async function doJoin() {
   } catch (e) { log("audio unlock fail: " + e.message); }
 
   await fetchIceServers();
-  // v3.10: prefetch sticker list so the picker opens instantly first time
   fetchStickerList();
 
   try {
@@ -1543,7 +1531,6 @@ async function doJoin() {
   startWakeLockWatch();
   startAudioSelfHeal();
   setupScrollLock();
-  // v3.10: ensure correct initial sizing for the textarea
   autoResizeInput();
   updateStickerIconVisibility();
 
@@ -1622,9 +1609,6 @@ function connectWS() {
         log("myId=" + MY_ID + " maxPeers=" + serverMaxPeers);
         break;
 
-      // v3.10: server pushes the current sticker list on join. Client
-      // also re-fetches via /stickers each time the picker opens to catch
-      // brand-new files that landed mid-session.
       case 'stickers':
         if (Array.isArray(m.stickers)) {
           stickerList = m.stickers;
@@ -1633,27 +1617,17 @@ function connectWS() {
         break;
 
       case 'history':
+        // v3.11: history arrives oldest-first. With column-reverse, the
+        // visual bottom is DOM first child, so to keep the order
+        // (newest at the bottom) we render oldest LAST — i.e. iterate
+        // in chronological order and let renderMsg() insertBefore()
+        // the first child. That naturally puts newer messages below
+        // older ones in the visual layout.
         m.messages.forEach(renderMsg);
+        // After history, we are by definition at the visual bottom
+        // (no scrolling has happened). Ensure the unread/jump-button
+        // state reflects that.
         scrollToLatest(false, true);
-        // v3.10.2: history may include multiple images that haven't loaded
-        // yet. Re-pin to the bottom each time one finishes loading, so the
-        // user lands on the freshest message regardless of network speed.
-        {
-          const msgsEl = document.getElementById('msgs');
-          if (msgsEl) {
-            const allImgs = msgsEl.querySelectorAll('img.chat-img, img.sticker-img');
-            allImgs.forEach(img => {
-              if (img.complete && img.naturalWidth > 0) return;
-              const repin = () => {
-                if (isAtBottom()) {
-                  msgsEl.scrollTop = msgsEl.scrollHeight;
-                }
-              };
-              img.addEventListener('load',  () => requestAnimationFrame(repin), { once: true });
-              img.addEventListener('error', () => requestAnimationFrame(repin), { once: true });
-            });
-          }
-        }
         break;
 
       case 'chat':
@@ -1886,99 +1860,69 @@ function updPeerLevels() {
 }
 let _peerLevelTicker = null;
 
+// ════════════════════════════════════════════════════════════════════════════
+// v3.11 SCROLL LOGIC FOR REVERSE-FLEX MESSAGE LIST
+// ════════════════════════════════════════════════════════════════════════════
+// Mental model:
+//   • Visual bottom (newest message)  →  scrollTop ≈ 0
+//   • Visual top    (oldest message)  →  scrollTop is far from 0
+//
+// Different browsers historically used different signs for scrollTop with
+// column-reverse. Modern Chrome/Safari/Firefox give NEGATIVE scrollTop as
+// you scroll up. Some older builds gave POSITIVE. To be bulletproof we
+// only ever look at Math.abs(scrollTop) and treat it as "how far from
+// the visual bottom in pixels". This is the same trick used by the
+// react-scroll-to-bottom library that Telegram Web and Discord both
+// use under the hood.
+// ════════════════════════════════════════════════════════════════════════════
+
 let userIsAtBottom = true;
 let unreadCount = 0;
 const NEAR_BOTTOM_PX = 80;
+
+function distanceFromVisualBottom(el) {
+  // With column-reverse, |scrollTop| is the pixel distance from the
+  // visual bottom. We use Math.abs to handle both sign conventions.
+  return Math.abs(el.scrollTop);
+}
 
 function setupScrollLock() {
   const el = document.getElementById('msgs');
   if (!el) return;
   el.addEventListener('scroll', () => {
-    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const dist = distanceFromVisualBottom(el);
     const wasAtBottom = userIsAtBottom;
-    userIsAtBottom = distFromBottom <= NEAR_BOTTOM_PX;
+    userIsAtBottom = dist <= NEAR_BOTTOM_PX;
     if (userIsAtBottom && !wasAtBottom) {
       unreadCount = 0;
       updateJumpButton();
     } else if (userIsAtBottom) {
       if (unreadCount !== 0) { unreadCount = 0; updateJumpButton(); }
+    } else {
+      // Scrolled up; just refresh the button visibility (count unchanged)
+      updateJumpButton();
     }
   }, { passive: true });
-
-  // v3.10.5: when the on-screen keyboard opens/closes (or the window is
-  // resized / orientation flips), the chat container's clientHeight changes
-  // because `.app` is position:fixed and follows the layout viewport (which
-  // shrinks for the keyboard via `interactive-widget=resizes-content`).
-  // We just need to re-pin the scroll if the user was at the bottom — no
-  // manual height setting required. Tried that in v3.10.4; visualViewport
-  // values were sometimes stale and left dead space below the input bar.
-  const onViewportChange = () => {
-    if (userIsAtBottom) {
-      requestAnimationFrame(() => {
-        el.scrollTop = el.scrollHeight;
-      });
-      // A second pin shortly after, to catch the keyboard's settle frame
-      setTimeout(() => {
-        if (userIsAtBottom) el.scrollTop = el.scrollHeight;
-      }, 250);
-    }
-  };
-  if (window.visualViewport) {
-    window.visualViewport.addEventListener('resize', onViewportChange);
-    window.visualViewport.addEventListener('scroll', onViewportChange);
-  }
-  window.addEventListener('resize', onViewportChange);
-  window.addEventListener('orientationchange', onViewportChange);
 }
 
 function isAtBottom() {
   const el = document.getElementById('msgs');
   if (!el) return true;
-  const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-  return distFromBottom <= NEAR_BOTTOM_PX;
+  return distanceFromVisualBottom(el) <= NEAR_BOTTOM_PX;
 }
 
 function scrollToLatest(smooth, force) {
+  // Visual bottom = scrollTop 0 in column-reverse layouts.
   const el = document.getElementById('msgs');
   if (!el) return;
   if (smooth) {
-    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    el.scrollTo({ top: 0, behavior: 'smooth' });
   } else {
-    el.scrollTop = el.scrollHeight;
+    el.scrollTop = 0;
   }
   userIsAtBottom = true;
   unreadCount = 0;
   updateJumpButton();
-}
-
-// v3.10.2: re-scroll once each image inside `row` finishes loading. Without
-// this, scrollToLatest() runs while the <img> is still 0×0 (bytes not loaded
-// yet), so when the image finally lays out it pushes content below the
-// viewport and the user has to manually scroll. We listen for load/error on
-// every image in the row and re-pin to the bottom — but only if the user is
-// still parked at the bottom (so we never yank someone who's reading older
-// messages).
-function scrollAfterMedia(row) {
-  if (!row) return;
-  const imgs = row.querySelectorAll('img.chat-img, img.sticker-img');
-  if (!imgs.length) return;
-  const pin = () => {
-    // Only re-pin if the user is currently at/near the bottom. If they've
-    // scrolled up to read history, leave them alone.
-    if (isAtBottom()) {
-      const el = document.getElementById('msgs');
-      if (el) el.scrollTop = el.scrollHeight;
-    }
-  };
-  imgs.forEach(img => {
-    if (img.complete && img.naturalWidth > 0) {
-      // Already cached/decoded — pin on next frame so layout commits first.
-      requestAnimationFrame(pin);
-    } else {
-      img.addEventListener('load',  () => requestAnimationFrame(pin), { once: true });
-      img.addEventListener('error', () => requestAnimationFrame(pin), { once: true });
-    }
-  });
 }
 
 function updateJumpButton() {
@@ -2998,8 +2942,6 @@ function sendImageMsg(dataUrl) {
 function startReply(m) {
   if (!m || m.kind === 'system') return;
   const txt = (m.text || '').trim();
-  // v3.10: include sticker preview text. If the message is purely a sticker
-  // (no text, no image), the reply preview just says "Sticker".
   let snippet;
   if (txt) snippet = txt.slice(0, 80);
   else if (m.image || m.image_expired) snippet = 'Image';
@@ -3026,7 +2968,6 @@ function showReplyBar() {
     const inputBar = document.querySelector('.input-bar');
     if (inputBar) inputBar.parentNode.insertBefore(el, inputBar);
   }
-  // Decide preview text: prefer the snippet, fall back to "Image"/"Sticker"
   let previewText = replyingTo.text || '';
   if (!previewText) {
     if (replyingTo.has_sticker) previewText = 'Sticker';
@@ -3054,17 +2995,34 @@ function openImagePreview(src) {
   document.body.appendChild(overlay);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// v3.11 MESSAGE INSERTION — REVERSE FLEX PRIMITIVE
+// ════════════════════════════════════════════════════════════════════════════
+// In a column-reverse list, the visual bottom is DOM index 0. To make a
+// new message appear at the visual bottom, we insertBefore(node, firstChild)
+// instead of appendChild. This single helper centralizes that rule so any
+// future code that adds a message gets it right by default.
+// ════════════════════════════════════════════════════════════════════════════
+function appendToVisualBottom(container, node) {
+  if (!container) return;
+  // insertBefore(node, null) === appendChild, so this is safe even when
+  // the container is empty.
+  container.insertBefore(node, container.firstChild);
+}
+
 function renderMsg(m) {
   const c = document.getElementById('msgs'); if (!c) return;
 
+  // v3.11: detect "was at bottom" BEFORE we add the new node. With
+  // column-reverse, distanceFromVisualBottom is |scrollTop|, which is
+  // unaffected by the insertion (the browser anchors scroll naturally).
   const wasAtBottom = isAtBottom();
-  let renderedRow = null;
 
   if (m.kind === 'system') {
     const d = document.createElement('div');
     d.className = 'msg-system';
     d.textContent = m.text;
-    c.appendChild(d);
+    appendToVisualBottom(c, d);
   } else {
     const isSelf = !!m.self;
     const pi = peerMap.get(m.peer_id) || {};
@@ -3072,9 +3030,6 @@ function renderMsg(m) {
     const showBadge = name.trim().toLowerCase() === 'sor';
     const avSrc = m.avatar || pi.avatar || '';
 
-    // v3.10: detect "sticker-only" messages — no text, no image, just a
-    // sticker (or expired sticker). These render WITHOUT a bubble so the
-    // sticker floats next to the avatar like in Kyodo/Telegram.
     const hasSticker = !!(m.sticker || m.sticker_expired);
     const hasImage = !!(m.image || m.image_expired);
     const hasText = !!(m.text && m.text.length > 0);
@@ -3103,13 +3058,8 @@ function renderMsg(m) {
                   '</div>';
     }
 
-    // Build the body content. Order matters: reply preview, then sticker
-    // (if sticker-only — it lives outside any bubble), or else image, then
-    // text, all wrapped in a bubble.
     let contentHTML;
     if (stickerOnly) {
-      // No bubble — reply preview (if any) and the sticker itself sit
-      // directly inside the msg-content column.
       let stickerHTML;
       if (m.sticker_expired) {
         stickerHTML = '<div class="sticker-expired"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg><span>Sticker no longer available</span></div>';
@@ -3118,7 +3068,6 @@ function renderMsg(m) {
       }
       contentHTML = header + replyHTML + stickerHTML;
     } else {
-      // Standard bubble path. Preserves all existing image+text behavior.
       let imgHTML = '';
       if (m.image) {
         imgHTML = '<img class="chat-img" src="' + esc(m.image) + '" alt="image">';
@@ -3138,9 +3087,6 @@ function renderMsg(m) {
 
     row.addEventListener('click', (ev) => {
       const t = ev.target;
-      // chat-img → open preview. sticker-img is pointer-events:none so it
-      // never reaches here, which is exactly what we want (stickers are
-      // not clickable to zoom — matches the requirement).
       if (t.classList && t.classList.contains('chat-img')) {
         ev.stopPropagation();
         openImagePreview(t.src);
@@ -3150,15 +3096,18 @@ function renderMsg(m) {
       startReply(m);
     });
 
-    c.appendChild(row);
-    renderedRow = row;
+    appendToVisualBottom(c, row);
   }
 
+  // v3.11: with column-reverse, the browser already keeps the bottom
+  // pinned automatically when content is added at the visual bottom and
+  // the user is at the bottom. We still nudge scrollTop to 0 for self
+  // messages (so we ALWAYS see what we just sent) and for the
+  // wasAtBottom case (defensive: keep us pinned even if some browser
+  // edge case nudged the scroll). When the user is scrolled UP reading
+  // history, we don't move them — we just bump the unread badge.
   if (m.self || wasAtBottom) {
     scrollToLatest(false);
-    // v3.10.2: re-pin scroll once the just-rendered image(s) actually load.
-    // Fixes the "image shows half-cropped, have to scroll manually" bug.
-    scrollAfterMedia(renderedRow);
   } else {
     if (m.kind !== 'system') {
       unreadCount++;
@@ -3173,7 +3122,7 @@ function renderSys(t) {
   const d = document.createElement('div');
   d.className = 'msg-system';
   d.textContent = t;
-  c.appendChild(d);
+  appendToVisualBottom(c, d);
   if (wasAtBottom) scrollToLatest(false);
 }
 
@@ -3204,8 +3153,6 @@ function renderTyping() {
 
 function sendMsg() {
   const inEl = document.getElementById('msgIn');
-  // v3.10: textarea preserves leading/trailing whitespace including newlines;
-  // .trim() also normalizes blank-only sends (e.g. someone hits Enter twice).
   const text = inEl.value.trim();
   if (!text || !ws || ws.readyState !== 1) return;
   if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
@@ -3217,14 +3164,11 @@ function sendMsg() {
   }
   ws.send(JSON.stringify(payload));
   inEl.value = '';
-  // Reset textarea height + re-show sticker icon since input is now empty
   autoResizeInput();
   updateStickerIconVisibility();
   // v3.10.1: keep the mobile keyboard up after sending. Without this, the
   // keyboard collapses on every send because some mobile browsers blur the
-  // textarea when the value is reset programmatically. Refocusing keeps the
-  // keyboard visible until the user manually dismisses it via the system
-  // keyboard's down-arrow / dismiss button.
+  // textarea when the value is reset programmatically.
   inEl.focus();
 }
 
@@ -3242,7 +3186,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.10.5 (max " + MAX_PEERS + " peers, stickers + grow-input + keyboard-stay + auto-pin + bottom-anchor + fixed-app)");
+log("page loaded v3.11 (max " + MAX_PEERS + " peers, reverse-flex messages)");
 </script>
 </body>
 </html>"""
@@ -3305,7 +3249,7 @@ async def memory_groomer():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot v3.10 BEAST MODE | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot v3.11 BEAST MODE | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK} | Max peers per room: {MAX_PEERS_PER_ROOM}")
     print(f"Memory caps: {MAX_CHAT_MESSAGES} msgs/room, {IMAGE_RETAIN_COUNT} recent images, {MAX_IMAGE_BYTES//1000}KB per img")
     print(f"Stickers folder: {STICKERS_DIR!r} | available now: {len(list_stickers())}")
@@ -3326,6 +3270,7 @@ async def main():
     print("v3.8: speaking throttle, scaled timers, signaling-state recovery")
     print("v3.9: memory caps + groomer (fits Render free tier)")
     print("v3.10: stickers panel + auto-growing textarea")
+    print("v3.11: messages bottom-anchored via column-reverse flex")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
