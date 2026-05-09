@@ -776,6 +776,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .p-s .dot.conn{background:#34c759}
 .p-s .dot.fail{background:#ff3b30}
 .p-s .dot.relay{background:#ff9500}
+.p-s .dot.warn{background:#ffcc00}
 .p-s .dot.connecting{background:#ffcc00;animation:pulse 1.2s infinite}
 @keyframes pulse{50%{opacity:0.4}}
 .hidden{display:none!important}
@@ -1489,10 +1490,34 @@ function updPeers() {
   peerMap.forEach((p, id) => {
     let dot = '';
     if (p.connState === 'connected') {
+      // ════════════════════════════════════════════════════════════════════
+      // v3.8 DOT LOGIC — color reflects ACTUAL audio health, not just loss
+      // ════════════════════════════════════════════════════════════════════
+      // Old: smoothed loss > 8% → RED, even if you could still hear them fine.
+      //      Misleading: a network spike showed RED while the call was working.
+      // New: RED only when audio is actually broken (no real audio heard for
+      //      8+ seconds AND elevated packet loss). Otherwise: GREEN if direct,
+      //      ORANGE if on relay, YELLOW if loss is bad but you can still hear.
+      // ════════════════════════════════════════════════════════════════════
       const smoothed = lossEwma[id] !== undefined ? lossEwma[id] : (p.lossPct || 0);
-      if (smoothed > 8) dot = 'fail';
-      else if (peerRelay[id] || p.usedRelay) dot = 'relay';
-      else dot = 'conn';
+      const onRelay = peerRelay[id] || p.usedRelay;
+      const muted = p.muted;
+      const heardRecently = p.lastHeardAt && (Date.now() - p.lastHeardAt) < 8000;
+      const noPacketsArriving = (p.recvRate !== undefined) && (p.recvRate < 1);
+
+      // Truly broken: no audio heard in 8s AND no packets arriving AND not muted.
+      // (If muted, no audio is expected, so silence is normal.)
+      const audioActuallyBroken = !muted && !heardRecently && noPacketsArriving && smoothed > 15;
+
+      if (audioActuallyBroken) {
+        dot = 'fail';            // RED — they really can't hear / be heard
+      } else if (onRelay) {
+        // On relay: orange if loss is mild, yellow-warn if loss is elevated
+        dot = (smoothed > 12) ? 'warn' : 'relay';
+      } else {
+        // Direct: green if loss is fine, yellow-warn if elevated
+        dot = (smoothed > 12) ? 'warn' : 'conn';
+      }
     } else if (p.connState === 'failed' || p.connState === 'closed') dot = 'fail';
     else if (p.connState === 'connecting' || p.connState === 'checking' || p.connState === 'new') dot = 'connecting';
     const speakClass = (p.speaking || p.actuallyHeard) ? ' speaking' : '';
@@ -2048,6 +2073,10 @@ function startInboundLevel(stream, pid) {
       if (p) {
         p.recvLevel = level;
         p.actuallyHeard = level > 0.02;
+        // v3.8: track last time we heard real audio. Used by the dot color
+        // logic to distinguish "currently silent (probably fine)" from
+        // "haven't heard them in 10s while loss is bad (actually broken)".
+        if (level > 0.02) p.lastHeardAt = Date.now();
       }
     }, 200);
   } catch (e) {
