@@ -1605,6 +1605,25 @@ function connectWS() {
       case 'history':
         m.messages.forEach(renderMsg);
         scrollToLatest(false, true);
+        // v3.10.2: history may include multiple images that haven't loaded
+        // yet. Re-pin to the bottom each time one finishes loading, so the
+        // user lands on the freshest message regardless of network speed.
+        {
+          const msgsEl = document.getElementById('msgs');
+          if (msgsEl) {
+            const allImgs = msgsEl.querySelectorAll('img.chat-img, img.sticker-img');
+            allImgs.forEach(img => {
+              if (img.complete && img.naturalWidth > 0) return;
+              const repin = () => {
+                if (isAtBottom()) {
+                  msgsEl.scrollTop = msgsEl.scrollHeight;
+                }
+              };
+              img.addEventListener('load',  () => requestAnimationFrame(repin), { once: true });
+              img.addEventListener('error', () => requestAnimationFrame(repin), { once: true });
+            });
+          }
+        }
         break;
 
       case 'chat':
@@ -1855,6 +1874,23 @@ function setupScrollLock() {
       if (unreadCount !== 0) { unreadCount = 0; updateJumpButton(); }
     }
   }, { passive: true });
+
+  // v3.10.2: when the on-screen keyboard opens/closes (or the window is
+  // resized / orientation flips), the chat container's clientHeight changes.
+  // If the user was parked at the bottom, keep them there — otherwise the
+  // last message can suddenly sit half-hidden behind the keyboard.
+  const onViewportChange = () => {
+    if (userIsAtBottom) {
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight;
+      });
+    }
+  };
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', onViewportChange);
+  }
+  window.addEventListener('resize', onViewportChange);
+  window.addEventListener('orientationchange', onViewportChange);
 }
 
 function isAtBottom() {
@@ -1875,6 +1911,36 @@ function scrollToLatest(smooth, force) {
   userIsAtBottom = true;
   unreadCount = 0;
   updateJumpButton();
+}
+
+// v3.10.2: re-scroll once each image inside `row` finishes loading. Without
+// this, scrollToLatest() runs while the <img> is still 0×0 (bytes not loaded
+// yet), so when the image finally lays out it pushes content below the
+// viewport and the user has to manually scroll. We listen for load/error on
+// every image in the row and re-pin to the bottom — but only if the user is
+// still parked at the bottom (so we never yank someone who's reading older
+// messages).
+function scrollAfterMedia(row) {
+  if (!row) return;
+  const imgs = row.querySelectorAll('img.chat-img, img.sticker-img');
+  if (!imgs.length) return;
+  const pin = () => {
+    // Only re-pin if the user is currently at/near the bottom. If they've
+    // scrolled up to read history, leave them alone.
+    if (isAtBottom()) {
+      const el = document.getElementById('msgs');
+      if (el) el.scrollTop = el.scrollHeight;
+    }
+  };
+  imgs.forEach(img => {
+    if (img.complete && img.naturalWidth > 0) {
+      // Already cached/decoded — pin on next frame so layout commits first.
+      requestAnimationFrame(pin);
+    } else {
+      img.addEventListener('load',  () => requestAnimationFrame(pin), { once: true });
+      img.addEventListener('error', () => requestAnimationFrame(pin), { once: true });
+    }
+  });
 }
 
 function updateJumpButton() {
@@ -2954,6 +3020,7 @@ function renderMsg(m) {
   const c = document.getElementById('msgs'); if (!c) return;
 
   const wasAtBottom = isAtBottom();
+  let renderedRow = null;
 
   if (m.kind === 'system') {
     const d = document.createElement('div');
@@ -3046,10 +3113,14 @@ function renderMsg(m) {
     });
 
     c.appendChild(row);
+    renderedRow = row;
   }
 
   if (m.self || wasAtBottom) {
     scrollToLatest(false);
+    // v3.10.2: re-pin scroll once the just-rendered image(s) actually load.
+    // Fixes the "image shows half-cropped, have to scroll manually" bug.
+    scrollAfterMedia(renderedRow);
   } else {
     if (m.kind !== 'system') {
       unreadCount++;
@@ -3133,7 +3204,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.10.1 (max " + MAX_PEERS + " peers, stickers + grow-input + keyboard-stay)");
+log("page loaded v3.10.2 (max " + MAX_PEERS + " peers, stickers + grow-input + keyboard-stay + auto-pin)");
 </script>
 </body>
 </html>"""
