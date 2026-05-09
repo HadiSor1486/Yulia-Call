@@ -849,7 +849,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
    the viewport (e.g. just opened, only a system message), the content
    sits at the bottom of the panel, not floating at the top.
    ════════════════════════════════════════════════════════════════════════ */
-.messages{height:100%;overflow-y:auto;padding:12px 12px 16px;display:flex;flex-direction:column-reverse;justify-content:flex-end;gap:6px;scroll-behavior:auto;overflow-anchor:none}
+.messages{height:100%;overflow-y:auto;padding:12px 12px 16px;display:flex;flex-direction:column-reverse;justify-content:flex-start;gap:6px;scroll-behavior:auto;overflow-anchor:none}
 .messages::-webkit-scrollbar{width:0}
 .msg-system{text-align:center;color:#8e8e93;font-size:12px;padding:6px 0}
 .msg-row{display:flex;gap:8px;max-width:85%;animation:msgIn .2s ease-out;align-items:flex-start}
