@@ -1,59 +1,40 @@
 """
-Silent Hill Voice Call Bot — v3.8 BEAST MODE (15-PEER HARDENED MESH)
+Silent Hill Voice Call Bot — v3.9 BEAST MODE (RENDER-FREE-TIER FRIENDLY)
 ═══════════════════════════════════════════════════════════════════════════════
-v3.8 — RAISED CEILING + REINFORCEMENTS FOR 12-15 PEER ROOMS:
+v3.9 — MEMORY HARDENING (fits in 512 MB Render free tier):
 
-  1. ROOM CAPACITY: 15 peers (was 11)
-     • 16th person → beige "15/15" screen with person SVG icon.
-     • Configurable via MAX_PEERS_PER_ROOM env var.
+  THE PROBLEM (from real Render OOM email):
+    Long calls with many image messages caused chat JSON files to grow
+    unboundedly. Every chat append did read-modify-write of the entire
+    file, and json.loads/dumps temporarily doubles RAM. A 30 MB file
+    being grown by 100 peers all sending images = 100+ MB RAM spike,
+    breaching the 512 MB tier. Process gets OOM-killed and restarts.
 
-  2. FOUR-TIER ADAPTIVE BITRATE (was three)
-     • 1–4 peers : 32 kbps   (pristine)
-     • 5–7 peers : 24 kbps   (excellent)
-     • 8–11 peers: 20 kbps   (great)
-     • 12+ peers : 16 kbps   (intelligible — Opus shines at low rates)
+  v3.9 FIXES:
+    1. MAX_CHAT_MESSAGES (default 200) — chat file capped, oldest dropped.
+    2. IMAGE_RETAIN_COUNT (default 30) — only the most recent N messages
+       keep their image base64. Older messages keep text/metadata but
+       drop image data. Massive savings: 1 image ≈ 400 KB, 30 images
+       capped ≈ 12 MB max per room.
+    3. MAX_IMAGE_BYTES (default 400 KB, was 600 KB) — slightly smaller
+       per-image cap. JPEG quality difference is invisible.
+    4. /history payload to new joiners strips images from messages older
+       than IMAGE_RETAIN_COUNT — they see "[Image no longer available]"
+       placeholder for old images, full images for recent ones.
+    5. memory_groomer() background task — every 10 min, walks all chat
+       files >200 KB and re-applies the caps. Catches edge cases.
+    6. Client renders image_expired flag as a tasteful inline placeholder
+       with an SVG icon, not a broken image.
+    All caps configurable via env vars.
 
-  3. WIDER STAGGER ON JOIN (50ms → 80ms)
-     • At 14 simultaneous SDP negotiations, 50ms wasn't enough room
-     • for the signaling channel to breathe. 80ms eliminates collisions.
-
-  4. SHARED AUDIO CONTEXT
-     • One global AudioContext for ALL inbound level meters AND the local
-       monitor. Was creating up to 16 separate contexts on iOS Safari.
-     • iOS Safari has a hard limit (~6) and silently fails after that.
-     • This fix is the single biggest reliability win for big rooms.
-
-  5. STATS / TIMER SCALING (3 tiers now)
-     • Stats interval: 4s / 6s / 8s for <8 / 8-11 / 12+ peers.
-     • Connection timer: 10s / 14s / 18s.
-     • Less CPU, less log spam, more grace under contention.
-
-  6. SPEAKING EVENT THROTTLE
-     • Was: every level change broadcast (~5/sec per active speaker).
-     • Now: max 2/sec. In a 15-person room with 4 simultaneous speakers,
-       cuts WS traffic from ~300 msgs/sec to ~120 msgs/sec.
-
-  7. ICE CANDIDATE POOL TRIMMED (4 → 2)
-     • At 15 peers that was 60 pre-gathered candidates per client.
-
-  8. RETRY CEILING SCALED (4 → 5 in big rooms)
-     • More peers = more transient flakes. Don't give up too fast.
-
-  9. SIGNALING-STATE RECOVERY
-     • Rare big-room race: both sides in have-local-offer after a failed
-       polite rollback. Now explicitly detected and rebuilt.
-
-  10. PRESERVED FROM v3.7:
-     • All 11/11 → 15/15 room-full UX (beige screen, person SVG)
-     • Scroll lock + jump-to-latest with unread badge
-     • Clean transparent typing indicator
-     • Wake lock watchdog + audio self-heal (iOS bg recovery)
-     • All v3.5 Metered SECRET/API KEY auto-detection
-     • All v3.4 /turn-debug + /turn-status diagnostics
-     • All v3.3 stuck-checking + retry-after-fail relay forcing
-     • All v3.2 EWMA loss tracking + full rebuild escalation
-     • All 12 v3.1 race fixes
-     • Token cleanup verified: deleted on never-joined AND on empty-room
+  PRESERVED FROM v3.8:
+    • 15-peer mesh cap, 4-tier adaptive bitrate, shared AudioContext
+    • Smart dot colors (red only when audio truly broken, not just lossy)
+    • Scroll lock + jump-to-latest with unread badge
+    • Clean transparent typing indicator
+    • Avatar center-crop (no stretching)
+    • Host badge for anyone named "Sor" (case-insensitive)
+    • All v3.x WebRTC reliability fixes
 
 ═══════════════════════════════════════════════════════════════════════════════
 """
@@ -84,6 +65,14 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 # Room capacity. v3.8 hardened to 15 peers. Configurable via env var.
 MAX_PEERS_PER_ROOM = int(os.environ.get("MAX_PEERS_PER_ROOM", "15"))
+
+# v3.9 memory hardening: hard caps to prevent chat-file bloat on free Render tier.
+# Render free = 512 MB RAM. Without these, a long call with many images can
+# inflate a single chat file to 30+ MB, and json_read+json_write doubles RAM
+# during the read-modify-write cycle.
+MAX_CHAT_MESSAGES = int(os.environ.get("MAX_CHAT_MESSAGES", "200"))
+IMAGE_RETAIN_COUNT = int(os.environ.get("IMAGE_RETAIN_COUNT", "30"))
+MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", "400000"))  # was 600000
 
 # TURN provider env vars
 METERED_API_KEY = os.environ.get("METERED_API_KEY", "")
@@ -475,7 +464,19 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
     print(f"[WS] {peer_id} ({name}) joined room={room_id} host={is_host} total={len(room['peers'])}/{MAX_PEERS_PER_ROOM}")
 
     await ws.send_json({"type": "your_id", "id": peer_id, "max_peers": MAX_PEERS_PER_ROOM})
-    await ws.send_json({"type": "history", "messages": json_read(room["chat_file"])[-100:]})
+    # v3.9: build history payload with bounded memory cost. Send last 100
+    # messages but strip image data from all but the most recent 30 — keeps
+    # context for new joiners without sending megabytes of base64 over WS.
+    full_history = json_read(room["chat_file"])
+    history_slice = full_history[-100:] if full_history else []
+    if len(history_slice) > IMAGE_RETAIN_COUNT:
+        keep_images_from = len(history_slice) - IMAGE_RETAIN_COUNT
+        for i, m in enumerate(history_slice):
+            if i < keep_images_from and isinstance(m, dict) and m.get("image"):
+                # Send shape-preserving placeholder so the message still renders
+                m = {**m, "image": "", "image_expired": True}
+                history_slice[i] = m
+    await ws.send_json({"type": "history", "messages": history_slice})
     peer_list = [
         {"id": p, "name": room["peers"][p]["name"], "avatar": room["peers"][p]["avatar"],
          "is_host": room["peers"][p]["is_host"], "muted": room["peers"][p]["muted"]}
@@ -530,7 +531,7 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
             if mt == "chat":
                 text = msg.get("text", "").strip()[:1000]
                 image = msg.get("image", "") or ""
-                if image and (not isinstance(image, str) or len(image) > 600000
+                if image and (not isinstance(image, str) or len(image) > MAX_IMAGE_BYTES
                               or not image.startswith("data:image/")):
                     image = ""
                 if not text and not image:
@@ -665,9 +666,29 @@ async def _noshow(room_id):
 
 
 def _append_msg(rid, msg):
+    """Append a message to the room's chat file. v3.9 memory hardening:
+    - Caps file at MAX_CHAT_MESSAGES (200) — drops oldest beyond that.
+    - Strips images from messages older than IMAGE_RETAIN_COUNT (30) so
+      long calls don't accumulate hundreds of MB of base64 in one file.
+    """
     p = f"{rid}_chat.json"
     m = json_read(p, [])
     m.append(msg)
+
+    # Cap total messages
+    if len(m) > MAX_CHAT_MESSAGES:
+        m = m[-MAX_CHAT_MESSAGES:]
+
+    # Strip images from older messages (keep only the most recent N with images)
+    # This is the big memory win: old image base64 is by far the biggest payload.
+    if len(m) > IMAGE_RETAIN_COUNT:
+        cutoff = len(m) - IMAGE_RETAIN_COUNT
+        for i in range(cutoff):
+            if isinstance(m[i], dict) and m[i].get("image"):
+                # Replace image with marker, keep rest of message intact
+                m[i]["image"] = ""
+                m[i]["image_expired"] = True
+
     json_write(p, m)
 
 
@@ -717,6 +738,8 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .msg-row.system{cursor:default}
 .msg-row.system:active{opacity:1}
 .chat-img{max-width:240px;max-height:300px;border-radius:12px;display:block;cursor:pointer;margin:2px 0}
+.img-expired{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.55);font-size:12px;font-style:italic;margin:2px 0}
+.img-expired svg{width:18px;height:18px;flex-shrink:0;opacity:0.6}
 .msg-bubble.has-img{padding:4px;overflow:hidden}
 .msg-bubble.has-img.has-text{padding-bottom:8px}
 .msg-bubble.has-img .msg-text{padding:4px 10px 0}
@@ -2734,7 +2757,12 @@ function renderMsg(m) {
                   '</div>';
     }
     let imgHTML = '';
-    if (m.image) imgHTML = '<img class="chat-img" src="' + esc(m.image) + '" alt="image">';
+    if (m.image) {
+      imgHTML = '<img class="chat-img" src="' + esc(m.image) + '" alt="image">';
+    } else if (m.image_expired) {
+      // v3.9: image was stripped from history to save memory; show a tasteful placeholder
+      imgHTML = '<div class="img-expired"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg><span>Image no longer available</span></div>';
+    }
     let textHTML = '';
     if (m.text) textHTML = '<div class="msg-text">' + esc(m.text) + '</div>';
     let bubbleClass = 'msg-bubble';
@@ -2836,7 +2864,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.8 (max " + MAX_PEERS + " peers, hardened)");
+log("page loaded v3.9 (max " + MAX_PEERS + " peers, mem-hardened)");
 </script>
 </body>
 </html>"""
@@ -2857,10 +2885,49 @@ async def keepalive():
                 print(f"[keepalive] err: {e}")
 
 
+async def memory_groomer():
+    """v3.9: periodically walks active chat files and applies the memory caps.
+    Catches edge cases: files written before caps existed, files that somehow
+    grew (e.g. burst of images all kept beyond IMAGE_RETAIN_COUNT), and just
+    generally keeps disk + RAM bounded."""
+    await asyncio.sleep(120)  # wait until app warmed up
+    while True:
+        try:
+            for rid in list(rooms.keys()):
+                f = f"{rid}_chat.json"
+                if not os.path.exists(f):
+                    continue
+                try:
+                    sz = os.path.getsize(f)
+                    # Only bother reading the file if it's gotten genuinely big
+                    if sz < 200_000:
+                        continue
+                    msgs = json_read(f, [])
+                    before = len(msgs)
+                    if len(msgs) > MAX_CHAT_MESSAGES:
+                        msgs = msgs[-MAX_CHAT_MESSAGES:]
+                    if len(msgs) > IMAGE_RETAIN_COUNT:
+                        cutoff = len(msgs) - IMAGE_RETAIN_COUNT
+                        for i in range(cutoff):
+                            if isinstance(msgs[i], dict) and msgs[i].get("image"):
+                                msgs[i]["image"] = ""
+                                msgs[i]["image_expired"] = True
+                    json_write(f, msgs)
+                    new_sz = os.path.getsize(f)
+                    if new_sz < sz - 50_000:
+                        print(f"[groomer] trimmed {rid}: {sz//1024}KB -> {new_sz//1024}KB ({before} msgs)")
+                except Exception as e:
+                    print(f"[groomer] {rid} err: {e}")
+        except Exception as e:
+            print(f"[groomer] outer err: {e}")
+        await asyncio.sleep(600)  # every 10 min
+
+
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot v3.8 BEAST MODE | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot v3.9 BEAST MODE | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK} | Max peers per room: {MAX_PEERS_PER_ROOM}")
+    print(f"Memory caps: {MAX_CHAT_MESSAGES} msgs/room, {IMAGE_RETAIN_COUNT} recent images, {MAX_IMAGE_BYTES//1000}KB per img")
     servers = await get_ice_servers()
     print(f"ICE servers configured: {len(servers)} entries")
     has_premium = bool(METERED_API_KEY or CF_TURN_TOKEN_ID or CUSTOM_TURN_URL)
@@ -2876,11 +2943,13 @@ async def main():
         print("!" * 60)
     print("v3.8: 15-peer cap, shared AudioContext, 4-tier bitrate,")
     print("v3.8: speaking throttle, scaled timers, signaling-state recovery")
+    print("v3.9: memory caps + groomer (fits Render free tier)")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
         run_kyodo_bot(),
         keepalive(),
+        memory_groomer(),
     )
 
 
