@@ -1,45 +1,39 @@
 """
-Silent Hill Voice Call Bot — v3.9 BEAST MODE (RENDER-FREE-TIER FRIENDLY)
+Silent Hill Voice Call Bot — v3.10 BEAST MODE (STICKERS + GROW-INPUT)
 ═══════════════════════════════════════════════════════════════════════════════
-v3.9 — MEMORY HARDENING (fits in 512 MB Render free tier):
+v3.10 — STICKERS & GROWING TEXT INPUT:
 
-  THE PROBLEM (from real Render OOM email):
-    Long calls with many image messages caused chat JSON files to grow
-    unboundedly. Every chat append did read-modify-write of the entire
-    file, and json.loads/dumps temporarily doubles RAM. A 30 MB file
-    being grown by 100 peers all sending images = 100+ MB RAM spike,
-    breaching the 512 MB tier. Process gets OOM-killed and restarts.
+  NEW IN v3.10:
+    1. STICKERS PANEL — like Kyodo. A sticker icon sits on the right side
+       INSIDE the message input. Tap → bottom sheet opens with all stickers
+       from the `stickers/` folder (s1.jpg, s2.jpg, ...). Tap a sticker to
+       send. Sheet closes automatically. The icon hides when the user is
+       typing and reappears when the input is empty.
+    2. STICKERS ARE LIVE — server reads the `stickers/` directory on every
+       /stickers request, so adding s12.jpg to GitHub instantly appears in
+       all rooms (no restart needed). No build step.
+    3. STICKERS RENDER WITHOUT A BUBBLE — they appear inline at small size
+       (max 140px), not clickable, no chrome around them. Just like Kyodo.
+    4. REPLY-TO-STICKER works — replies show "Sticker" as the preview.
+    5. STICKERS RESPECT MEMORY CAPS — when a message ages out beyond
+       IMAGE_RETAIN_COUNT, its sticker reference is stripped just like
+       images. (Stickers are URLs not base64 so RAM impact is tiny, but we
+       keep the same expiry semantics for consistency.)
+    6. AUTO-GROWING TEXT INPUT — was a single-line input that hid text
+       when it overflowed. Now a textarea that grows up to 3 lines, then
+       scrolls internally. Enter sends, Shift+Enter inserts a newline.
+       Identical look at rest.
 
-  v3.9 FIXES:
-    1. MAX_CHAT_MESSAGES (default 200) — chat file capped, oldest dropped.
-    2. IMAGE_RETAIN_COUNT (default 30) — only the most recent N messages
-       keep their image base64. Older messages keep text/metadata but
-       drop image data. Massive savings: 1 image ≈ 400 KB, 30 images
-       capped ≈ 12 MB max per room.
-    3. MAX_IMAGE_BYTES (default 400 KB, was 600 KB) — slightly smaller
-       per-image cap. JPEG quality difference is invisible.
-    4. /history payload to new joiners strips images from messages older
-       than IMAGE_RETAIN_COUNT — they see "[Image no longer available]"
-       placeholder for old images, full images for recent ones.
-    5. memory_groomer() background task — every 10 min, walks all chat
-       files >200 KB and re-applies the caps. Catches edge cases.
-    6. Client renders image_expired flag as a tasteful inline placeholder
-       with an SVG icon, not a broken image.
-    All caps configurable via env vars.
-
-  PRESERVED FROM v3.8:
-    • 15-peer mesh cap, 4-tier adaptive bitrate, shared AudioContext
-    • Smart dot colors (red only when audio truly broken, not just lossy)
-    • Scroll lock + jump-to-latest with unread badge
-    • Clean transparent typing indicator
-    • Avatar center-crop (no stretching)
-    • Host badge for anyone named "Sor" (case-insensitive)
-    • All v3.x WebRTC reliability fixes
+  PRESERVED FROM v3.9:
+    • Memory hardening: MAX_CHAT_MESSAGES, IMAGE_RETAIN_COUNT, MAX_IMAGE_BYTES
+    • memory_groomer() background task
+    • image_expired placeholder rendering
+    • All v3.8 WebRTC reliability and big-room scaling
 
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
-import asyncio, json, os, time, uuid, hmac, hashlib, base64
+import asyncio, json, os, re, time, uuid, hmac, hashlib, base64
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -66,13 +60,21 @@ PORT = int(os.environ.get("PORT", "8000"))
 # Room capacity. v3.8 hardened to 15 peers. Configurable via env var.
 MAX_PEERS_PER_ROOM = int(os.environ.get("MAX_PEERS_PER_ROOM", "15"))
 
-# v3.9 memory hardening: hard caps to prevent chat-file bloat on free Render tier.
-# Render free = 512 MB RAM. Without these, a long call with many images can
-# inflate a single chat file to 30+ MB, and json_read+json_write doubles RAM
-# during the read-modify-write cycle.
+# v3.9 memory hardening
 MAX_CHAT_MESSAGES = int(os.environ.get("MAX_CHAT_MESSAGES", "200"))
 IMAGE_RETAIN_COUNT = int(os.environ.get("IMAGE_RETAIN_COUNT", "30"))
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", "400000"))  # was 600000
+
+# v3.10 stickers folder. Anything in this folder ending in .jpg/.jpeg/.png/.webp
+# becomes a sticker. The server lists the directory live on each /stickers
+# request, so adding files via GitHub redeploy or even a manual file drop
+# makes them available immediately. Filenames must match SAFE_STICKER_NAME.
+STICKERS_DIR = os.environ.get("STICKERS_DIR", "stickers")
+STICKER_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+# Strict allowlist on filenames to prevent any path-traversal or weirdness:
+# letters, digits, dots, dashes, underscores. Max length 64 to keep WS payloads
+# tiny and to discourage anyone from stuffing data into filenames.
+SAFE_STICKER_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 # TURN provider env vars
 METERED_API_KEY = os.environ.get("METERED_API_KEY", "")
@@ -105,6 +107,38 @@ def json_read(p: str, default=None):
             return json.load(f)
     except Exception:
         return default
+
+
+def list_stickers() -> List[str]:
+    """Walk STICKERS_DIR and return a sorted list of valid sticker filenames.
+    Called live on every /stickers request — no caching. The dir is tiny
+    and this lets new GitHub commits show up instantly. Robust against
+    missing dir, weird filenames, hidden files."""
+    try:
+        if not os.path.isdir(STICKERS_DIR):
+            return []
+        out = []
+        for fn in os.listdir(STICKERS_DIR):
+            if fn.startswith("."):
+                continue
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in STICKER_EXTS:
+                continue
+            if not SAFE_STICKER_NAME.match(fn):
+                continue
+            out.append(fn)
+        # Natural-ish sort: s1, s2, s10 (not s1, s10, s2). Falls back to
+        # plain string sort for any name that doesn't match s\d+\..+
+        def sort_key(n: str):
+            m = re.match(r"^s(\d+)\.", n, re.IGNORECASE)
+            if m:
+                return (0, int(m.group(1)), n)
+            return (1, 0, n.lower())
+        out.sort(key=sort_key)
+        return out
+    except Exception as e:
+        print(f"[stickers] list err: {e}")
+        return []
 
 
 # ─── TURN CREDENTIAL FETCHING ───────────────────────────────────────────────
@@ -315,7 +349,8 @@ app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"ok": True, "rooms": len(rooms), "kyodo": KYODO_OK, "max_peers": MAX_PEERS_PER_ROOM}
+    return {"ok": True, "rooms": len(rooms), "kyodo": KYODO_OK,
+            "max_peers": MAX_PEERS_PER_ROOM, "stickers": len(list_stickers())}
 
 
 @app.get("/bg.jpg")
@@ -326,6 +361,42 @@ async def bg():
 @app.get("/ci.jpg")
 async def ci():
     return FileResponse("ci.jpg") if os.path.exists("ci.jpg") else HTMLResponse("", 404)
+
+
+# ── v3.10 sticker endpoints ───────────────────────────────────────────────
+# /stickers : returns the live list of available sticker filenames so the
+#             client can render the sticker picker. No caching — adding a
+#             file to GitHub appears in all open rooms on next pick-open.
+# /stickers/{name} : serves the actual file with strict filename validation.
+@app.get("/stickers")
+async def stickers_list():
+    files = list_stickers()
+    return JSONResponse({"stickers": files, "count": len(files)})
+
+
+@app.get("/stickers/{name}")
+async def sticker_file(name: str):
+    # Defense in depth: we already strip-filter at list time, but a direct
+    # request must also be sanitized in case anyone tries clever paths.
+    if not SAFE_STICKER_NAME.match(name):
+        return HTMLResponse("bad name", 400)
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in STICKER_EXTS:
+        return HTMLResponse("bad ext", 400)
+    path = os.path.join(STICKERS_DIR, name)
+    # Resolve to absolute and re-check the file lives inside STICKERS_DIR.
+    # Belt-and-braces against any creative \, /, or .. that slipped past
+    # SAFE_STICKER_NAME (it shouldn't, but cost is zero).
+    real = os.path.realpath(path)
+    base = os.path.realpath(STICKERS_DIR)
+    if not real.startswith(base + os.sep) and real != base:
+        return HTMLResponse("nope", 400)
+    if not os.path.isfile(real):
+        return HTMLResponse("not found", 404)
+    # Cache aggressively — sticker bytes never change. If you replace s1.jpg
+    # with new content, change the filename (s1b.jpg) or strip the ETag
+    # header server-side. For now: 1 hour cache is a good balance.
+    return FileResponse(real, headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.get("/turn")
@@ -383,6 +454,7 @@ async def turn_debug():
         "max_peers_per_room": MAX_PEERS_PER_ROOM,
         "active_rooms": len(rooms),
         "room_sizes": room_sizes,
+        "sticker_count": len(list_stickers()),
         "entries": sanitized,
     })
 
@@ -410,10 +482,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
     room = rooms[room_id]
 
     # ── ROOM CAPACITY ENFORCEMENT (server is source of truth) ──
-    # The 12th person (or whatever MAX_PEERS_PER_ROOM+1) gets a clean
-    # "room_full" message and the WS closes. Their browser shows the
-    # beige full-room screen with a person SVG. When someone leaves,
-    # the slot frees up — they can refresh and join.
     if len(room["peers"]) >= MAX_PEERS_PER_ROOM:
         try:
             await ws.send_json({
@@ -464,19 +532,30 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
     print(f"[WS] {peer_id} ({name}) joined room={room_id} host={is_host} total={len(room['peers'])}/{MAX_PEERS_PER_ROOM}")
 
     await ws.send_json({"type": "your_id", "id": peer_id, "max_peers": MAX_PEERS_PER_ROOM})
+
+    # v3.10: also send the current sticker list on join, so the picker is
+    # ready to open instantly without an extra round trip. Client also
+    # refreshes from /stickers each open in case new files have arrived.
+    await ws.send_json({"type": "stickers", "stickers": list_stickers()})
+
     # v3.9: build history payload with bounded memory cost. Send last 100
-    # messages but strip image data from all but the most recent 30 — keeps
-    # context for new joiners without sending megabytes of base64 over WS.
+    # messages but strip image/sticker data from all but the most recent 30.
     full_history = json_read(room["chat_file"])
     history_slice = full_history[-100:] if full_history else []
     if len(history_slice) > IMAGE_RETAIN_COUNT:
-        keep_images_from = len(history_slice) - IMAGE_RETAIN_COUNT
+        keep_from = len(history_slice) - IMAGE_RETAIN_COUNT
         for i, m in enumerate(history_slice):
-            if i < keep_images_from and isinstance(m, dict) and m.get("image"):
-                # Send shape-preserving placeholder so the message still renders
-                m = {**m, "image": "", "image_expired": True}
+            if i < keep_from and isinstance(m, dict):
+                if m.get("image"):
+                    m = {**m, "image": "", "image_expired": True}
+                # v3.10: also expire stickers in old messages, mirrors images.
+                # In practice stickers are URL strings so the RAM saving is
+                # tiny; this is for behavioral consistency more than memory.
+                if m.get("sticker"):
+                    m = {**m, "sticker": "", "sticker_expired": True}
                 history_slice[i] = m
     await ws.send_json({"type": "history", "messages": history_slice})
+
     peer_list = [
         {"id": p, "name": room["peers"][p]["name"], "avatar": room["peers"][p]["avatar"],
          "is_host": room["peers"][p]["is_host"], "muted": room["peers"][p]["muted"]}
@@ -534,8 +613,23 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                 if image and (not isinstance(image, str) or len(image) > MAX_IMAGE_BYTES
                               or not image.startswith("data:image/")):
                     image = ""
-                if not text and not image:
+
+                # v3.10 sticker handling. Client sends just the filename
+                # (e.g. "s3.jpg"); we validate and verify it exists. Stickers
+                # are URLs not base64, so bandwidth/storage cost is trivial.
+                sticker_raw = msg.get("sticker", "") or ""
+                sticker = ""
+                if sticker_raw and isinstance(sticker_raw, str) and len(sticker_raw) <= 64:
+                    if SAFE_STICKER_NAME.match(sticker_raw):
+                        ext = os.path.splitext(sticker_raw)[1].lower()
+                        if ext in STICKER_EXTS:
+                            sp = os.path.join(STICKERS_DIR, sticker_raw)
+                            if os.path.isfile(sp):
+                                sticker = sticker_raw
+
+                if not text and not image and not sticker:
                     continue
+
                 reply_to = None
                 rt = msg.get("reply_to")
                 if isinstance(rt, dict):
@@ -544,6 +638,8 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                         "name": str(rt.get("name", ""))[:30],
                         "text": str(rt.get("text", ""))[:80],
                         "has_image": bool(rt.get("has_image")),
+                        # v3.10: replies-to-stickers
+                        "has_sticker": bool(rt.get("has_sticker")),
                     }
                 cm = {"type": "chat", "kind": "user",
                       "id": str(uuid.uuid4())[:12],
@@ -552,6 +648,8 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                       "time": datetime.now().isoformat()}
                 if image:
                     cm["image"] = image
+                if sticker:
+                    cm["sticker"] = sticker
                 if reply_to:
                     cm["reply_to"] = reply_to
                 _append_msg(room_id, cm)
@@ -668,8 +766,8 @@ async def _noshow(room_id):
 def _append_msg(rid, msg):
     """Append a message to the room's chat file. v3.9 memory hardening:
     - Caps file at MAX_CHAT_MESSAGES (200) — drops oldest beyond that.
-    - Strips images from messages older than IMAGE_RETAIN_COUNT (30) so
-      long calls don't accumulate hundreds of MB of base64 in one file.
+    - Strips images from messages older than IMAGE_RETAIN_COUNT (30).
+    v3.10: also strips stickers (URL strings, but kept consistent).
     """
     p = f"{rid}_chat.json"
     m = json_read(p, [])
@@ -679,15 +777,17 @@ def _append_msg(rid, msg):
     if len(m) > MAX_CHAT_MESSAGES:
         m = m[-MAX_CHAT_MESSAGES:]
 
-    # Strip images from older messages (keep only the most recent N with images)
-    # This is the big memory win: old image base64 is by far the biggest payload.
+    # Expire image/sticker payloads on older messages
     if len(m) > IMAGE_RETAIN_COUNT:
         cutoff = len(m) - IMAGE_RETAIN_COUNT
         for i in range(cutoff):
-            if isinstance(m[i], dict) and m[i].get("image"):
-                # Replace image with marker, keep rest of message intact
-                m[i]["image"] = ""
-                m[i]["image_expired"] = True
+            if isinstance(m[i], dict):
+                if m[i].get("image"):
+                    m[i]["image"] = ""
+                    m[i]["image_expired"] = True
+                if m[i].get("sticker"):
+                    m[i]["sticker"] = ""
+                    m[i]["sticker_expired"] = True
 
     json_write(p, m)
 
@@ -743,12 +843,26 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .msg-bubble.has-img{padding:4px;overflow:hidden}
 .msg-bubble.has-img.has-text{padding-bottom:8px}
 .msg-bubble.has-img .msg-text{padding:4px 10px 0}
+
+/* ───── STICKERS (v3.10) ───── */
+/* A sticker message renders WITHOUT a bubble — just the image inline next to
+   the avatar and name header. Max 140px on any side, no chrome, not clickable
+   to open a preview. Like Kyodo, like Telegram, like Discord. */
+.msg-row.sticker .msg-bubble,
+.msg-row.has-sticker-only .msg-bubble{background:transparent;padding:0;border-radius:0}
+.sticker-img{max-width:140px;max-height:140px;width:auto;height:auto;display:block;margin:2px 0;user-select:none;-webkit-user-select:none;pointer-events:none}
+.sticker-expired{display:inline-flex;align-items:center;gap:6px;padding:8px 10px;border-radius:10px;background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.55);font-size:12px;font-style:italic;margin:2px 0}
+.sticker-expired svg{width:16px;height:16px;flex-shrink:0;opacity:0.6}
+
 .msg-reply{border-left:3px solid rgba(255,255,255,0.55);padding:4px 8px;margin-bottom:4px;font-size:12px;background:rgba(255,255,255,0.08);border-radius:6px;display:flex;flex-direction:column;gap:1px;max-width:240px}
 .msg-bubble.has-img .msg-reply{margin:4px 4px 4px}
 .msg-reply-name{font-weight:600;color:rgba(255,255,255,0.95);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .msg-reply-text{opacity:0.75;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* If the replied-to message contains ONLY a sticker, the reply preview lives
+   above the sticker image instead of inside a bubble (since stickers have no
+   bubble). Keep the reply card width sane. */
+.msg-row.has-sticker-only .msg-reply{max-width:200px;margin-bottom:6px}
 
-/* ───── JUMP TO LATEST BUTTON (v3.7) ───── */
 .jump-latest{position:absolute;right:14px;bottom:14px;width:42px;height:42px;border-radius:50%;background:#007aff;color:#fff;border:none;display:none;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.5);z-index:6;animation:msgIn .2s}
 .jump-latest.show{display:flex}
 .jump-latest svg{width:20px;height:20px;pointer-events:none}
@@ -764,22 +878,57 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .img-preview-overlay img{max-width:95vw;max-height:90vh;border-radius:8px}
 .img-preview-overlay .close-hint{position:absolute;top:20px;right:20px;color:#fff;font-size:32px;opacity:0.7}
 
-/* ───── TYPING INDICATOR (v3.7 - clean, transparent, inline) ───── */
 .typing-bar{position:relative;z-index:10;background:transparent;padding:2px 14px 4px;font-size:11px;color:rgba(255,255,255,0.55);font-style:italic;flex-shrink:0;min-height:18px;line-height:1.3;letter-spacing:0.2px}
 .typing-bar.hidden{display:none!important}
 
-.input-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:8px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0}
+/* ───── INPUT BAR (v3.10 — textarea + sticker icon inside input) ───── */
+/* The input bar gets a wrapper around the textarea so we can absolutely
+   position the sticker icon inside it on the right. The textarea grows
+   from 1 line up to 3 lines (max-height: 84px), then scrolls internally. */
+.input-bar{position:relative;z-index:10;background:rgba(13,13,13,0.95);border-top:1px solid rgba(255,255,255,0.06);padding:8px 12px;display:flex;align-items:flex-end;gap:8px;flex-shrink:0}
 .input-attach,.input-send{width:38px;height:38px;border-radius:50%;border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0}
 .input-attach{background:#2c2c2e;color:#fff;font-size:18px}
-.input-field{flex:1;height:38px;border-radius:19px;border:none;background:#1c1c1e;color:#fff;padding:0 14px;font-size:14px;outline:none}
-.input-field::placeholder{color:#8e8e93}
 .input-send{background:#007aff;color:#fff;font-size:16px}
 .input-send:active{transform:scale(.92)}
-.mic-btn{width:32px;height:32px;border-radius:50%;border:none;background:#3a3a3c;color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:.2s;padding:0}
+/* Wrapper is what the textarea + sticker icon live in. Padding-right gives
+   the sticker icon a reserved 38px gutter so the cursor never collides. */
+.input-wrap{flex:1;position:relative;display:flex;align-items:flex-end;background:#1c1c1e;border-radius:19px;min-height:38px;max-height:84px;transition:none}
+.input-field{flex:1;width:100%;border:none;background:transparent;color:#fff;padding:9px 44px 9px 14px;font-size:14px;outline:none;line-height:1.4;font-family:inherit;resize:none;max-height:84px;overflow-y:auto;-webkit-appearance:none;appearance:none;border-radius:19px}
+.input-field::placeholder{color:#8e8e93}
+.input-field::-webkit-scrollbar{width:0}
+/* Sticker icon button — sits absolutely inside the input wrapper on the
+   right edge, vertically anchored to the bottom row of the textarea so it
+   stays in line with the cursor when the textarea grows. Hidden when the
+   user has typed any text. */
+.sticker-btn{position:absolute;right:4px;bottom:3px;width:32px;height:32px;border-radius:50%;border:none;background:transparent;color:#8e8e93;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0;transition:color .15s,opacity .15s,transform .15s}
+.sticker-btn:active{transform:scale(.9)}
+.sticker-btn:hover{color:#fff}
+.sticker-btn svg{width:22px;height:22px;pointer-events:none}
+.sticker-btn.hidden{opacity:0;pointer-events:none;transform:scale(.8)}
+.mic-btn{width:32px;height:32px;border-radius:50%;border:none;background:#3a3a3c;color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:.2s;padding:0;align-self:flex-end;margin-bottom:3px}
 .mic-btn.muted{background:#ff3b30}
 .mic-btn svg{width:16px;height:16px;pointer-events:none}
+.input-attach{align-self:flex-end}
+.input-send{align-self:flex-end}
 .leave-header-btn{width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:none;border:none;color:#ff3b30;cursor:pointer;padding:0}
 .leave-header-btn svg{width:20px;height:20px}
+
+/* ───── STICKER PICKER PANEL (v3.10 — bottom sheet, Kyodo-style) ───── */
+.sticker-panel{position:fixed;left:0;right:0;bottom:0;z-index:120;background:rgba(20,20,22,0.98);backdrop-filter:blur(20px);border-top-left-radius:18px;border-top-right-radius:18px;border-top:1px solid rgba(255,255,255,0.08);max-height:55vh;display:flex;flex-direction:column;transform:translateY(100%);transition:transform .25s cubic-bezier(.2,.7,.2,1);box-shadow:0 -8px 24px rgba(0,0,0,0.4);padding-bottom:env(safe-area-inset-bottom)}
+.sticker-panel.open{transform:translateY(0)}
+.sticker-panel-handle{width:44px;height:5px;border-radius:3px;background:rgba(255,255,255,0.18);margin:8px auto 4px;flex-shrink:0}
+.sticker-panel-header{display:flex;align-items:center;justify-content:space-between;padding:6px 16px 10px;flex-shrink:0}
+.sticker-panel-title{font-size:16px;font-weight:600;color:#fff}
+.sticker-panel-close{width:30px;height:30px;border-radius:50%;border:none;background:rgba(255,255,255,0.08);color:#fff;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1}
+.sticker-grid{flex:1;overflow-y:auto;padding:4px 12px 16px;display:grid;grid-template-columns:repeat(4,1fr);gap:8px;align-content:start}
+.sticker-grid::-webkit-scrollbar{width:0}
+.sticker-cell{aspect-ratio:1;background:rgba(255,255,255,0.04);border-radius:12px;display:flex;align-items:center;justify-content:center;cursor:pointer;overflow:hidden;border:none;padding:6px;transition:transform .12s,background .12s}
+.sticker-cell:active{transform:scale(.93);background:rgba(255,255,255,0.08)}
+.sticker-cell img{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;pointer-events:none}
+.sticker-empty{grid-column:1/-1;text-align:center;padding:32px 12px;color:#8e8e93;font-size:13px;line-height:1.5}
+.sticker-backdrop{position:fixed;inset:0;z-index:115;background:rgba(0,0,0,0.4);opacity:0;pointer-events:none;transition:opacity .2s}
+.sticker-backdrop.open{opacity:1;pointer-events:auto}
+
 .overlay{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.88);display:flex;align-items:center;justify-content:center}
 .o-box{background:#1c1c1e;border-radius:16px;padding:24px;width:90%;max-width:340px;text-align:center}
 .o-box h2{font-size:18px;margin-bottom:8px}
@@ -804,7 +953,6 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 @keyframes pulse{50%{opacity:0.4}}
 .hidden{display:none!important}
 
-/* ───── ROOM FULL SCREEN (v3.7 - beige, person SVG, no emoji) ───── */
 .room-full{position:fixed;inset:0;z-index:400;background:#e8dcc4;color:#3a2e1f;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;text-align:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
 .room-full-icon{width:96px;height:96px;background:#3a2e1f;border-radius:50%;display:flex;align-items:center;justify-content:center;margin-bottom:20px}
 .room-full-icon svg{width:54px;height:54px;color:#e8dcc4}
@@ -860,20 +1008,34 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 <button class="input-attach" onclick="document.getElementById('imgIn').click()" title="Send image">+</button>
 <button class="mic-btn" id="muteBtn" onclick="toggleMute()" title="Mute"><svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
 <input type="file" id="imgIn" accept="image/*" style="display:none" onchange="pickChatImage(event)">
-<input type="text" class="input-field" id="msgIn" placeholder="Write a message..." onkeypress="if(event.key==='Enter')sendMsg()">
+<div class="input-wrap">
+  <textarea class="input-field" id="msgIn" placeholder="Write a message..." rows="1" maxlength="1000"></textarea>
+  <button class="sticker-btn" id="stickerBtn" onclick="toggleStickerPanel()" title="Stickers" aria-label="Open stickers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 13.5V8a3 3 0 0 0-3-3H6a3 3 0 0 0-3 3v8a3 3 0 0 0 3 3h5.5"/><path d="M21 13.5L13.5 21a4.5 4.5 0 0 1 0-9"/><path d="M13.5 21A4.5 4.5 0 0 1 18 16.5"/></svg></button>
+</div>
 <button class="input-send" onclick="sendMsg()">&#10148;</button>
 </div>
 </div>
 
+<!-- v3.10: sticker bottom sheet + dim backdrop -->
+<div class="sticker-backdrop" id="stickerBackdrop" onclick="closeStickerPanel()"></div>
+<div class="sticker-panel" id="stickerPanel" role="dialog" aria-label="Stickers">
+  <div class="sticker-panel-handle"></div>
+  <div class="sticker-panel-header">
+    <div class="sticker-panel-title">Stickers</div>
+    <button class="sticker-panel-close" onclick="closeStickerPanel()" aria-label="Close stickers">&times;</button>
+  </div>
+  <div class="sticker-grid" id="stickerGrid"></div>
+</div>
+
 <script>
 // ════════════════════════════════════════════════════════════════════════════
-// SILENT HILL CLIENT — v3.7 BEAST MODE (10–11 PEER MESH)
+// SILENT HILL CLIENT — v3.10 BEAST MODE (STICKERS + GROW-INPUT)
 // ════════════════════════════════════════════════════════════════════════════
 
 const ROOM = "__ROOM_ID__", TOKEN = "__TOKEN__";
 const MAX_PEERS = parseInt("__MAX_PEERS__", 10) || 11;
 let MY_ID = "";
-let serverMaxPeers = MAX_PEERS;  // refreshed from server's 'your_id' message
+let serverMaxPeers = MAX_PEERS;
 let ws = null, localStream = null, myName = "", myAvatar = "";
 let isMuted = false, isHost = false;
 let leaving = false;
@@ -909,6 +1071,12 @@ let lastMuteToggleAt = 0;
 const frozenJitterCounts = {};
 const frozenJitterValues = {};
 
+// v3.10: list of available stickers (filenames). Refreshed on join and
+// every time the user opens the picker, so adding a file to the GitHub
+// stickers/ folder appears without restart.
+let stickerList = [];
+let stickerPanelOpen = false;
+
 let ICE_SERVERS = [
   {urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302']},
   {urls: 'turn:openrelay.metered.ca:443?transport=tcp',
@@ -933,8 +1101,6 @@ function getPCConfig(forceRelay) {
     iceServers: ICE_SERVERS,
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
-    // v3.8: trimmed 4 → 2. At 15 peers, pool=4 was 60 pre-gathered candidates
-    // per client, with diminishing returns. 2 is plenty for fast ICE.
     iceCandidatePoolSize: 2,
     iceTransportPolicy: forceRelay ? 'relay' : 'all',
     sdpSemantics: 'unified-plan'
@@ -953,14 +1119,6 @@ function log(m) {
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// v3.8 ADAPTIVE BITRATE (mesh-friendly for 15-person rooms) — 4 TIERS
-// ════════════════════════════════════════════════════════════════════════════
-// 1-4 peers   : 32 kbps  (best quality)
-// 5-7 peers   : 24 kbps  (excellent voice)
-// 8-11 peers  : 20 kbps  (great voice)
-// 12+ peers   : 16 kbps  (intelligible — Opus is magical at this rate)
-// ════════════════════════════════════════════════════════════════════════════
 function adaptiveBitrate() {
   const n = peerMap.size;
   if (n >= 12) return 16;
@@ -970,7 +1128,6 @@ function adaptiveBitrate() {
 }
 
 function statsIntervalMs() {
-  // Less frequent stats checks in big rooms = less CPU on phones
   const n = peerMap.size;
   if (n >= 12) return 8000;
   if (n >= 8) return 6000;
@@ -978,7 +1135,6 @@ function statsIntervalMs() {
 }
 
 function connTimerMs() {
-  // More peers = more contention during initial setup → more grace
   const n = peerMap.size;
   if (n >= 12) return 18000;
   if (n >= 8) return 14000;
@@ -1004,11 +1160,6 @@ function pickAv(e) {
       const sz = 128;
       c.width = c.height = sz;
       const ctx = c.getContext('2d');
-      // v3.8 FIX: center-crop to square to prevent stretching/squeezing.
-      // Was: drawImage(img, 0, 0, sz, sz) — forced any aspect ratio into 128×128
-      // square, which horizontally squished portraits and vertically squished
-      // landscapes. Now we crop to a centered square first, then draw it
-      // filling the canvas. Same approach Instagram/WhatsApp use.
       const srcSize = Math.min(img.width, img.height);
       const srcX = (img.width - srcSize) / 2;
       const srcY = (img.height - srcSize) / 2;
@@ -1026,10 +1177,46 @@ document.getElementById('nameIn').addEventListener('input', e => {
   if (!myAvatar) document.getElementById('avInit').textContent = myName ? myName[0].toUpperCase() : '?';
 });
 
-(function wireTyping() {
+// ════════════════════════════════════════════════════════════════════════════
+// v3.10 INPUT WIRING — typing indicator + auto-grow + sticker icon visibility
+// ════════════════════════════════════════════════════════════════════════════
+// The input is now a textarea (was <input>). Three things happen on input:
+//   1. Typing indicator broadcast (unchanged behavior, just moved into the
+//      same listener so we don't bind twice).
+//   2. Auto-grow: height scales with content from 1 line up to 3 lines, then
+//      internal scroll kicks in. Recomputed every keystroke.
+//   3. Sticker icon visibility: hidden the moment any character is present,
+//      shown again when the input goes empty (matches what Kyodo does).
+// ════════════════════════════════════════════════════════════════════════════
+
+const INPUT_MAX_HEIGHT = 84;  // ~3 lines at 14px / 1.4 line-height with padding
+const INPUT_MIN_HEIGHT = 38;  // matches the resting height (rows=1)
+
+function autoResizeInput() {
+  const el = document.getElementById('msgIn');
+  if (!el) return;
+  // Reset to minimum so shrink-on-delete works, then grow to scrollHeight,
+  // capped at MAX. After cap, native overflow:auto handles the scrolling.
+  el.style.height = 'auto';
+  const h = Math.min(el.scrollHeight, INPUT_MAX_HEIGHT);
+  el.style.height = Math.max(h, INPUT_MIN_HEIGHT) + 'px';
+}
+
+function updateStickerIconVisibility() {
+  const inEl = document.getElementById('msgIn');
+  const btn = document.getElementById('stickerBtn');
+  if (!inEl || !btn) return;
+  if (inEl.value.length > 0) btn.classList.add('hidden');
+  else btn.classList.remove('hidden');
+}
+
+(function wireInput() {
   const inEl = document.getElementById('msgIn');
   if (!inEl) return;
+
   inEl.addEventListener('input', () => {
+    autoResizeInput();
+    updateStickerIconVisibility();
     if (!ws || ws.readyState !== 1) return;
     ws.send(JSON.stringify({ type: 'typing_start' }));
     if (typingTimer) clearTimeout(typingTimer);
@@ -1037,6 +1224,14 @@ document.getElementById('nameIn').addEventListener('input', e => {
       if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'typing_stop' }));
       typingTimer = null;
     }, 2000);
+  });
+
+  // Enter sends, Shift+Enter inserts newline. Matches every modern chat.
+  inEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      sendMsg();
+    }
   });
 })();
 
@@ -1070,12 +1265,94 @@ async function fetchIceServers() {
   } catch (e) {}
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// v3.10 STICKERS — fetch list, render grid, send, panel open/close
+// ════════════════════════════════════════════════════════════════════════════
+async function fetchStickerList() {
+  try {
+    const r = await fetch('/stickers', { cache: 'no-store' });
+    if (r.ok) {
+      const data = await r.json();
+      if (Array.isArray(data.stickers)) {
+        stickerList = data.stickers;
+        log("stickers: " + stickerList.length + " available");
+        return;
+      }
+    }
+  } catch (e) {
+    log("sticker list fetch failed: " + e.message);
+  }
+}
+
+function renderStickerGrid() {
+  const grid = document.getElementById('stickerGrid');
+  if (!grid) return;
+  if (!stickerList || stickerList.length === 0) {
+    grid.innerHTML = '<div class="sticker-empty">No stickers yet.<br>Drop images into the <code>stickers/</code> folder.</div>';
+    return;
+  }
+  // Build buttons. We use buttons (not divs) for keyboard a11y.
+  const html = stickerList.map(name => {
+    const safe = esc(name);
+    return '<button class="sticker-cell" type="button" data-name="' + safe + '" aria-label="' + safe + '"><img src="/stickers/' + safe + '" alt="" loading="lazy"></button>';
+  }).join('');
+  grid.innerHTML = html;
+  // Wire up click handlers (delegation would also work but explicit is clearer)
+  grid.querySelectorAll('.sticker-cell').forEach(cell => {
+    cell.addEventListener('click', () => {
+      const name = cell.getAttribute('data-name');
+      if (name) sendStickerMsg(name);
+    });
+  });
+}
+
+async function toggleStickerPanel() {
+  if (stickerPanelOpen) closeStickerPanel();
+  else await openStickerPanel();
+}
+
+async function openStickerPanel() {
+  // Refresh list each open in case new stickers landed in the folder
+  await fetchStickerList();
+  renderStickerGrid();
+  const panel = document.getElementById('stickerPanel');
+  const back = document.getElementById('stickerBackdrop');
+  if (panel) panel.classList.add('open');
+  if (back) back.classList.add('open');
+  stickerPanelOpen = true;
+  // Blur the textarea so the soft keyboard doesn't fight the bottom sheet
+  const inEl = document.getElementById('msgIn');
+  if (inEl) inEl.blur();
+}
+
+function closeStickerPanel() {
+  const panel = document.getElementById('stickerPanel');
+  const back = document.getElementById('stickerBackdrop');
+  if (panel) panel.classList.remove('open');
+  if (back) back.classList.remove('open');
+  stickerPanelOpen = false;
+}
+
+function sendStickerMsg(name) {
+  if (!ws || ws.readyState !== 1) return;
+  if (!name) return;
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
+  ws.send(JSON.stringify({ type: 'typing_stop' }));
+  const payload = { type: 'chat', text: '', sticker: name };
+  if (replyingTo) {
+    payload.reply_to = replyingTo;
+    cancelReply();
+  }
+  ws.send(JSON.stringify(payload));
+  // Close the panel right after — matches "the list will disappear" requirement
+  closeStickerPanel();
+}
+
 async function acquireWakeLock() {
   try {
     if ('wakeLock' in navigator) {
       wakeLock = await navigator.wakeLock.request('screen');
       log("wakeLock OK");
-      // iOS releases on visibility change; clear our handle so watchdog reacquires
       wakeLock.addEventListener('release', () => {
         log("wakeLock released event");
         wakeLock = null;
@@ -1207,7 +1484,6 @@ async function doJoin() {
   document.getElementById('joinBtn').textContent = "...";
 
   try {
-    // v3.8: use the shared AudioContext from the start
     remoteAudioCtx = getSharedAC();
     if (remoteAudioCtx.state === 'suspended') await remoteAudioCtx.resume();
     const silentBuf = remoteAudioCtx.createBuffer(1, remoteAudioCtx.sampleRate * 0.1, remoteAudioCtx.sampleRate);
@@ -1220,6 +1496,8 @@ async function doJoin() {
   } catch (e) { log("audio unlock fail: " + e.message); }
 
   await fetchIceServers();
+  // v3.10: prefetch sticker list so the picker opens instantly first time
+  fetchStickerList();
 
   try {
     localStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
@@ -1235,6 +1513,9 @@ async function doJoin() {
   startWakeLockWatch();
   startAudioSelfHeal();
   setupScrollLock();
+  // v3.10: ensure correct initial sizing for the textarea
+  autoResizeInput();
+  updateStickerIconVisibility();
 
   if (_peerLevelTicker) clearInterval(_peerLevelTicker);
   _peerLevelTicker = setInterval(updPeerLevels, 150);
@@ -1242,22 +1523,16 @@ async function doJoin() {
   connectWS();
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// v3.7 ROOM FULL SCREEN (beige, person SVG, no emoji)
-// ════════════════════════════════════════════════════════════════════════════
 function showRoomFullScreen(current, max) {
-  // Tear down everything we set up — we're not joining the call
   leaving = true;
   if (ws && ws.readyState === 1) { try { ws.close(); } catch (e) {} }
   cleanupRTC();
 
-  // Hide other UI
   const app = document.getElementById('app');
   const ovl = document.getElementById('joinOvl');
   if (app) app.classList.add('hidden');
   if (ovl) ovl.classList.add('hidden');
 
-  // Build the full screen if not already present
   let el = document.getElementById('roomFullScreen');
   if (el) el.remove();
   el = document.createElement('div');
@@ -1306,7 +1581,6 @@ function connectWS() {
         break;
 
       case 'room_full':
-        // v3.7: server says the room is at capacity
         gotRoomFull = true;
         log("room full: " + m.current + "/" + m.max);
         showRoomFullScreen(m.current, m.max);
@@ -1318,9 +1592,18 @@ function connectWS() {
         log("myId=" + MY_ID + " maxPeers=" + serverMaxPeers);
         break;
 
+      // v3.10: server pushes the current sticker list on join. Client
+      // also re-fetches via /stickers each time the picker opens to catch
+      // brand-new files that landed mid-session.
+      case 'stickers':
+        if (Array.isArray(m.stickers)) {
+          stickerList = m.stickers;
+          log("stickers (push): " + stickerList.length);
+        }
+        break;
+
       case 'history':
         m.messages.forEach(renderMsg);
-        // Initial paint: snap to bottom regardless of scroll lock state
         scrollToLatest(false, true);
         break;
 
@@ -1337,8 +1620,6 @@ function connectWS() {
             peerMap.delete(id);
           }
         }
-        // v3.7: stagger initial offers in big rooms to avoid SDP collision storms
-        // v3.8: bumped 50ms → 80ms for 15-peer reliability (signaling needs breathing room)
         let staggerIdx = 0;
         for (const p of m.peers) {
           addPeer(p);
@@ -1363,7 +1644,6 @@ function connectWS() {
         } else if (MY_ID) {
           log("late: I'm smaller -> wait for offer from " + m.peer.id);
         }
-        // v3.7: re-apply bitrate budget — room got bigger
         applyBitrateToAll();
         break;
 
@@ -1374,7 +1654,6 @@ function connectWS() {
         renderSys(m.name + ' left');
         updCount();
         updPeers();
-        // v3.7: room shrunk — bump everyone's bitrate back up
         applyBitrateToAll();
         break;
 
@@ -1469,7 +1748,6 @@ function connectWS() {
   ws.onclose = e => {
     log("WS close " + e.code);
     if (gotRoomFull || e.code === 4003) {
-      // Server told us room is full. Don't reconnect — user must press retry.
       return;
     }
     if (!leaving) {
@@ -1500,7 +1778,6 @@ function addPeer(p) {
 }
 
 function updCount() {
-  // v3.7: show capacity in the header for awareness
   const total = peerMap.size + 1;
   document.getElementById('mcount').textContent = total + '/' + serverMaxPeers + ' in call';
 }
@@ -1513,32 +1790,19 @@ function updPeers() {
   peerMap.forEach((p, id) => {
     let dot = '';
     if (p.connState === 'connected') {
-      // ════════════════════════════════════════════════════════════════════
-      // v3.8 DOT LOGIC — color reflects ACTUAL audio health, not just loss
-      // ════════════════════════════════════════════════════════════════════
-      // Old: smoothed loss > 8% → RED, even if you could still hear them fine.
-      //      Misleading: a network spike showed RED while the call was working.
-      // New: RED only when audio is actually broken (no real audio heard for
-      //      8+ seconds AND elevated packet loss). Otherwise: GREEN if direct,
-      //      ORANGE if on relay, YELLOW if loss is bad but you can still hear.
-      // ════════════════════════════════════════════════════════════════════
       const smoothed = lossEwma[id] !== undefined ? lossEwma[id] : (p.lossPct || 0);
       const onRelay = peerRelay[id] || p.usedRelay;
       const muted = p.muted;
       const heardRecently = p.lastHeardAt && (Date.now() - p.lastHeardAt) < 8000;
       const noPacketsArriving = (p.recvRate !== undefined) && (p.recvRate < 1);
 
-      // Truly broken: no audio heard in 8s AND no packets arriving AND not muted.
-      // (If muted, no audio is expected, so silence is normal.)
       const audioActuallyBroken = !muted && !heardRecently && noPacketsArriving && smoothed > 15;
 
       if (audioActuallyBroken) {
-        dot = 'fail';            // RED — they really can't hear / be heard
+        dot = 'fail';
       } else if (onRelay) {
-        // On relay: orange if loss is mild, yellow-warn if loss is elevated
         dot = (smoothed > 12) ? 'warn' : 'relay';
       } else {
-        // Direct: green if loss is fine, yellow-warn if elevated
         dot = (smoothed > 12) ? 'warn' : 'conn';
       }
     } else if (p.connState === 'failed' || p.connState === 'closed') dot = 'fail';
@@ -1573,15 +1837,6 @@ function updPeerLevels() {
 }
 let _peerLevelTicker = null;
 
-// ════════════════════════════════════════════════════════════════════════════
-// v3.7 SCROLL LOCK + JUMP TO LATEST
-// ════════════════════════════════════════════════════════════════════════════
-// If the user has scrolled UP to read history, new messages don't yank them
-// back down. A floating ⬇ button (SVG) appears at bottom-right with a counter
-// of unread messages. Click → smooth-scroll to bottom and clear badge.
-// Auto-scroll resumes when the user scrolls back near the bottom (within 80px).
-// ════════════════════════════════════════════════════════════════════════════
-
 let userIsAtBottom = true;
 let unreadCount = 0;
 const NEAR_BOTTOM_PX = 80;
@@ -1594,11 +1849,9 @@ function setupScrollLock() {
     const wasAtBottom = userIsAtBottom;
     userIsAtBottom = distFromBottom <= NEAR_BOTTOM_PX;
     if (userIsAtBottom && !wasAtBottom) {
-      // Just returned to bottom — clear unread state
       unreadCount = 0;
       updateJumpButton();
     } else if (userIsAtBottom) {
-      // Stayed at bottom; ensure button is hidden
       if (unreadCount !== 0) { unreadCount = 0; updateJumpButton(); }
     }
   }, { passive: true });
@@ -1641,10 +1894,6 @@ function updateJumpButton() {
     }
   }
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-// ZOMBIE DETECTION (preserved from v3.1)
-// ════════════════════════════════════════════════════════════════════════════
 
 let _zombieCounts = {};
 let _zombieCooldowns = {};
@@ -1695,7 +1944,6 @@ function startConnectionTimer(pid) {
   const pc = peers[pid];
   if (!pc || pc._connTimer) return;
   pc._connTimerFires = pc._connTimerFires || 0;
-  // v3.7: scale timer with room size — more peers, more contention, more grace
   const timeoutMs = connTimerMs();
   pc._connTimer = setTimeout(() => {
     pc._connTimer = null;
@@ -1908,8 +2156,6 @@ async function handleOffer(from, sdp) {
         try {
           await existing.setLocalDescription({ type: 'rollback' });
         } catch (rollbackErr) {
-          // v3.8: rare big-room race — rollback can fail if the PC is
-          // in a weird intermediate state. Fall through to full rebuild.
           log("rollback FAILED " + from + ": " + rollbackErr.message + " -> rebuild");
           throw rollbackErr;
         }
@@ -2055,14 +2301,6 @@ function preferOpusAndTune(sdp) {
   return out.join('\r\n');
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// v3.8 SHARED AUDIO CONTEXT
-// ════════════════════════════════════════════════════════════════════════════
-// iOS Safari has a hard limit (~6) on simultaneous AudioContexts. Old code
-// created one per inbound level meter + one for local — at 15 peers that's
-// 16 contexts, and Safari silently failed after the 6th. Result: speaking
-// indicators stopped working for half the room. Now everyone shares one.
-// ════════════════════════════════════════════════════════════════════════════
 let _sharedAC = null;
 function getSharedAC() {
   if (!_sharedAC) {
@@ -2081,7 +2319,7 @@ function startInboundLevel(stream, pid) {
   }
   try {
     const ac = getSharedAC();
-    if (!remoteAudioCtx) remoteAudioCtx = ac; // back-compat alias
+    if (!remoteAudioCtx) remoteAudioCtx = ac;
     const src = ac.createMediaStreamSource(stream);
     const analyser = ac.createAnalyser();
     analyser.fftSize = 256;
@@ -2096,9 +2334,6 @@ function startInboundLevel(stream, pid) {
       if (p) {
         p.recvLevel = level;
         p.actuallyHeard = level > 0.02;
-        // v3.8: track last time we heard real audio. Used by the dot color
-        // logic to distinguish "currently silent (probably fine)" from
-        // "haven't heard them in 10s while loss is bad (actually broken)".
         if (level > 0.02) p.lastHeardAt = Date.now();
       }
     }, 200);
@@ -2272,7 +2507,6 @@ function startStats(pc, pid) {
   lossEwma[pid] = 0;
   delete sustainedBadStart[pid];
 
-  // v3.7: stats interval scales with room size (4s normally, 6s when 8+ peers)
   const intervalMs = statsIntervalMs();
 
   statsTimers[pid] = setInterval(async () => {
@@ -2490,8 +2724,6 @@ async function scheduleRetry(pid) {
   p._retrying = true;
   p.retries = (p.retries || 0) + 1;
 
-  // v3.8: scale retry ceiling with room size. More peers = more transient
-  // flakes during the initial setup storm — don't give up too fast.
   const maxRetries = peerMap.size >= 12 ? 5 : 4;
   if (p.retries > maxRetries) {
     log("GIVE UP on " + pid + " (after " + maxRetries + " retries)");
@@ -2529,7 +2761,6 @@ let localAnalyser = null, localLevelTimer = null;
 function setupLocalLevelMonitor() {
   if (!localStream) return;
   try {
-    // v3.8: use the shared AudioContext (was creating its own — wasteful on iOS)
     const ac = getSharedAC();
     const src = ac.createMediaStreamSource(localStream);
     localAnalyser = ac.createAnalyser();
@@ -2537,9 +2768,6 @@ function setupLocalLevelMonitor() {
     src.connect(localAnalyser);
     const data = new Uint8Array(localAnalyser.frequencyBinCount);
     let lastSent = 0, lastLevel = 0;
-    // v3.8: throttle speaking broadcasts. Was firing on every level change
-    // (~5/sec per active speaker). Now max ~2/sec. In a 15-person room with
-    // 4 simultaneous speakers, cuts WS traffic from ~300/s to ~120/s.
     const MIN_BROADCAST_INTERVAL = 500;
     localLevelTimer = setInterval(() => {
       if (isMuted || !localStream) return;
@@ -2552,8 +2780,6 @@ function setupLocalLevelMonitor() {
       const wasSpeaking = lastLevel > 0.05;
       const stateChanged = speaking !== wasSpeaking;
       const enoughTimePassed = now - lastSent >= MIN_BROADCAST_INTERVAL;
-      // Always broadcast on state change (start/stop speaking) but rate-limit
-      // continuation pings while still actively speaking
       if (stateChanged || (speaking && enoughTimePassed)) {
         if (ws && ws.readyState === 1) {
           ws.send(JSON.stringify({ type: 'speaking', level: speaking ? level : 0 }));
@@ -2614,8 +2840,6 @@ function toggleMute() {
   updPeers();
 }
 
-// ─── IMAGE ATTACHMENTS + REPLY-TO-MESSAGE ──────────────────────────────────
-
 let replyingTo = null;
 
 function pickChatImage(e) {
@@ -2670,12 +2894,19 @@ function sendImageMsg(dataUrl) {
 function startReply(m) {
   if (!m || m.kind === 'system') return;
   const txt = (m.text || '').trim();
-  const snippet = txt ? txt.slice(0, 80) : (m.image ? 'Image' : '');
+  // v3.10: include sticker preview text. If the message is purely a sticker
+  // (no text, no image), the reply preview just says "Sticker".
+  let snippet;
+  if (txt) snippet = txt.slice(0, 80);
+  else if (m.image || m.image_expired) snippet = 'Image';
+  else if (m.sticker || m.sticker_expired) snippet = 'Sticker';
+  else snippet = '';
   replyingTo = {
     id: m.id || '',
     name: m.name || '?',
     text: snippet,
-    has_image: !!m.image
+    has_image: !!(m.image || m.image_expired),
+    has_sticker: !!(m.sticker || m.sticker_expired)
   };
   showReplyBar();
   const inEl = document.getElementById('msgIn');
@@ -2691,9 +2922,12 @@ function showReplyBar() {
     const inputBar = document.querySelector('.input-bar');
     if (inputBar) inputBar.parentNode.insertBefore(el, inputBar);
   }
-  const previewText = (replyingTo.has_image && !replyingTo.text)
-    ? 'Image'
-    : (replyingTo.text || '');
+  // Decide preview text: prefer the snippet, fall back to "Image"/"Sticker"
+  let previewText = replyingTo.text || '';
+  if (!previewText) {
+    if (replyingTo.has_sticker) previewText = 'Sticker';
+    else if (replyingTo.has_image) previewText = 'Image';
+  }
   el.innerHTML =
     '<div class="reply-bar-content">' +
       '<span class="reply-bar-label">Replying to ' + esc(replyingTo.name) + '</span>' +
@@ -2719,8 +2953,6 @@ function openImagePreview(src) {
 function renderMsg(m) {
   const c = document.getElementById('msgs'); if (!c) return;
 
-  // v3.7: capture scroll state BEFORE appending so we can decide whether
-  // to auto-scroll (user at bottom) or hold position (user reading history)
   const wasAtBottom = isAtBottom();
 
   if (m.kind === 'system') {
@@ -2732,16 +2964,21 @@ function renderMsg(m) {
     const isSelf = !!m.self;
     const pi = peerMap.get(m.peer_id) || {};
     const name = m.name || pi.name || '?';
-    // v3.8 FIX: host badge is name-based, not is_host-based.
-    // Was: showBadge = isH && name === 'Sor'
-    //   • isH required is_host=True, which only the FIRST joiner gets.
-    //   • So if Sor wasn't first to join the room, no badge.
-    //   • Also case-sensitive, so "sor" or "SOR" wouldn't trigger it.
-    // Now: any message from someone named Sor (case-insensitive) shows Host.
     const showBadge = name.trim().toLowerCase() === 'sor';
     const avSrc = m.avatar || pi.avatar || '';
+
+    // v3.10: detect "sticker-only" messages — no text, no image, just a
+    // sticker (or expired sticker). These render WITHOUT a bubble so the
+    // sticker floats next to the avatar like in Kyodo/Telegram.
+    const hasSticker = !!(m.sticker || m.sticker_expired);
+    const hasImage = !!(m.image || m.image_expired);
+    const hasText = !!(m.text && m.text.length > 0);
+    const stickerOnly = hasSticker && !hasText && !hasImage;
+
     const row = document.createElement('div');
     row.className = 'msg-row ' + (isSelf ? 'self' : 'other');
+    if (stickerOnly) row.classList.add('has-sticker-only');
+
     let avHTML;
     if (avSrc) avHTML = '<div class="avatar"><img src="' + esc(avSrc) + '"></div>';
     else avHTML = '<div class="avatar"><span>' + esc(name[0].toUpperCase()) + '</span></div>';
@@ -2750,30 +2987,55 @@ function renderMsg(m) {
     let replyHTML = '';
     if (m.reply_to) {
       const r = m.reply_to;
-      const previewText = (r.has_image && !r.text) ? 'Image' : (r.text || '');
+      let previewText = r.text || '';
+      if (!previewText) {
+        if (r.has_sticker) previewText = 'Sticker';
+        else if (r.has_image) previewText = 'Image';
+      }
       replyHTML = '<div class="msg-reply">' +
                     '<span class="msg-reply-name">' + esc(r.name || '?') + '</span>' +
                     '<span class="msg-reply-text">' + esc(previewText) + '</span>' +
                   '</div>';
     }
-    let imgHTML = '';
-    if (m.image) {
-      imgHTML = '<img class="chat-img" src="' + esc(m.image) + '" alt="image">';
-    } else if (m.image_expired) {
-      // v3.9: image was stripped from history to save memory; show a tasteful placeholder
-      imgHTML = '<div class="img-expired"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg><span>Image no longer available</span></div>';
+
+    // Build the body content. Order matters: reply preview, then sticker
+    // (if sticker-only — it lives outside any bubble), or else image, then
+    // text, all wrapped in a bubble.
+    let contentHTML;
+    if (stickerOnly) {
+      // No bubble — reply preview (if any) and the sticker itself sit
+      // directly inside the msg-content column.
+      let stickerHTML;
+      if (m.sticker_expired) {
+        stickerHTML = '<div class="sticker-expired"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg><span>Sticker no longer available</span></div>';
+      } else {
+        stickerHTML = '<img class="sticker-img" src="/stickers/' + esc(m.sticker) + '" alt="sticker" draggable="false">';
+      }
+      contentHTML = header + replyHTML + stickerHTML;
+    } else {
+      // Standard bubble path. Preserves all existing image+text behavior.
+      let imgHTML = '';
+      if (m.image) {
+        imgHTML = '<img class="chat-img" src="' + esc(m.image) + '" alt="image">';
+      } else if (m.image_expired) {
+        imgHTML = '<div class="img-expired"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg><span>Image no longer available</span></div>';
+      }
+      let textHTML = '';
+      if (m.text) textHTML = '<div class="msg-text">' + esc(m.text) + '</div>';
+      let bubbleClass = 'msg-bubble';
+      if (m.image) bubbleClass += ' has-img';
+      if (m.image && m.text) bubbleClass += ' has-text';
+      const bubbleInner = replyHTML + imgHTML + (textHTML || (m.image ? '' : esc(m.text)));
+      contentHTML = header + '<div class="' + bubbleClass + '">' + bubbleInner + '</div>';
     }
-    let textHTML = '';
-    if (m.text) textHTML = '<div class="msg-text">' + esc(m.text) + '</div>';
-    let bubbleClass = 'msg-bubble';
-    if (m.image) bubbleClass += ' has-img';
-    if (m.image && m.text) bubbleClass += ' has-text';
-    const bubbleInner = replyHTML + imgHTML + (textHTML || (m.image ? '' : esc(m.text)));
-    row.innerHTML = avHTML + '<div class="msg-content">' + header +
-                    '<div class="' + bubbleClass + '">' + bubbleInner + '</div></div>';
+
+    row.innerHTML = avHTML + '<div class="msg-content">' + contentHTML + '</div>';
 
     row.addEventListener('click', (ev) => {
       const t = ev.target;
+      // chat-img → open preview. sticker-img is pointer-events:none so it
+      // never reaches here, which is exactly what we want (stickers are
+      // not clickable to zoom — matches the requirement).
       if (t.classList && t.classList.contains('chat-img')) {
         ev.stopPropagation();
         openImagePreview(t.src);
@@ -2786,12 +3048,9 @@ function renderMsg(m) {
     c.appendChild(row);
   }
 
-  // v3.7 SCROLL LOCK: respect user position
   if (m.self || wasAtBottom) {
-    // It's our own message OR we were already at bottom — scroll naturally
     scrollToLatest(false);
   } else {
-    // User is reading history — DON'T yank them. Bump unread counter.
     if (m.kind !== 'system') {
       unreadCount++;
       updateJumpButton();
@@ -2807,7 +3066,6 @@ function renderSys(t) {
   d.textContent = t;
   c.appendChild(d);
   if (wasAtBottom) scrollToLatest(false);
-  // System messages don't bump unread counter — too noisy
 }
 
 function esc(t) {
@@ -2837,6 +3095,8 @@ function renderTyping() {
 
 function sendMsg() {
   const inEl = document.getElementById('msgIn');
+  // v3.10: textarea preserves leading/trailing whitespace including newlines;
+  // .trim() also normalizes blank-only sends (e.g. someone hits Enter twice).
   const text = inEl.value.trim();
   if (!text || !ws || ws.readyState !== 1) return;
   if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
@@ -2848,6 +3108,9 @@ function sendMsg() {
   }
   ws.send(JSON.stringify(payload));
   inEl.value = '';
+  // Reset textarea height + re-show sticker icon since input is now empty
+  autoResizeInput();
+  updateStickerIconVisibility();
 }
 
 function leaveCall() {
@@ -2864,7 +3127,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.9 (max " + MAX_PEERS + " peers, mem-hardened)");
+log("page loaded v3.10 (max " + MAX_PEERS + " peers, stickers + grow-input)");
 </script>
 </body>
 </html>"""
@@ -2887,10 +3150,9 @@ async def keepalive():
 
 async def memory_groomer():
     """v3.9: periodically walks active chat files and applies the memory caps.
-    Catches edge cases: files written before caps existed, files that somehow
-    grew (e.g. burst of images all kept beyond IMAGE_RETAIN_COUNT), and just
-    generally keeps disk + RAM bounded."""
-    await asyncio.sleep(120)  # wait until app warmed up
+    v3.10: also strips stickers from old messages (mirrors the image expiry
+    in _append_msg)."""
+    await asyncio.sleep(120)
     while True:
         try:
             for rid in list(rooms.keys()):
@@ -2899,7 +3161,6 @@ async def memory_groomer():
                     continue
                 try:
                     sz = os.path.getsize(f)
-                    # Only bother reading the file if it's gotten genuinely big
                     if sz < 200_000:
                         continue
                     msgs = json_read(f, [])
@@ -2909,9 +3170,13 @@ async def memory_groomer():
                     if len(msgs) > IMAGE_RETAIN_COUNT:
                         cutoff = len(msgs) - IMAGE_RETAIN_COUNT
                         for i in range(cutoff):
-                            if isinstance(msgs[i], dict) and msgs[i].get("image"):
-                                msgs[i]["image"] = ""
-                                msgs[i]["image_expired"] = True
+                            if isinstance(msgs[i], dict):
+                                if msgs[i].get("image"):
+                                    msgs[i]["image"] = ""
+                                    msgs[i]["image_expired"] = True
+                                if msgs[i].get("sticker"):
+                                    msgs[i]["sticker"] = ""
+                                    msgs[i]["sticker_expired"] = True
                     json_write(f, msgs)
                     new_sz = os.path.getsize(f)
                     if new_sz < sz - 50_000:
@@ -2920,14 +3185,15 @@ async def memory_groomer():
                     print(f"[groomer] {rid} err: {e}")
         except Exception as e:
             print(f"[groomer] outer err: {e}")
-        await asyncio.sleep(600)  # every 10 min
+        await asyncio.sleep(600)
 
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot v3.9 BEAST MODE | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot v3.10 BEAST MODE | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK} | Max peers per room: {MAX_PEERS_PER_ROOM}")
     print(f"Memory caps: {MAX_CHAT_MESSAGES} msgs/room, {IMAGE_RETAIN_COUNT} recent images, {MAX_IMAGE_BYTES//1000}KB per img")
+    print(f"Stickers folder: {STICKERS_DIR!r} | available now: {len(list_stickers())}")
     servers = await get_ice_servers()
     print(f"ICE servers configured: {len(servers)} entries")
     has_premium = bool(METERED_API_KEY or CF_TURN_TOKEN_ID or CUSTOM_TURN_URL)
@@ -2944,6 +3210,7 @@ async def main():
     print("v3.8: 15-peer cap, shared AudioContext, 4-tier bitrate,")
     print("v3.8: speaking throttle, scaled timers, signaling-state recovery")
     print("v3.9: memory caps + groomer (fits Render free tier)")
+    print("v3.10: stickers panel + auto-growing textarea")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
