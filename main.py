@@ -3111,6 +3111,12 @@ function sendMsg() {
   // Reset textarea height + re-show sticker icon since input is now empty
   autoResizeInput();
   updateStickerIconVisibility();
+  // v3.10.1: keep the mobile keyboard up after sending. Without this, the
+  // keyboard collapses on every send because some mobile browsers blur the
+  // textarea when the value is reset programmatically. Refocusing keeps the
+  // keyboard visible until the user manually dismisses it via the system
+  // keyboard's down-arrow / dismiss button.
+  inEl.focus();
 }
 
 function leaveCall() {
@@ -3127,7 +3133,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.10 (max " + MAX_PEERS + " peers, stickers + grow-input)");
+log("page loaded v3.10.1 (max " + MAX_PEERS + " peers, stickers + grow-input + keyboard-stay)");
 </script>
 </body>
 </html>"""
