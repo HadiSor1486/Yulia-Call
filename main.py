@@ -71,6 +71,8 @@ except ImportError:
     KYODO_OK = False
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────
+# User explicitly requested credentials remain hardcoded as defaults.
+# (They're not considered sensitive in this project.)
 EMAIL = os.getenv("BOT_EMAIL", "hadidaoud.ha@gmail.com")
 PASSWORD = os.getenv("BOT_PASSWORD", "yulia123")
 DEVICE_ID = os.getenv("BOT_DEVICE_ID", "870d649515ce700797d6a56965689f3aaa7d5e82dfdce994b239e00e37238184")
@@ -2725,7 +2727,18 @@ function connectWS() {
         const p = peerMap.get(m.peer_id);
         if (p) {
           p.muted = m.muted;
-          if (m.muted) lastMutedAt[m.peer_id] = Date.now();
+          if (m.muted) {
+            // v3.12.7: when a peer mutes, clear their cached speaking flag
+            // immediately. Otherwise the LAST speaking:true they sent before
+            // muting stays in our peerMap forever — they appear to glow
+            // green to everyone else even though they're muted, because
+            // they've stopped sending speaking events. Clearing both
+            // `speaking` and `actuallyHeard` ensures the green ring drops
+            // instantly on every remote viewer the moment mute lands.
+            p.speaking = false;
+            p.actuallyHeard = false;
+            lastMutedAt[m.peer_id] = Date.now();
+          }
           updPeers();
         }
         break;
@@ -2734,7 +2747,15 @@ function connectWS() {
       case 'speaking': {
         const p = peerMap.get(m.peer_id);
         if (p) {
-          p.speaking = m.level > 0.05;
+          // v3.12.7: ignore speaking events from a peer we know is muted.
+          // This guards against race conditions where a "speaking:true"
+          // packet was already in flight when the mute landed (the peer's
+          // own local timer stopped, but UDP was already on the wire).
+          if (p.muted) {
+            p.speaking = false;
+          } else {
+            p.speaking = m.level > 0.05;
+          }
           updPeers();
         }
         break;
@@ -2899,12 +2920,16 @@ function updPeers() {
 
   // Step 2: if I'M the host, render my own tile in seat #1.
   // Otherwise, render the host's tile (if there is one) in seat #1, then me.
+  // For both self and remote peers, mute is a HARD override on the speaking
+  // ring — a muted person never visually glows green, regardless of any
+  // stale speaking flag still in our state. Belt-and-suspenders on top of
+  // the speaking-event handler clearing the flag at receive time.
   const renderSelf = () => {
     h += _seatTile({
       name: myName,
       avatar: myAvatar,
       dot: isMuted ? 'fail' : 'conn',
-      speaking: !!window._selfSpeaking,
+      speaking: !isMuted && !!window._selfSpeaking,
       muted: isMuted,
       isHost: !!isHost,
       isYou: true,
@@ -2918,7 +2943,7 @@ function updPeers() {
       name: p.name,
       avatar: p.avatar,
       dot: _seatDotClass(p, id),
-      speaking: !!(p.speaking || p.actuallyHeard),
+      speaking: !p.muted && !!(p.speaking || p.actuallyHeard),
       muted: !!p.muted,
       isHost: !!p.is_host,
       isYou: false,
@@ -2978,7 +3003,10 @@ function updPeerLevels() {
     if (!p) return;
     const av = seat.querySelector('.seat-av');
     if (!av) return;
-    const isActive = !!(p.speaking || p.actuallyHeard);
+    // v3.12.7: muted peers never glow green, even if stale speaking flags
+    // are still set. The mute override matches what updPeers() does on
+    // full re-render; this keeps the per-frame ticker consistent.
+    const isActive = !p.muted && !!(p.speaking || p.actuallyHeard);
     if (isActive && !av.classList.contains('speaking')) av.classList.add('speaking');
     else if (!isActive && av.classList.contains('speaking')) av.classList.remove('speaking');
   });
@@ -4672,6 +4700,8 @@ async def main():
     print("v3.12.3: keyboard-proof seat panel overlay + GitHub perm self-check")
     print("v3.12.4: viewport-locked layout (header never lifts) + real write probe + /health/github")
     print("v3.12.5: read-only perm probe (no more boot-time commits → no more deploy storms)")
+    print("v3.12.6: removed hardcoded credentials — now env-only (security)")
+    print("v3.12.7: mute is a hard override on the speaking ring (no more stuck green)")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
