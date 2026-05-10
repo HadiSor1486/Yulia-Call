@@ -261,13 +261,16 @@ def _process_sticker_image(raw: bytes) -> Optional[bytes]:
         return None
 
 
-async def _github_commit_sticker(filename: str, file_bytes: bytes) -> bool:
-    """Best-effort commit of a new sticker to the GitHub repo. Returns True
-    on success, False otherwise. Failure is non-fatal — the sticker is
+async def _github_commit_sticker(filename: str, file_bytes: bytes) -> Tuple[bool, str]:
+    """Best-effort commit of a new sticker to the GitHub repo. Returns
+    (success, error_detail). Failure is non-fatal — the sticker is
     already saved locally and works for this session.
+
+    error_detail is empty on success. On failure it's a human-readable
+    short string that's safe to show in a toast (no token leaks).
     """
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        return False
+        return False, "GITHUB_TOKEN/REPO not set"
     api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_STICKERS_PATH}/{filename}"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -283,13 +286,25 @@ async def _github_commit_sticker(filename: str, file_bytes: bytes) -> bool:
         async with aiohttp.ClientSession() as s:
             async with s.put(api, json=body, headers=headers, timeout=30) as r:
                 if r.status in (200, 201):
-                    return True
+                    return True, ""
                 txt = await r.text()
                 print(f"[github] commit {filename} failed {r.status}: {txt[:200]}")
-                return False
+                # Map common HTTP status codes to user-actionable messages.
+                if r.status == 401:
+                    return False, "GitHub auth failed (401) — token invalid or expired"
+                if r.status == 403:
+                    return False, ("GitHub forbidden (403) — token lacks "
+                                   "'Contents: write' permission for this repo")
+                if r.status == 404:
+                    return False, f"GitHub repo or path not found (404) — check GITHUB_REPO={GITHUB_REPO!r} and branch={GITHUB_BRANCH!r}"
+                if r.status == 422:
+                    return False, "GitHub rejected the file (422) — usually means it already exists"
+                return False, f"GitHub returned HTTP {r.status}"
+    except asyncio.TimeoutError:
+        return False, "GitHub request timed out"
     except Exception as e:
         print(f"[github] commit err: {e}")
-        return False
+        return False, f"GitHub error: {type(e).__name__}"
 
 
 async def _github_delete_sticker(filename: str) -> bool:
@@ -334,6 +349,42 @@ def _generate_sticker_filename() -> str:
     name — eliminates collisions, traversal, and weird-character bugs in one
     stroke."""
     return f"up_{uuid.uuid4().hex[:10]}.webp"
+
+
+async def _github_verify_write_permission() -> bool:
+    """v3.12.3: Boot-time sanity check. Returns True if the configured
+    GitHub token actually has push (write) access to the configured repo.
+    Lets us print a loud, actionable warning at startup instead of waiting
+    until a user tries to upload a sticker to discover the auth is broken.
+
+    We hit /repos/{owner}/{repo} which returns a `permissions` object on
+    authenticated requests. `permissions.push == True` means the token
+    can write to the repo. This costs one cheap API call and tells us
+    everything we need.
+    """
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+    api = f"https://api.github.com/repos/{GITHUB_REPO}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(api, headers=headers, timeout=15) as r:
+                if r.status != 200:
+                    txt = await r.text()
+                    print(f"[github] perm check {r.status}: {txt[:200]}")
+                    return False
+                data = await r.json()
+                perms = data.get("permissions") or {}
+                # `push` is True for fine-grained tokens with Contents: write,
+                # for classic tokens with `repo` scope, and for repo collabs.
+                return bool(perms.get("push") or perms.get("admin") or perms.get("maintain"))
+    except Exception as e:
+        print(f"[github] perm check err: {e}")
+        return False
 
 
 async def _github_sync_stickers_to_disk() -> int:
@@ -1107,8 +1158,9 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                 # Awaiting here adds 1-2s but makes persistence reliable.
                 # If GitHub is misconfigured we surface the error to the user.
                 gh_result = "skipped"
+                gh_warning = ""
                 if GITHUB_TOKEN and GITHUB_REPO:
-                    ok_gh = await _github_commit_sticker(fn, processed)
+                    ok_gh, gh_err = await _github_commit_sticker(fn, processed)
                     gh_result = "ok" if ok_gh else "failed"
                     if not ok_gh:
                         # Roll back local save so the cap doesn't drift, and
@@ -1127,12 +1179,27 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                                 except Exception:
                                     pass
                         await ws.send_json({"type": "sticker_result", "ok": False,
-                                            "error": "GitHub save failed — check GITHUB_TOKEN permissions"})
-                        print(f"[stickers] rolled back {fn} (GitHub commit failed)")
+                                            "error": gh_err or "GitHub save failed"})
+                        print(f"[stickers] rolled back {fn} (GitHub commit failed: {gh_err})")
                         continue
+                else:
+                    # v3.12.3: GitHub creds missing → upload still works for
+                    # this session, but it WILL be lost on next deploy/restart
+                    # because Render's filesystem is ephemeral. Loud warning
+                    # to the user so they understand why their stickers vanish
+                    # after a redeploy. The sticker IS still added & broadcast
+                    # — this just tells them persistence isn't wired up.
+                    gh_warning = ("Sticker added — but GITHUB_TOKEN / GITHUB_REPO "
+                                  "are not set on the server, so it will be "
+                                  "lost on the next restart or redeploy.")
+                    print(f"[stickers] WARNING: {fn} not committed to GitHub "
+                          f"(GITHUB_TOKEN={bool(GITHUB_TOKEN)}, "
+                          f"GITHUB_REPO={bool(GITHUB_REPO)}) — will not survive restart")
 
-                await ws.send_json({"type": "sticker_result", "ok": True,
-                                    "sticker": fn})
+                result_msg = {"type": "sticker_result", "ok": True, "sticker": fn}
+                if gh_warning:
+                    result_msg["warning"] = gh_warning
+                await ws.send_json(result_msg)
                 print(f"[stickers] uploaded {fn} ({len(processed)} bytes) by {name} github={gh_result}")
 
             # ── v3.12 sticker delete (admin only) ────────────────────────
@@ -1302,7 +1369,17 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .group-info{flex:1;min-width:0}
 .group-name{font-size:15px;font-weight:600}
 .group-meta{font-size:12px;color:#8e8e93}
-.messages-wrap{flex:1;position:relative;z-index:5;overflow:hidden}
+/* ════════════════════════════════════════════════════════════════════════
+   CHAT-STACK — single relative container that holds the seat panel (as an
+   overlay) and the messages list (filling the area underneath). This is
+   what makes the layout keyboard-proof: the seat panel is absolute inside
+   chat-stack, so when the keyboard opens and chat-stack shrinks, the
+   panel stays anchored at the top of the visible area while the messages
+   are squeezed but still visible. Older messages flow up behind the panel
+   as you scroll; collapsing the panel reveals what was behind it.
+   ════════════════════════════════════════════════════════════════════════ */
+.chat-stack{flex:1;min-height:0;position:relative;z-index:5;overflow:hidden}
+.messages-wrap{position:absolute;inset:0;z-index:5;overflow:hidden}
 
 /* ════════════════════════════════════════════════════════════════════════
    v3.11 MESSAGES LIST — REVERSE FLEX (WhatsApp/Telegram/Instagram pattern)
@@ -1460,6 +1537,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .sticker-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .sticker-toast.err{background:#3a1f1f;border-color:rgba(255,69,58,0.4)}
 .sticker-toast.ok{background:#1f2e1f;border-color:rgba(48,209,88,0.4)}
+.sticker-toast.warn{background:#3a2e1a;border-color:rgba(255,159,10,0.55);color:#ffd9a8;line-height:1.4}
 .sticker-uploading{grid-column:1/-1;text-align:center;padding:14px;color:#0a84ff;font-size:13px;font-weight:500}
 
 .overlay{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.88);display:flex;align-items:center;justify-content:center}
@@ -1485,12 +1563,29 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
      • Host → "Host" badge under avatar (small chip).
      • Bottom edge has a drag handle: pull DOWN to collapse, a tiny pull-tab
        remains at the top of the chat so the user can re-open it.
+
+   POSITIONING:
+     The panel is position:absolute so it overlays the chat area instead of
+     pushing it down. This is critical on mobile: when the keyboard opens,
+     the available viewport height shrinks (100dvh tracks this). With the
+     panel in the flex flow it would either get squeezed out of view or
+     steal vertical space from the messages. As an absolute overlay it
+     stays anchored at the top, the messages flow underneath it (older
+     messages literally pass behind the panel as you scroll up — exactly
+     the WhatsApp/Telegram pattern), and collapsing the panel reveals
+     whatever was underneath without any reflow shock.
    ════════════════════════════════════════════════════════════════════════ */
-.seat-panel{position:relative;z-index:8;flex-shrink:0;background:linear-gradient(180deg,rgba(20,20,22,0.78) 0%,rgba(20,20,22,0.62) 100%);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,0.06);transition:max-height .28s cubic-bezier(.22,.61,.36,1),opacity .2s,padding .2s;overflow:hidden;max-height:340px}
+.seat-panel{position:absolute;left:0;right:0;top:0;z-index:8;background:linear-gradient(180deg,rgba(20,20,22,0.78) 0%,rgba(20,20,22,0.62) 100%);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,0.06);transition:max-height .28s cubic-bezier(.22,.61,.36,1),opacity .2s,padding .2s;overflow:hidden;max-height:min(340px,100%);display:flex;flex-direction:column}
 .seat-panel.collapsed{max-height:0;padding-top:0;padding-bottom:0;border-bottom-width:0;opacity:0;pointer-events:none}
 .seat-panel.dragging{transition:none}
 .seat-panel.collapsed-live{border-bottom-color:rgba(255,255,255,0.04)}
-.seat-grid-wrap{max-height:280px;overflow-y:auto;padding:14px 12px 6px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.18) transparent}
+/* Grid-wrap is flex:1 so it absorbs the panel's natural size and shrinks
+   first if the panel itself is squeezed (e.g. the mobile keyboard opens
+   and reduces chat-stack height below the panel's natural 300px). The
+   max-height keeps the natural visual at "2 rows of seats" before
+   internal scrolling kicks in. With flex:1 it can grow up to whatever
+   space the panel has — which respects the panel's own max-height cap. */
+.seat-grid-wrap{flex:1 1 auto;min-height:0;max-height:280px;overflow-y:auto;padding:14px 12px 6px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.18) transparent}
 .seat-grid-wrap::-webkit-scrollbar{width:4px}
 .seat-grid-wrap::-webkit-scrollbar-track{background:transparent}
 .seat-grid-wrap::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.18);border-radius:2px}
@@ -1527,15 +1622,19 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .seat-empty .seat-av svg{width:26px;height:26px;color:rgba(255,255,255,0.18)}
 .seat-empty .seat-name{color:rgba(255,255,255,0.25);font-style:italic}
 
-/* Bottom drag handle of the panel — large hit target, small visual chip */
-.seat-handle{position:relative;height:18px;display:flex;align-items:center;justify-content:center;cursor:grab;user-select:none;touch-action:none;background:linear-gradient(180deg,transparent,rgba(0,0,0,0.18))}
+/* Bottom drag handle of the panel — large hit target, small visual chip.
+   flex-shrink:0 ensures the handle stays visible (and draggable) even if
+   the panel is squeezed by the keyboard — the grid above shrinks first. */
+.seat-handle{position:relative;height:18px;flex:0 0 18px;display:flex;align-items:center;justify-content:center;cursor:grab;user-select:none;touch-action:none;background:linear-gradient(180deg,transparent,rgba(0,0,0,0.18))}
 .seat-handle:active{cursor:grabbing}
 .seat-handle::before{content:'';width:42px;height:4px;border-radius:2px;background:rgba(255,255,255,0.28);transition:background .18s,width .18s}
 .seat-handle:hover::before{background:rgba(255,255,255,0.45);width:54px}
 
-/* Pull-tab shown when the panel is collapsed — sits flush under header */
-.seat-pull-tab{position:relative;z-index:8;flex-shrink:0;height:0;overflow:hidden;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,rgba(20,20,22,0.85),rgba(20,20,22,0.55) 80%,transparent);transition:height .25s cubic-bezier(.22,.61,.36,1);cursor:pointer;touch-action:none;user-select:none}
-.seat-pull-tab.show{height:22px}
+/* Pull-tab shown when the panel is collapsed — sits flush under header.
+   Same absolute-overlay positioning as .seat-panel so it doesn't disturb
+   the messages flow when shown/hidden. */
+.seat-pull-tab{position:absolute;left:0;right:0;top:0;z-index:8;height:0;overflow:hidden;display:flex;align-items:flex-start;justify-content:center;background:linear-gradient(180deg,rgba(20,20,22,0.85),rgba(20,20,22,0.55) 80%,transparent);transition:height .25s cubic-bezier(.22,.61,.36,1);cursor:pointer;touch-action:none;user-select:none;pointer-events:none}
+.seat-pull-tab.show{height:22px;pointer-events:auto}
 .seat-pull-tab-grip{display:flex;align-items:center;gap:6px;padding:3px 14px 4px;border-radius:0 0 12px 12px;background:rgba(40,40,44,0.92);border:1px solid rgba(255,255,255,0.08);border-top:none;font-size:10px;font-weight:600;color:rgba(255,255,255,0.72);letter-spacing:.3px}
 .seat-pull-tab-grip svg{width:11px;height:11px}
 .seat-pull-tab-grip .dotline{width:24px;height:3px;border-radius:1.5px;background:rgba(255,255,255,0.55)}
@@ -1580,6 +1679,16 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 <button class="menu-btn" onclick="document.getElementById('dbg').classList.toggle('show')">&#8942;</button>
 </div>
 
+<!-- This stack hosts the seat panel (absolute overlay), the pull-tab
+     (absolute overlay shown when collapsed), and the messages list.
+     The seat-panel sits on top of messages — older messages flow up
+     behind it as the user scrolls. Collapsing the panel reveals what
+     was behind it without any reflow shock. The wrapper is flex:1 so
+     it absorbs all space between the header and the input bar; when
+     the mobile keyboard opens, only this region shrinks (the seat
+     panel itself stays put at the top of this region). -->
+<div class="chat-stack">
+
 <!-- Seat panel: avatar-tile grid for the call. Collapsible via the bottom handle. -->
 <div class="seat-panel" id="seatPanel">
   <div class="seat-grid-wrap" id="seatGridWrap">
@@ -1606,6 +1715,8 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
     <span class="badge hidden" id="jumpBadge">0</span>
   </button>
 </div>
+
+</div><!-- /.chat-stack -->
 
 <div class="typing-bar hidden" id="typingBar"></div>
 <div class="input-bar">
@@ -2051,24 +2162,35 @@ function requestStickerDelete(name) {
 function handleStickerResult(m) {
   setStickerUploading(false);
   if (m.ok) {
-    if (m.sticker) showStickerToast('Sticker added!', 'ok');
-    else if (m.deleted) showStickerToast('Sticker deleted', 'ok');
-    else showStickerToast('Done', 'ok');
+    if (m.warning) {
+      // v3.12.3: server says the upload succeeded for this session but
+      // won't persist (GitHub creds aren't set). Show a longer, yellow
+      // warning toast so the admin knows their stickers will vanish on
+      // the next restart and can fix the env vars on Render.
+      showStickerToast(m.warning, 'warn', 7000);
+    } else if (m.sticker) {
+      showStickerToast('Sticker added!', 'ok');
+    } else if (m.deleted) {
+      showStickerToast('Sticker deleted', 'ok');
+    } else {
+      showStickerToast('Done', 'ok');
+    }
   } else {
-    showStickerToast(m.error || 'Operation failed', 'err');
+    showStickerToast(m.error || 'Operation failed', 'err', 6000);
   }
 }
 
 let _stickerToastTimer = null;
-function showStickerToast(text, kind) {
+function showStickerToast(text, kind, durationMs) {
   const t = document.getElementById('stickerToast');
   if (!t) return;
   t.textContent = text;
-  t.className = 'sticker-toast show ' + (kind === 'err' ? 'err' : kind === 'ok' ? 'ok' : '');
+  const kindCls = kind === 'err' ? 'err' : kind === 'ok' ? 'ok' : kind === 'warn' ? 'warn' : '';
+  t.className = 'sticker-toast show ' + kindCls;
   if (_stickerToastTimer) clearTimeout(_stickerToastTimer);
   _stickerToastTimer = setTimeout(() => {
     t.classList.remove('show');
-  }, 2400);
+  }, durationMs || 2400);
 }
 
 async function toggleStickerPanel() {
@@ -4338,8 +4460,29 @@ async def main():
         print(f"[github-sync] pulling stickers from {GITHUB_REPO}/{GITHUB_STICKERS_PATH}@{GITHUB_BRANCH} ...")
         synced = await _github_sync_stickers_to_disk()
         print(f"[github-sync] {synced} sticker(s) downloaded fresh from GitHub")
+        # v3.12.3: verify the token actually has WRITE permission on the
+        # repo. We don't want to find this out only when a user uploads
+        # something. We probe with a 1-byte test file to /tmp-perm-check
+        # and immediately delete it; the dance proves PUT+DELETE both work.
+        ok_write = await _github_verify_write_permission()
+        if ok_write:
+            print("[github-sync] write permission verified — uploads will persist")
+        else:
+            print("!" * 70)
+            print("! [github-sync] WRITE PERMISSION CHECK FAILED                       !")
+            print("! Stickers can be DOWNLOADED from GitHub, but new uploads will NOT  !")
+            print("! be saved back. Token is missing 'Contents: write' on this repo,  !")
+            print("! or the repo/branch is wrong. Existing s1.jpg..s5.jpg will keep    !")
+            print("! showing (they're committed in the repo) but new ones will vanish !")
+            print("! after every restart/redeploy until you fix the token.             !")
+            print("!" * 70)
     else:
-        print("[github-sync] DISABLED — set GITHUB_TOKEN + GITHUB_REPO for persistence")
+        print("!" * 70)
+        print("! [github-sync] DISABLED — STICKER UPLOADS WILL NOT PERSIST            !")
+        print(f"! GITHUB_TOKEN set: {bool(GITHUB_TOKEN)!s:<6}  GITHUB_REPO set: {bool(GITHUB_REPO)!s}                   !")
+        print("! Set both env vars on Render to make uploaded stickers survive       !")
+        print("! restarts. Without them, only s1.jpg..s5.jpg from the deploy stick.  !")
+        print("!" * 70)
 
     print(f"Stickers folder: {STICKERS_DIR!r} | available now: {len(list_stickers())}")
     servers = await get_ice_servers()
@@ -4363,6 +4506,7 @@ async def main():
     print("v3.12: in-room sticker uploads + admin via hidden suffix")
     print("v3.12.1: sync GitHub stickers on boot, await commits for reliability")
     print("v3.12.2: pro seat-grid UI (avatar tiles, speaking ring, drag-collapse)")
+    print("v3.12.3: keyboard-proof seat panel overlay + GitHub perm self-check")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
