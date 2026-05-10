@@ -2827,10 +2827,12 @@ function updCount() {
 //     - host frame (gold border) for the host
 //     - name + tiny status dot (the existing connection-quality dot logic)
 //     - "Host" chip under the host's name
-// • The grid is 3 columns wide. Six tiles fit on screen at once. With more
-//   than 6 participants, the grid scrolls vertically inside .seat-grid-wrap.
-// • Empty placeholder tiles are shown when the room isn't full (up to 6
-//   visible) so the layout stays balanced — purely cosmetic.
+// • The grid is a single horizontal row. ~3-4 tiles fit on a typical
+//   phone width without scrolling; with more peers, the row scrolls
+//   horizontally inside .seat-grid-wrap.
+// • Empty placeholder tiles are shown to communicate capacity:
+//   minimum 4 visible slots, plus 1 trailing "invite" slot once the
+//   room has 4+ people (until the 15-peer cap is reached).
 // • The whole panel is collapsible — see the seat-handle drag logic below.
 
 function _seatDotClass(p, id) {
@@ -4342,12 +4344,11 @@ function toggleMute() {
 
   if (realTrack.readyState === 'live') realTrack.enabled = !isMuted;
 
-  // v3.12.8: when muting, instantly zero out the level/speaking flags so
-  // the voice-reactive ring drops to dark on the next animation frame
-  // without waiting for the next mic-level tick.
+  // When muting, instantly zero out the speaking flag so the green
+  // ring drops on the next animation frame without waiting for the
+  // next mic-level tick.
   if (isMuted) {
     window._selfSpeaking = false;
-    window._selfLevel = 0;
   }
 
   const b = document.getElementById('muteBtn');
@@ -4734,7 +4735,7 @@ async def memory_groomer():
 
 async def main():
     print("=" * 60)
-    print(f"Silent Hill Bot v3.12.1 BEAST MODE | {WEB_APP_URL} | Port {PORT}")
+    print(f"Silent Hill Bot v3.12.13 BEAST MODE | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK} | Max peers per room: {MAX_PEERS_PER_ROOM}")
     print(f"Memory caps: {MAX_CHAT_MESSAGES} msgs/room, {IMAGE_RETAIN_COUNT} recent images, {MAX_IMAGE_BYTES//1000}KB per img")
 
@@ -4806,13 +4807,14 @@ async def main():
     print("v3.12.3: keyboard-proof seat panel overlay + GitHub perm self-check")
     print("v3.12.4: viewport-locked layout (header never lifts) + real write probe + /health/github")
     print("v3.12.5: read-only perm probe (no more boot-time commits → no more deploy storms)")
-    print("v3.12.6: removed hardcoded credentials — now env-only (security)")
+    print("v3.12.6: (rolled back — credentials kept hardcoded per user preference)")
     print("v3.12.7: mute is a hard override on the speaking ring (no more stuck green)")
     print("v3.12.8: single horizontal seat row + voice-reactive halo (real audio-driven)")
     print("v3.12.9: halo actually animates now (@property for var interp + continuous breath)")
     print("v3.12.10: trailing invite-slot — always 1 empty after real seats, capped at room max")
     print("v3.12.11: rolled back voice-reactive halo to the reliable gentle keyframe pulse")
     print("v3.12.12: hysteresis on speaking detect — snappy stop, no mid-speech flicker")
+    print("v3.12.13: cleanup pass — fixed stale comments, dead refs, banner version")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
