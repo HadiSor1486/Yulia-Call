@@ -1682,46 +1682,19 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
    overflow:hidden (which we need to keep — it's what clips the <img>
    to a perfect circle). */
 .seat-av-wrap{position:relative;width:64px;height:64px;flex-shrink:0}
-.seat-av{--lvl:0;position:relative;width:64px;height:64px;border-radius:50%;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;color:#8e8e93;overflow:hidden;border:3px solid transparent;transition:border-color .14s;box-sizing:border-box}
+.seat-av{position:relative;width:64px;height:64px;border-radius:50%;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;color:#8e8e93;overflow:hidden;border:3px solid transparent;transition:border-color .1s linear,box-shadow .1s linear;box-sizing:border-box}
 .seat-av img{width:100%;height:100%;object-fit:cover;display:block}
-.seat-av.speaking{border-color:#34c759}
-/* Voice-reactive halo: a pseudo-element behind the avatar.
-   v3.12.9 fix: CSS custom properties inside calc() don't interpolate
-   by default — they snap. So in v3.12.8 the halo looked frozen. The
-   fix is two-fold:
-     1. Register --lvl with @property so the browser knows it's a
-        <number> and CAN interpolate it across transitions. Then
-        anything using calc(... * var(--lvl)) animates smoothly.
-     2. Layer a visible scale-pulse on top, driven by the level too —
-        gives a real "breathing" feel even when level is steady.
-   Browsers without @property support (older Safari) still get the
-   transitions on opacity + transform, so the ring still moves. */
-@property --lvl {
-  syntax: '<number>';
-  inherits: true;
-  initial-value: 0;
+/* Speaking ring: a gentle, reliable keyframe pulse on the green border
+   + glow, exactly like v3.12.2 had. We tried a more elaborate voice-
+   reactive halo using CSS custom properties + @property in v3.12.8/9
+   but the cross-browser interpolation behavior wasn't consistent — on
+   some setups the halo looked frozen. The simple keyframe works
+   everywhere and reads clearly as "this person is speaking". */
+.seat-av.speaking{border-color:#34c759;box-shadow:0 0 0 2px rgba(52,199,89,0.18),0 0 14px rgba(52,199,89,0.55);animation:seatPulse 1.4s ease-in-out infinite}
+@keyframes seatPulse{
+  0%,100%{box-shadow:0 0 0 2px rgba(52,199,89,0.18),0 0 10px rgba(52,199,89,0.45)}
+  50%   {box-shadow:0 0 0 3px rgba(52,199,89,0.30),0 0 18px rgba(52,199,89,0.75)}
 }
-/* The halo: position, base styles, and the level-driven box-shadow.
-   transform/opacity are set in .speaking so a continuous breath
-   animation can play on top without fighting the static rule. */
-.seat-av::after{content:'';position:absolute;inset:-3px;border-radius:50%;pointer-events:none;box-shadow:0 0 calc(6px + 26px * var(--lvl)) calc(1px + 6px * var(--lvl)) rgba(52,199,89,calc(0.18 + 0.78 * var(--lvl)));opacity:0;transform:scale(1);transition:opacity .18s linear,box-shadow .14s ease-out;will-change:box-shadow,opacity,transform}
-/* When speaking: show the halo (opacity:1) AND run a continuous breath
-   keyframe so the ring visibly pulses even when audio level is steady.
-   The breath adds a ±6% scale + ±15% opacity ripple on a 1.4s cycle —
-   subtle enough to feel organic, not robotic. The level-driven
-   box-shadow runs in parallel, so loud speech still produces a bigger
-   bloom on top of the breath. */
-.seat-av.speaking::after{opacity:1;animation:seatHaloBreath 1.4s ease-in-out infinite}
-@keyframes seatHaloBreath{
-  0%,100%{transform:scale(calc(1 + 0.04 * var(--lvl)));opacity:0.85}
-  50%   {transform:scale(calc(1.06 + 0.08 * var(--lvl)));opacity:1}
-}
-/* Subtle continuous heartbeat for the ring border so it never looks
-   completely static when someone speaks at a steady volume. This is
-   independent of the level-driven halo above — it's a slow, gentle
-   border-color pulse that just adds life. */
-.seat-av.speaking{animation:seatBorderPulse 1.6s ease-in-out infinite}
-@keyframes seatBorderPulse{0%,100%{border-color:rgba(52,199,89,0.85)}50%{border-color:rgba(52,199,89,1)}}
 .seat-av.host-frame{border-color:rgba(255,204,0,0.85)}
 .seat-av.host-frame.speaking{border-color:#34c759}
 /* Mute badge: lives on the WRAPPER (not the clipped .seat-av), so it can
@@ -3033,25 +3006,14 @@ function updPeers() {
 }
 
 function updPeerLevels() {
-  // Cheap per-frame update: flips .speaking class AND writes a per-tile
-  // CSS variable --lvl (0..1) that the .seat-av::after halo reads from
-  // via calc(). This is what gives the green ring its real, organic
-  // voice-reactive pulse — the halo's blur, spread, and opacity all
-  // scale with --lvl. Updating a CSS custom property is cheap (no
-  // layout/paint thrash if used in already-composited properties like
-  // box-shadow and opacity).
+  // Cheap per-frame update: just flip .speaking on tiles whose state
+  // changed. The CSS keyframe seatPulse handles the actual visual
+  // animation. No level shaping or custom-property writes needed —
+  // those were part of the experimental voice-reactive halo that we
+  // rolled back in v3.12.10 because the cross-browser interpolation
+  // story for CSS custom properties wasn't reliable.
   const grid = document.getElementById('seatGrid');
   if (!grid) return;
-
-  // Tiny helper: map a raw mic level (often 0..0.3 for normal speech)
-  // to a 0..1 visual range with a soft floor and ceiling. The ^0.7
-  // gamma curve makes quiet talking visible without making loud talking
-  // overdrive into pure white. Clamp to [0, 1].
-  const shape = (raw) => {
-    if (!raw || raw < 0.04) return 0;          // below "speaking" threshold
-    const x = Math.min(1, (raw - 0.04) / 0.35); // 0..1 normalized
-    return Math.pow(x, 0.7);
-  };
 
   // ── self tile ───────────────────────────────────────────────────────
   const selfTile = grid.querySelector('.seat[data-self="1"] .seat-av');
@@ -3059,8 +3021,6 @@ function updPeerLevels() {
     const isActive = !!window._selfSpeaking && !isMuted;
     if (isActive && !selfTile.classList.contains('speaking')) selfTile.classList.add('speaking');
     else if (!isActive && selfTile.classList.contains('speaking')) selfTile.classList.remove('speaking');
-    const lvl = isActive ? shape(window._selfLevel || 0) : 0;
-    selfTile.style.setProperty('--lvl', lvl.toFixed(3));
   }
 
   // ── remote peer tiles ───────────────────────────────────────────────
@@ -3076,10 +3036,6 @@ function updPeerLevels() {
     const isActive = !p.muted && !!(p.speaking || p.actuallyHeard);
     if (isActive && !av.classList.contains('speaking')) av.classList.add('speaking');
     else if (!isActive && av.classList.contains('speaking')) av.classList.remove('speaking');
-    // v3.12.8: drive the halo intensity from the real-time inbound audio
-    // level (p.recvLevel is sampled at 200ms from the peer's MediaStream).
-    const lvl = isActive ? shape(p.recvLevel || 0) : 0;
-    av.style.setProperty('--lvl', lvl.toFixed(3));
   });
 }
 let _peerLevelTicker = null;
@@ -3788,18 +3744,48 @@ function startInboundLevel(stream, pid) {
     analyser.fftSize = 256;
     src.connect(analyser);
     const data = new Uint8Array(analyser.frequencyBinCount);
+    // ── Per-peer hysteresis state for actuallyHeard ────────────────────
+    // Same pattern as the local-mic monitor (asymmetric thresholds +
+    // release window) so the remote peer's green ring doesn't flicker
+    // between words but drops promptly when they really go quiet.
+    let heardState = false;
+    let recvSilenceStartedAt = 0;
+    const HEARD_START = 0.04;
+    const HEARD_STOP = 0.018;
+    const HEARD_RELEASE_MS = 300;  // a tad longer than local-side to
+                                   // absorb jitter from the network
     inboundLevelTimers[pid] = setInterval(() => {
       analyser.getByteFrequencyData(data);
       let sum = 0;
       for (let i = 0; i < data.length; i++) sum += data[i];
       const level = sum / data.length / 255;
       const p = peerMap.get(pid);
-      if (p) {
-        p.recvLevel = level;
-        p.actuallyHeard = level > 0.02;
-        if (level > 0.02) p.lastHeardAt = Date.now();
+      if (!p) return;
+      p.recvLevel = level;
+      // Hysteresis state machine — mirrors the local one.
+      const now = Date.now();
+      if (!heardState) {
+        if (level > HEARD_START) {
+          heardState = true;
+          recvSilenceStartedAt = 0;
+        }
+      } else {
+        if (level < HEARD_STOP) {
+          if (recvSilenceStartedAt === 0) recvSilenceStartedAt = now;
+          else if (now - recvSilenceStartedAt >= HEARD_RELEASE_MS) {
+            heardState = false;
+            recvSilenceStartedAt = 0;
+          }
+        } else {
+          recvSilenceStartedAt = 0;
+        }
       }
-    }, 200);
+      p.actuallyHeard = heardState;
+      // lastHeardAt remains driven by any audible packet (low bar) — it's
+      // used elsewhere as a "have we received audio at all recently" signal
+      // for connection-quality dots, separate from the speaking-ring logic.
+      if (level > 0.02) p.lastHeardAt = now;
+    }, 100);
   } catch (e) {
     log("inboundLevel fail " + pid + ": " + e.message);
   }
@@ -4259,6 +4245,23 @@ function setupLocalLevelMonitor() {
     src.connect(localAnalyser);
     const data = new Uint8Array(localAnalyser.frequencyBinCount);
     let lastSent = 0, lastLevel = 0;
+    // ── Hysteresis state ──────────────────────────────────────────────
+    // Two thresholds, two transitions:
+    //   • START_THRESH = 0.05 — has to clear this to flip ON. High enough
+    //     that desk fans / fridge hum don't trigger.
+    //   • STOP_THRESH = 0.025 — must drop below this to even START
+    //     considering "stopped." Lower than START so brief dips between
+    //     words ("hello, my-name is...") don't break the speaking state.
+    //   • RELEASE_MS = 250 — silence must persist this long below
+    //     STOP_THRESH before we actually flip OFF.
+    // This is the standard pattern used by Discord, Zoom, FaceTime —
+    // makes the ring feel snappy on real stops but glued during natural
+    // micro-pauses in speech.
+    const START_THRESH = 0.05;
+    const STOP_THRESH = 0.025;
+    const RELEASE_MS = 250;
+    let speakingState = false;        // the "official" on/off we broadcast
+    let silenceStartedAt = 0;         // when level first dropped below STOP_THRESH
     const MIN_BROADCAST_INTERVAL = 500;
     localLevelTimer = setInterval(() => {
       if (isMuted || !localStream) return;
@@ -4267,24 +4270,45 @@ function setupLocalLevelMonitor() {
       for (let i = 0; i < data.length; i++) sum += data[i];
       const level = sum / data.length / 255;
       const now = Date.now();
-      const speaking = level > 0.05;
-      const wasSpeaking = lastLevel > 0.05;
-      const stateChanged = speaking !== wasSpeaking;
+
+      // ── Hysteresis state machine ────────────────────────────────────
+      let newSpeaking = speakingState;
+      if (!speakingState) {
+        // Not currently speaking. Need to clear the HIGH threshold to start.
+        if (level > START_THRESH) {
+          newSpeaking = true;
+          silenceStartedAt = 0;
+        }
+      } else {
+        // Currently speaking. Stay on unless level drops below LOW threshold
+        // and stays there for RELEASE_MS.
+        if (level < STOP_THRESH) {
+          if (silenceStartedAt === 0) silenceStartedAt = now;
+          else if (now - silenceStartedAt >= RELEASE_MS) {
+            newSpeaking = false;
+            silenceStartedAt = 0;
+          }
+        } else {
+          // Brief dip didn't reach silence threshold OR silence didn't
+          // last long enough — reset the silence timer, keep glowing.
+          silenceStartedAt = 0;
+        }
+      }
+
+      const stateChanged = newSpeaking !== speakingState;
       const enoughTimePassed = now - lastSent >= MIN_BROADCAST_INTERVAL;
-      if (stateChanged || (speaking && enoughTimePassed)) {
+      if (stateChanged || (newSpeaking && enoughTimePassed)) {
         if (ws && ws.readyState === 1) {
-          ws.send(JSON.stringify({ type: 'speaking', level: speaking ? level : 0 }));
+          ws.send(JSON.stringify({ type: 'speaking', level: newSpeaking ? level : 0 }));
           lastSent = now;
         }
       }
-      // Also drive my own seat-tile green ring locally (no need to wait for
+      speakingState = newSpeaking;
+      // Drive my own seat-tile green ring locally (no need to wait for
       // a server roundtrip — feels instant and avoids the 500ms throttle).
-      window._selfSpeaking = speaking;
-      // v3.12.8: expose the raw level too, so the seat tile's voice-reactive
-      // halo can scale with real audio amplitude (not just on/off).
-      window._selfLevel = level;
+      window._selfSpeaking = speakingState;
       lastLevel = level;
-    }, 200);
+    }, 100);
   } catch (e) { log("levelMon fail"); }
 }
 
@@ -4787,6 +4811,8 @@ async def main():
     print("v3.12.8: single horizontal seat row + voice-reactive halo (real audio-driven)")
     print("v3.12.9: halo actually animates now (@property for var interp + continuous breath)")
     print("v3.12.10: trailing invite-slot — always 1 empty after real seats, capped at room max")
+    print("v3.12.11: rolled back voice-reactive halo to the reliable gentle keyframe pulse")
+    print("v3.12.12: hysteresis on speaking detect — snappy stop, no mid-speech flicker")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
