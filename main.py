@@ -809,7 +809,15 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
         await ws.close(code=4003)
         return
 
-    is_host = tok.get("creator", False) and len(room["peers"]) == 0
+    # Host is the admin user (Sor) — always, regardless of who created the
+    # Kyodo room or who joined the call first. The hidden-suffix admin auth
+    # (joining as "Sor-") is what proves identity here. This way:
+    #   • Sor always gets the Host badge + gold frame + seat #1.
+    #   • Anyone else joining first will NOT become host, even temporarily.
+    #   • If Sor leaves and rejoins, host transfers back to Sor.
+    # The old "creator AND first to join" rule is gone — the Kyodo room
+    # creator no longer matters for in-call host status.
+    is_host = is_admin
     room["peers"][peer_id] = {
         "ws": ws, "name": name, "avatar": avatar,
         "muted": False, "is_host": is_host, "is_admin": is_admin,
@@ -1488,13 +1496,22 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .seat-grid-wrap::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.18);border-radius:2px}
 .seat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px 8px;justify-items:center}
 .seat{display:flex;flex-direction:column;align-items:center;gap:6px;width:100%;min-width:0}
-.seat-av{position:relative;width:64px;height:64px;border-radius:50%;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;color:#8e8e93;overflow:hidden;flex-shrink:0;border:3px solid transparent;transition:border-color .18s,box-shadow .18s,transform .18s}
+/* Wrapper sits OUTSIDE the clipped avatar so the mute badge can overlap
+   the bottom-right edge without being chopped off by .seat-av's
+   overflow:hidden (which we need to keep — it's what clips the <img>
+   to a perfect circle). */
+.seat-av-wrap{position:relative;width:64px;height:64px;flex-shrink:0}
+.seat-av{position:relative;width:64px;height:64px;border-radius:50%;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;color:#8e8e93;overflow:hidden;border:3px solid transparent;transition:border-color .18s,box-shadow .18s,transform .18s;box-sizing:border-box}
 .seat-av img{width:100%;height:100%;object-fit:cover;display:block}
 .seat-av.speaking{border-color:#34c759;box-shadow:0 0 0 2px rgba(52,199,89,0.18),0 0 14px rgba(52,199,89,0.55);animation:seatPulse 1.4s ease-in-out infinite}
 @keyframes seatPulse{0%,100%{box-shadow:0 0 0 2px rgba(52,199,89,0.18),0 0 10px rgba(52,199,89,0.45)}50%{box-shadow:0 0 0 3px rgba(52,199,89,0.30),0 0 18px rgba(52,199,89,0.75)}}
 .seat-av.host-frame{border-color:rgba(255,204,0,0.85)}
 .seat-av.host-frame.speaking{border-color:#34c759}
-.seat-mute{position:absolute;right:-2px;bottom:-2px;width:22px;height:22px;border-radius:50%;background:#ff3b30;border:2px solid rgba(20,20,22,0.95);display:flex;align-items:center;justify-content:center;color:#fff}
+/* Mute badge: lives on the WRAPPER (not the clipped .seat-av), so it can
+   overlap the bottom-right corner of the avatar circle while sitting
+   mostly OUTSIDE the frame — matching the chat-app convention in the
+   reference screenshot. */
+.seat-mute{position:absolute;right:-4px;bottom:-2px;width:22px;height:22px;border-radius:50%;background:#ff3b30;border:2px solid rgba(20,20,22,0.95);display:flex;align-items:center;justify-content:center;color:#fff;z-index:2;box-shadow:0 2px 6px rgba(0,0,0,0.45);pointer-events:none}
 .seat-mute svg{width:11px;height:11px}
 .seat-name-row{display:flex;align-items:center;gap:5px;max-width:100%;min-width:0}
 .seat-dot{width:7px;height:7px;border-radius:50%;background:#8e8e93;flex-shrink:0;transition:background .2s,box-shadow .2s}
@@ -2619,10 +2636,15 @@ function _seatTile(opts) {
   const hostBadge = opts.isHost ? '<span class="seat-badge">Host</span>' : '';
   const nameTxt = esc(opts.name) + (opts.isYou ? ' (You)' : '');
   const pidAttr = opts.pid ? ' data-pid="' + opts.pid + '"' : ' data-self="1"';
+  // The mute badge sits on .seat-av-wrap (NOT .seat-av) so it isn't clipped
+  // by the avatar's overflow:hidden. This lets it overlap the bottom-right
+  // corner from outside the circle, matching the screenshot reference.
   return (
     '<div class="seat"' + pidAttr + '>' +
-      '<div class="seat-av' + speakingClass + hostFrame + '">' +
-        _avatarHTML(opts.name, opts.avatar) +
+      '<div class="seat-av-wrap">' +
+        '<div class="seat-av' + speakingClass + hostFrame + '">' +
+          _avatarHTML(opts.name, opts.avatar) +
+        '</div>' +
         muteBadge +
       '</div>' +
       '<div class="seat-name-row">' +
@@ -2637,7 +2659,9 @@ function _seatTile(opts) {
 function _emptySeatTile() {
   return (
     '<div class="seat seat-empty" aria-hidden="true">' +
-      '<div class="seat-av">' + EMPTY_SVG + '</div>' +
+      '<div class="seat-av-wrap">' +
+        '<div class="seat-av">' + EMPTY_SVG + '</div>' +
+      '</div>' +
       '<div class="seat-name-row"><span class="seat-name">Empty</span></div>' +
     '</div>'
   );
@@ -2647,18 +2671,40 @@ function updPeers() {
   const grid = document.getElementById('seatGrid');
   if (!grid) return;
   let h = '';
-  // Self tile first
-  h += _seatTile({
-    name: myName,
-    avatar: myAvatar,
-    dot: isMuted ? 'fail' : 'conn',
-    speaking: !!window._selfSpeaking,
-    muted: isMuted,
-    isHost: !!isHost,
-    isYou: true,
-    pid: ''
-  });
+
+  // ── Seat ordering rule ────────────────────────────────────────────────
+  // The host (Sor) ALWAYS occupies seat #1, regardless of who joined the
+  // call first. After the host comes "me" (if I'm not the host), then
+  // everyone else in their natural join order.
+  // This means: if Sor joins a room that already has people in it, his
+  // tile shows up at the top of the grid and pushes everyone down by one.
+  // If Sor is currently absent, seat #1 is just whoever else is in
+  // position; as soon as Sor rejoins, he reclaims seat #1 automatically.
+  // ──────────────────────────────────────────────────────────────────────
+
+  // Step 1: find the host among the remote peers (if any).
+  let hostPeerId = null;
   peerMap.forEach((p, id) => {
+    if (p.is_host && hostPeerId === null) hostPeerId = id;
+  });
+
+  // Step 2: if I'M the host, render my own tile in seat #1.
+  // Otherwise, render the host's tile (if there is one) in seat #1, then me.
+  const renderSelf = () => {
+    h += _seatTile({
+      name: myName,
+      avatar: myAvatar,
+      dot: isMuted ? 'fail' : 'conn',
+      speaking: !!window._selfSpeaking,
+      muted: isMuted,
+      isHost: !!isHost,
+      isYou: true,
+      pid: ''
+    });
+  };
+  const renderRemote = (id) => {
+    const p = peerMap.get(id);
+    if (!p) return;
     h += _seatTile({
       name: p.name,
       avatar: p.avatar,
@@ -2669,7 +2715,26 @@ function updPeers() {
       isYou: false,
       pid: id
     });
-  });
+  };
+
+  if (isHost) {
+    // I'm the host → seat #1 is me. Then everyone else in join order.
+    renderSelf();
+    peerMap.forEach((p, id) => renderRemote(id));
+  } else if (hostPeerId) {
+    // Host is someone else (Sor) → seat #1 is them, seat #2 is me, then
+    // everyone else (skipping the host since we already rendered them).
+    renderRemote(hostPeerId);
+    renderSelf();
+    peerMap.forEach((p, id) => {
+      if (id !== hostPeerId) renderRemote(id);
+    });
+  } else {
+    // No host present in the room right now → me first, then everyone else.
+    renderSelf();
+    peerMap.forEach((p, id) => renderRemote(id));
+  }
+
   // Pad with empty placeholder seats so the first row is visually balanced
   // (up to 6 seats — i.e. 2 rows of 3 — visible without scrolling).
   const total = peerMap.size + 1;
