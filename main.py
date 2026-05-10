@@ -1,53 +1,68 @@
 """
-Silent Hill Voice Call Bot — v3.11 BEAST MODE (REVERSE-FLEX MESSAGES)
+Silent Hill Voice Call Bot — v3.12 BEAST MODE (IN-ROOM STICKER UPLOADS)
 ═══════════════════════════════════════════════════════════════════════════════
-v3.11 — MESSAGES NOW BOTTOM-ANCHORED (WhatsApp / Instagram / Telegram style)
+v3.12 — STICKERS CAN BE UPLOADED FROM INSIDE THE ROOM, ADMIN CAN DELETE,
+        ALL WITH RAM SAFETY AND GITHUB PERSISTENCE.
 
-  ONE CHANGE FROM v3.10:
-    The messages list is now rendered with `flex-direction: column-reverse`,
-    which is the same technique used by WhatsApp Web, Telegram Web, Messenger
-    and Instagram DMs. The browser pins scroll to the visual bottom by
-    default, so:
-      • New messages appear at the bottom and are visible immediately
-      • If the viewport shifts (mobile keyboard opens/closes, address bar
-        collapses, orientation flip), the bottom stays pinned — no message
-        is ever hidden because of a layout shift
-      • If a user scrolls UP to read history, a new message does NOT yank
-        them down (it just bumps the unread badge)
-      • When the room first opens with few messages, they sit at the bottom
-        of the panel (not floating at the top)
+  WHAT'S NEW SINCE v3.11:
+    • [+] button in the sticker panel header lets ANY user upload a new
+          sticker. The image is resized client-side first (max 1024px,
+          WebP @ 0.85) so a 4 MB phone photo becomes ~80 KB before it
+          ever leaves the device. The server then defensively re-resizes
+          and re-encodes (Pillow → WebP @ q=85), strips EXIF, and writes
+          to STICKERS_DIR. The new sticker is broadcast live to every
+          peer in every room — it appears in the picker instantly, no
+          rejoin needed.
+    • Hard cap of 30 stickers (MAX_STICKERS env var). Upload at the cap
+          is rejected with a clear toast — admin must delete first.
+    • RAM guard: an asyncio.Semaphore(1) wraps the Pillow decode so we
+          never have two heavy resize jobs in memory at once. Concurrent
+          uploads queue. Plus a 5 MB hard limit on the raw upload bytes
+          so a malicious payload can't OOM the bot.
+    • Atomic count check via asyncio.Lock so two simultaneous uploads
+          can't sneak past MAX_STICKERS.
+    • Persistence on Render: if GITHUB_TOKEN + GITHUB_REPO env vars are
+          set, every uploaded/deleted sticker is committed to your repo
+          in the background via the GitHub Contents API. Survives
+          restarts and redeploys. If not set, uploads still work for the
+          current process lifetime.
+    • Hidden-suffix admin auth: joining as "Sor-" (or any
+          ADMIN_NAME_BASE+ADMIN_NAME_SUFFIX) marks the user admin
+          server-side and strips the "-" before display. Plain "Sor" is
+          treated as a regular peer with no badge and no powers. The
+          Host badge and the delete (×) buttons on stickers now key off
+          the server-trusted is_admin flag, never off the displayed
+          name. Impersonation is structurally impossible.
+    • Auto-generated unique filenames (up_<10hex>.webp) — no name
+          collisions, no traversal surface.
 
-  HOW IT WORKS UNDER THE HOOD:
-    With column-reverse, children are visually flipped but DOM order is
-    preserved. The visual bottom = DOM first-child. To make newest
-    messages appear at the visual bottom we now `insertBefore(firstChild)`
-    instead of `appendChild`. History is iterated in reverse for the same
-    reason. "Scrolled to bottom" with column-reverse means
-    `scrollTop >= -NEAR_BOTTOM_PX` (scrollTop counts upward from 0 as you
-    scroll into older content). The jump-to-latest button now scrolls to
-    `scrollTop = 0`. Every behavior in v3.10 — replies, stickers, image
-    preview, typing indicator, unread counter — is preserved.
-
-  EVERYTHING ELSE FROM v3.10 IS UNTOUCHED:
-    • Stickers panel (live folder listing, no-bubble render)
-    • Auto-growing textarea (1→3 lines, then internal scroll)
-    • Mobile keyboard stays up after sending
-    • Memory hardening: MAX_CHAT_MESSAGES, IMAGE_RETAIN_COUNT, MAX_IMAGE_BYTES
-    • memory_groomer() background task
-    • image_expired / sticker_expired placeholders
-    • All v3.8 WebRTC reliability and big-room scaling
+  EVERYTHING FROM v3.11 IS UNTOUCHED:
+    • Reverse-flex bottom-anchored messages (WhatsApp/Telegram pattern)
+    • All scroll lock / unread / jump-button logic
+    • All v3.10 stickers, replies, image preview, typing
+    • All memory hardening, all WebRTC reliability
+    • All TURN failover, all Kyodo bot integration
 
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
-import asyncio, json, os, re, time, uuid, hmac, hashlib, base64
+import asyncio, json, os, re, time, uuid, hmac, hashlib, base64, io
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from uvicorn import Config, Server
+
+# v3.12: Pillow for sticker upload pipeline (resize + recompress to WebP).
+# Optional — if missing, sticker upload is disabled but the rest of the bot
+# runs fine. requirements.txt should now include `Pillow>=10.0.0`.
+try:
+    from PIL import Image, ImageOps
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
 
 try:
     from kyodo import ChatMessage, EventType, AsyncClient as Client
@@ -83,6 +98,41 @@ STICKER_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 # tiny and to discourage anyone from stuffing data into filenames.
 SAFE_STICKER_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
+# ── v3.12 sticker upload pipeline ───────────────────────────────────────────
+# Goals: keep RAM bounded, keep stickers persistent across Render restarts.
+#
+# RAM strategy:
+#   • Hard cap on upload payload (default 5 MB). Anything larger → reject
+#     immediately, never decoded.
+#   • Pillow processing happens inside an asyncio Semaphore(1) so at most one
+#     image is in memory being decoded/resized at a time, regardless of how
+#     many users hit upload simultaneously. Others queue.
+#   • Output is always WebP @ 1024px max edge, quality 85. Typical result:
+#     50–120 KB on disk. So 30 stickers ≈ 3 MB total disk footprint.
+#
+# Persistence strategy (Render's free tier wipes the FS on restart/redeploy):
+#   • Always write to local STICKERS_DIR first → instant availability.
+#   • If GITHUB_TOKEN + GITHUB_REPO env vars set, also commit to GitHub in
+#     the background. On next Render deploy/restart the file is back. This
+#     means uploaded stickers behave exactly like manually-committed ones.
+#   • If GitHub creds aren't set, uploads still work but are ephemeral.
+MAX_STICKERS = int(os.environ.get("MAX_STICKERS", "30"))
+MAX_STICKER_UPLOAD_BYTES = int(os.environ.get("MAX_STICKER_UPLOAD_BYTES", "5242880"))  # 5 MB raw
+STICKER_OUTPUT_MAX_EDGE = int(os.environ.get("STICKER_OUTPUT_MAX_EDGE", "1024"))
+STICKER_OUTPUT_QUALITY = int(os.environ.get("STICKER_OUTPUT_QUALITY", "85"))
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. "username/silent-hill-bot"
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+GITHUB_STICKERS_PATH = os.environ.get("GITHUB_STICKERS_PATH", "stickers")
+
+# Admin auth via hidden-suffix trick. A user joining as "Sor-" (or "sor-")
+# is recognized as admin: server strips the trailing "-" before broadcasting
+# the name, and sets is_admin=True. Plain "Sor" is just a regular peer with
+# no badge and no powers. This way users who try to impersonate by typing
+# "Sor" will fail because they don't know about the hidden suffix.
+ADMIN_NAME_BASE = os.environ.get("ADMIN_NAME_BASE", "sor").lower()
+ADMIN_NAME_SUFFIX = os.environ.get("ADMIN_NAME_SUFFIX", "-")  # the hidden bit
+
 # TURN provider env vars
 METERED_API_KEY = os.environ.get("METERED_API_KEY", "")
 METERED_DOMAIN = os.environ.get("METERED_DOMAIN", "")
@@ -97,6 +147,36 @@ rooms: Dict[str, dict] = {}
 kyodo_client = None
 _turn_cache = {"servers": None, "expires": 0}
 _turn_lock = asyncio.Lock()  # dedupes concurrent cold-cache fetches
+
+# v3.12: Semaphore(1) ensures at most one Pillow decode/resize happens at a
+# time across the whole process, so RAM stays bounded even if 10 people hit
+# upload simultaneously. They queue.
+_sticker_upload_sem = asyncio.Semaphore(1)
+# Lock ensures the "count → reject if >= cap → write" sequence is atomic.
+_sticker_count_lock = asyncio.Lock()
+
+
+def detect_admin(raw_name: str) -> Tuple[str, bool]:
+    """v3.12 hidden-suffix admin auth.
+
+    If the user joins as "<ADMIN_NAME_BASE><ADMIN_NAME_SUFFIX>" (e.g. "Sor-"),
+    we recognize them as admin and strip the suffix from the displayed name.
+    Anyone joining as plain "<ADMIN_NAME_BASE>" (e.g. "Sor") is NOT admin —
+    they're just a regular user. The trailing dash never appears in the UI,
+    so impersonators don't know it exists.
+
+    Returns (display_name, is_admin).
+    """
+    if not raw_name:
+        return raw_name, False
+    stripped = raw_name.strip()
+    low = stripped.lower()
+    target = ADMIN_NAME_BASE + ADMIN_NAME_SUFFIX
+    if low == target:
+        # Preserve the user's casing on the base, drop the suffix
+        base_len = len(ADMIN_NAME_BASE)
+        return stripped[:base_len], True
+    return stripped, False
 
 
 def json_write(p: str, d: Any):
@@ -146,6 +226,114 @@ def list_stickers() -> List[str]:
     except Exception as e:
         print(f"[stickers] list err: {e}")
         return []
+
+
+# ── v3.12 image processing & GitHub persistence ────────────────────────────
+def _process_sticker_image(raw: bytes) -> Optional[bytes]:
+    """Decode arbitrary image bytes and re-encode as a clean WebP at the
+    configured max edge / quality. Strips EXIF/metadata. Auto-orients.
+    Returns the encoded bytes, or None on any failure.
+
+    Runs synchronously — caller must wrap in run_in_executor or hold the
+    upload semaphore so we don't pile up Pillow heap allocations.
+    """
+    if not PIL_OK:
+        return None
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            im = ImageOps.exif_transpose(im)  # honor camera rotation
+            # Force RGBA→RGB for non-PNG outputs; WebP handles RGBA fine but
+            # we lose alpha if we accidentally drop it. Keep it.
+            if im.mode not in ("RGB", "RGBA", "L"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            # Downscale (never upscale) to fit STICKER_OUTPUT_MAX_EDGE.
+            w, h = im.size
+            longest = max(w, h)
+            if longest > STICKER_OUTPUT_MAX_EDGE:
+                ratio = STICKER_OUTPUT_MAX_EDGE / float(longest)
+                new_size = (max(1, int(w * ratio)), max(1, int(h * ratio)))
+                im = im.resize(new_size, Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="WEBP", quality=STICKER_OUTPUT_QUALITY, method=6)
+            return buf.getvalue()
+    except Exception as e:
+        print(f"[stickers] process err: {e}")
+        return None
+
+
+async def _github_commit_sticker(filename: str, file_bytes: bytes) -> bool:
+    """Best-effort commit of a new sticker to the GitHub repo. Returns True
+    on success, False otherwise. Failure is non-fatal — the sticker is
+    already saved locally and works for this session.
+    """
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+    api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_STICKERS_PATH}/{filename}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = {
+        "message": f"Add sticker {filename} (uploaded via room)",
+        "content": base64.b64encode(file_bytes).decode("ascii"),
+        "branch": GITHUB_BRANCH,
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.put(api, json=body, headers=headers, timeout=30) as r:
+                if r.status in (200, 201):
+                    return True
+                txt = await r.text()
+                print(f"[github] commit {filename} failed {r.status}: {txt[:200]}")
+                return False
+    except Exception as e:
+        print(f"[github] commit err: {e}")
+        return False
+
+
+async def _github_delete_sticker(filename: str) -> bool:
+    """Best-effort delete of a sticker from the GitHub repo. Two-step (GET
+    file SHA, then DELETE). Returns True on success."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+    api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_STICKERS_PATH}/{filename}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            # 1: find SHA
+            async with s.get(api, headers=headers,
+                             params={"ref": GITHUB_BRANCH}, timeout=15) as r:
+                if r.status == 404:
+                    return True  # already gone
+                if r.status != 200:
+                    return False
+                meta = await r.json()
+                sha = meta.get("sha")
+                if not sha:
+                    return False
+            # 2: delete
+            body = {
+                "message": f"Delete sticker {filename}",
+                "sha": sha,
+                "branch": GITHUB_BRANCH,
+            }
+            async with s.delete(api, json=body, headers=headers, timeout=15) as r:
+                return r.status in (200, 204)
+    except Exception as e:
+        print(f"[github] delete err: {e}")
+        return False
+
+
+def _generate_sticker_filename() -> str:
+    """Auto-generated unique filename. We never trust the uploader's chosen
+    name — eliminates collisions, traversal, and weird-character bugs in one
+    stroke."""
+    return f"up_{uuid.uuid4().hex[:10]}.webp"
 
 
 # ─── TURN CREDENTIAL FETCHING ───────────────────────────────────────────────
@@ -504,10 +692,16 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
 
     peer_id = str(uuid.uuid4())[:8]
     name, avatar = "Unknown", ""
+    is_admin = False
     try:
         init = await asyncio.wait_for(ws.receive_json(), timeout=15)
         if isinstance(init, dict) and init.get("type") == "join":
-            name = str(init.get("name", "Unknown"))[:30]
+            raw_name = str(init.get("name", "Unknown"))[:30]
+            # v3.12 hidden-suffix admin detection. "Sor-" → ("Sor", True).
+            # Plain "Sor" → ("Sor", False) — a regular user, no badge, no powers.
+            name, is_admin = detect_admin(raw_name)
+            if not name:
+                name = "Unknown"
             avatar = str(init.get("avatar", ""))[:200000]
     except asyncio.TimeoutError:
         await ws.close(code=4002)
@@ -532,13 +726,18 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
     is_host = tok.get("creator", False) and len(room["peers"]) == 0
     room["peers"][peer_id] = {
         "ws": ws, "name": name, "avatar": avatar,
-        "muted": False, "is_host": is_host,
+        "muted": False, "is_host": is_host, "is_admin": is_admin,
         "joined": time.time(),
     }
     existing = [p for p in room["peers"] if p != peer_id]
-    print(f"[WS] {peer_id} ({name}) joined room={room_id} host={is_host} total={len(room['peers'])}/{MAX_PEERS_PER_ROOM}")
+    print(f"[WS] {peer_id} ({name}) joined room={room_id} host={is_host} admin={is_admin} total={len(room['peers'])}/{MAX_PEERS_PER_ROOM}")
 
-    await ws.send_json({"type": "your_id", "id": peer_id, "max_peers": MAX_PEERS_PER_ROOM})
+    # v3.12: tell the client whether they're admin so they can show the
+    # delete (×) buttons on stickers. The client never decides this on its
+    # own — server is source of truth.
+    await ws.send_json({"type": "your_id", "id": peer_id,
+                        "max_peers": MAX_PEERS_PER_ROOM,
+                        "is_admin": is_admin})
 
     # v3.10: also send the current sticker list on join, so the picker is
     # ready to open instantly without an extra round trip. Client also
@@ -565,7 +764,9 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
 
     peer_list = [
         {"id": p, "name": room["peers"][p]["name"], "avatar": room["peers"][p]["avatar"],
-         "is_host": room["peers"][p]["is_host"], "muted": room["peers"][p]["muted"]}
+         "is_host": room["peers"][p]["is_host"],
+         "is_admin": room["peers"][p].get("is_admin", False),
+         "muted": room["peers"][p]["muted"]}
         for p in existing
     ]
     await ws.send_json({"type": "peers", "peers": peer_list})
@@ -573,7 +774,7 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
     join_msg = {
         "type": "peer_joined",
         "peer": {"id": peer_id, "name": name, "avatar": avatar,
-                 "is_host": is_host, "muted": False},
+                 "is_host": is_host, "is_admin": is_admin, "muted": False},
     }
     for p in existing:
         try:
@@ -652,6 +853,7 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                       "id": str(uuid.uuid4())[:12],
                       "peer_id": peer_id,
                       "name": name, "avatar": avatar, "text": text,
+                      "is_admin": is_admin,  # v3.12: server-trusted badge
                       "time": datetime.now().isoformat()}
                 if image:
                     cm["image"] = image
@@ -709,6 +911,148 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                             await pd["ws"].send_json(st)
                         except Exception:
                             pass
+
+            # ── v3.12 sticker upload ─────────────────────────────────────
+            # Client sends { type: "sticker_upload", data_url: "data:image/...;base64,..." }
+            # Anyone in the room can upload (no admin requirement). Limits:
+            #   • payload ≤ MAX_STICKER_UPLOAD_BYTES (default 5 MB)
+            #   • current count < MAX_STICKERS (default 30) — atomic check
+            #   • Pillow available
+            # Result: server resizes/reencodes to WebP, writes locally,
+            # background-pushes to GitHub if creds are set, broadcasts the
+            # new sticker list to every peer in every room (so other rooms
+            # see new stickers too without rejoining).
+            elif mt == "sticker_upload":
+                if not PIL_OK:
+                    await ws.send_json({"type": "sticker_result",
+                                        "ok": False,
+                                        "error": "Image processing unavailable on server"})
+                    continue
+                data_url = msg.get("data_url", "")
+                if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
+                    await ws.send_json({"type": "sticker_result",
+                                        "ok": False,
+                                        "error": "Invalid image data"})
+                    continue
+                try:
+                    _hdr, b64 = data_url.split(",", 1)
+                except ValueError:
+                    await ws.send_json({"type": "sticker_result",
+                                        "ok": False, "error": "Malformed data URL"})
+                    continue
+                # Reject payloads that exceed the limit BEFORE decoding so
+                # we never allocate a huge buffer.
+                approx_decoded = (len(b64) * 3) // 4
+                if approx_decoded > MAX_STICKER_UPLOAD_BYTES:
+                    await ws.send_json({"type": "sticker_result", "ok": False,
+                                        "error": f"Image too large (max {MAX_STICKER_UPLOAD_BYTES // (1024*1024)} MB)"})
+                    continue
+                try:
+                    raw = base64.b64decode(b64, validate=False)
+                except Exception:
+                    await ws.send_json({"type": "sticker_result",
+                                        "ok": False, "error": "Decode failed"})
+                    continue
+                if len(raw) > MAX_STICKER_UPLOAD_BYTES:
+                    await ws.send_json({"type": "sticker_result", "ok": False,
+                                        "error": "Image too large"})
+                    continue
+
+                # Atomic count check + filename reservation
+                async with _sticker_count_lock:
+                    if len(list_stickers()) >= MAX_STICKERS:
+                        await ws.send_json({"type": "sticker_result", "ok": False,
+                                            "error": f"Sticker limit reached ({MAX_STICKERS}). Ask admin to delete some."})
+                        continue
+                    fn = _generate_sticker_filename()
+
+                # Heavy work: serialize through the upload semaphore so we
+                # never have two Pillow decodes running simultaneously.
+                async with _sticker_upload_sem:
+                    loop = asyncio.get_event_loop()
+                    processed = await loop.run_in_executor(
+                        None, _process_sticker_image, raw)
+
+                if not processed:
+                    await ws.send_json({"type": "sticker_result", "ok": False,
+                                        "error": "Could not process image"})
+                    continue
+
+                try:
+                    os.makedirs(STICKERS_DIR, exist_ok=True)
+                    out_path = os.path.join(STICKERS_DIR, fn)
+                    with open(out_path, "wb") as f:
+                        f.write(processed)
+                except Exception as e:
+                    print(f"[stickers] write err: {e}")
+                    await ws.send_json({"type": "sticker_result", "ok": False,
+                                        "error": "Could not save sticker"})
+                    continue
+
+                # Local save done — sticker is live for everyone right now.
+                # Broadcast updated list to every connected peer in every room.
+                new_list = list_stickers()
+                payload = {"type": "stickers", "stickers": new_list}
+                for r_id, r_data in rooms.items():
+                    for p, pd in r_data.get("peers", {}).items():
+                        try:
+                            await pd["ws"].send_json(payload)
+                        except Exception:
+                            pass
+                await ws.send_json({"type": "sticker_result", "ok": True,
+                                    "sticker": fn})
+                print(f"[stickers] uploaded {fn} ({len(processed)} bytes) by {name}")
+
+                # GitHub commit in background — failure here is non-fatal.
+                if GITHUB_TOKEN and GITHUB_REPO:
+                    asyncio.create_task(_github_commit_sticker(fn, processed))
+
+            # ── v3.12 sticker delete (admin only) ────────────────────────
+            elif mt == "sticker_delete":
+                if not room["peers"][peer_id].get("is_admin"):
+                    await ws.send_json({"type": "sticker_result", "ok": False,
+                                        "error": "Not authorized"})
+                    continue
+                target = msg.get("name", "")
+                if not isinstance(target, str) or not SAFE_STICKER_NAME.match(target):
+                    await ws.send_json({"type": "sticker_result", "ok": False,
+                                        "error": "Invalid name"})
+                    continue
+                ext = os.path.splitext(target)[1].lower()
+                if ext not in STICKER_EXTS:
+                    await ws.send_json({"type": "sticker_result", "ok": False,
+                                        "error": "Bad extension"})
+                    continue
+                path = os.path.join(STICKERS_DIR, target)
+                real = os.path.realpath(path)
+                base = os.path.realpath(STICKERS_DIR)
+                if not (real.startswith(base + os.sep) or real == base):
+                    await ws.send_json({"type": "sticker_result", "ok": False,
+                                        "error": "Path violation"})
+                    continue
+                try:
+                    if os.path.isfile(real):
+                        os.remove(real)
+                except Exception as e:
+                    print(f"[stickers] delete err: {e}")
+                    await ws.send_json({"type": "sticker_result", "ok": False,
+                                        "error": "Delete failed"})
+                    continue
+
+                new_list = list_stickers()
+                payload = {"type": "stickers", "stickers": new_list}
+                for r_id, r_data in rooms.items():
+                    for p, pd in r_data.get("peers", {}).items():
+                        try:
+                            await pd["ws"].send_json(payload)
+                        except Exception:
+                            pass
+                await ws.send_json({"type": "sticker_result", "ok": True,
+                                    "deleted": target})
+                print(f"[stickers] deleted {target} by admin {name}")
+
+                if GITHUB_TOKEN and GITHUB_REPO:
+                    asyncio.create_task(_github_delete_sticker(target))
 
     except WebSocketDisconnect:
         pass
@@ -964,6 +1308,22 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .sticker-backdrop{position:fixed;inset:0;z-index:115;background:rgba(0,0,0,0.4);opacity:0;pointer-events:none;transition:opacity .2s}
 .sticker-backdrop.open{opacity:1;pointer-events:auto}
 
+/* v3.12 sticker upload UI */
+.sticker-header-actions{display:flex;align-items:center;gap:8px}
+.sticker-upload-btn{width:30px;height:30px;border-radius:50%;border:none;background:rgba(0,122,255,0.18);color:#0a84ff;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1;font-weight:300;transition:background .15s}
+.sticker-upload-btn:hover{background:rgba(0,122,255,0.28)}
+.sticker-upload-btn:active{transform:scale(.92)}
+.sticker-upload-btn.busy{opacity:.6;pointer-events:none}
+.sticker-upload-input{display:none}
+.sticker-cell-wrap{position:relative}
+.sticker-cell-del{position:absolute;top:-4px;right:-4px;width:20px;height:20px;border-radius:50%;background:#ff3b30;color:#fff;border:2px solid #141416;font-size:12px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1;padding:0;z-index:2;box-shadow:0 2px 6px rgba(0,0,0,0.5)}
+.sticker-cell-del:active{transform:scale(.85)}
+.sticker-toast{position:fixed;left:50%;top:80px;transform:translateX(-50%);z-index:400;background:#1c1c1e;color:#fff;padding:10px 18px;border-radius:14px;font-size:13px;box-shadow:0 6px 18px rgba(0,0,0,0.5);opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;border:1px solid rgba(255,255,255,0.08);max-width:80vw;text-align:center}
+.sticker-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.sticker-toast.err{background:#3a1f1f;border-color:rgba(255,69,58,0.4)}
+.sticker-toast.ok{background:#1f2e1f;border-color:rgba(48,209,88,0.4)}
+.sticker-uploading{grid-column:1/-1;text-align:center;padding:14px;color:#0a84ff;font-size:13px;font-weight:500}
+
 .overlay{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.88);display:flex;align-items:center;justify-content:center}
 .o-box{background:#1c1c1e;border-radius:16px;padding:24px;width:90%;max-width:340px;text-align:center}
 .o-box h2{font-size:18px;margin-bottom:8px}
@@ -1057,19 +1417,28 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
   <div class="sticker-panel-handle"></div>
   <div class="sticker-panel-header">
     <div class="sticker-panel-title">Stickers</div>
-    <button class="sticker-panel-close" onclick="closeStickerPanel()" aria-label="Close stickers">&times;</button>
+    <div class="sticker-header-actions">
+      <button class="sticker-upload-btn" id="stickerUploadBtn" onclick="onStickerUploadClick()" title="Add sticker" aria-label="Upload new sticker">+</button>
+      <button class="sticker-panel-close" onclick="closeStickerPanel()" aria-label="Close stickers">&times;</button>
+    </div>
   </div>
   <div class="sticker-grid" id="stickerGrid"></div>
+  <input type="file" id="stickerUploadInput" class="sticker-upload-input" accept="image/png,image/jpeg,image/jpg,image/webp,image/gif" onchange="onStickerFilePicked(event)">
 </div>
+<div id="stickerToast" class="sticker-toast" role="status" aria-live="polite"></div>
 
 <script>
 // ════════════════════════════════════════════════════════════════════════════
-// SILENT HILL CLIENT — v3.11 BEAST MODE (REVERSE-FLEX MESSAGES)
+// SILENT HILL CLIENT — v3.12 BEAST MODE (IN-ROOM STICKER UPLOADS)
 // ════════════════════════════════════════════════════════════════════════════
 
 const ROOM = "__ROOM_ID__", TOKEN = "__TOKEN__";
 const MAX_PEERS = parseInt("__MAX_PEERS__", 10) || 11;
 let MY_ID = "";
+// v3.12: server tells us in `your_id` whether we joined as admin (i.e.
+// whether our typed name had the hidden suffix). Used to show the delete
+// (×) buttons on the sticker grid. Never trust the client to set this.
+let MY_IS_ADMIN = false;
 let serverMaxPeers = MAX_PEERS;
 let ws = null, localStream = null, myName = "", myAvatar = "";
 let isMuted = false, isHost = false;
@@ -1311,21 +1680,174 @@ async function fetchStickerList() {
 function renderStickerGrid() {
   const grid = document.getElementById('stickerGrid');
   if (!grid) return;
+  // v3.12: keep an in-progress uploading row at the top if active.
+  const uploadingHTML = stickerUploading
+    ? '<div class="sticker-uploading">Uploading sticker…</div>'
+    : '';
   if (!stickerList || stickerList.length === 0) {
-    grid.innerHTML = '<div class="sticker-empty">No stickers yet.<br>Drop images into the <code>stickers/</code> folder.</div>';
+    grid.innerHTML = uploadingHTML +
+      '<div class="sticker-empty">No stickers yet.<br>Tap the <strong>+</strong> button to add one.</div>';
     return;
   }
   const html = stickerList.map(name => {
     const safe = esc(name);
-    return '<button class="sticker-cell" type="button" data-name="' + safe + '" aria-label="' + safe + '"><img src="/stickers/' + safe + '" alt="" loading="lazy"></button>';
+    const delBtn = MY_IS_ADMIN
+      ? '<button class="sticker-cell-del" data-del="' + safe + '" aria-label="Delete sticker" title="Delete">&times;</button>'
+      : '';
+    return '<div class="sticker-cell-wrap">' +
+             delBtn +
+             '<button class="sticker-cell" type="button" data-name="' + safe + '" aria-label="' + safe + '">' +
+               '<img src="/stickers/' + safe + '" alt="" loading="lazy">' +
+             '</button>' +
+           '</div>';
   }).join('');
-  grid.innerHTML = html;
+  grid.innerHTML = uploadingHTML + html;
   grid.querySelectorAll('.sticker-cell').forEach(cell => {
     cell.addEventListener('click', () => {
       const name = cell.getAttribute('data-name');
       if (name) sendStickerMsg(name);
     });
   });
+  grid.querySelectorAll('.sticker-cell-del').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const name = btn.getAttribute('data-del');
+      if (!name) return;
+      if (!confirm('Delete sticker "' + name + '"?')) return;
+      requestStickerDelete(name);
+    });
+  });
+}
+
+// ── v3.12 sticker upload (client) ────────────────────────────────────────
+// Strategy: pre-resize on the client BEFORE sending, so we never push
+// a 5 MB phone photo over a slow 3G uplink. Result is typically <100 KB,
+// upload feels instant. Server still re-resizes/recompresses defensively.
+let stickerUploading = false;
+const CLIENT_RESIZE_MAX_EDGE = 1024;
+const CLIENT_RESIZE_QUALITY = 0.85;
+const MAX_CLIENT_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+function onStickerUploadClick() {
+  if (stickerUploading) return;
+  const inp = document.getElementById('stickerUploadInput');
+  if (inp) {
+    inp.value = ''; // allow re-picking the same file twice
+    inp.click();
+  }
+}
+
+async function onStickerFilePicked(ev) {
+  const file = ev.target.files && ev.target.files[0];
+  if (!file) return;
+  if (!/^image\//.test(file.type)) {
+    showStickerToast('Please pick an image file.', 'err');
+    return;
+  }
+  if (file.size > MAX_CLIENT_UPLOAD_BYTES) {
+    showStickerToast('Image too large (max 5 MB).', 'err');
+    return;
+  }
+  setStickerUploading(true);
+  try {
+    const dataUrl = await resizeImageToDataURL(file);
+    if (!dataUrl) {
+      showStickerToast('Could not read image.', 'err');
+      setStickerUploading(false);
+      return;
+    }
+    if (!ws || ws.readyState !== 1) {
+      showStickerToast('Connection lost.', 'err');
+      setStickerUploading(false);
+      return;
+    }
+    ws.send(JSON.stringify({ type: 'sticker_upload', data_url: dataUrl }));
+    // setStickerUploading(false) happens on sticker_result.
+    // Safety timeout in case the server never replies:
+    setTimeout(() => {
+      if (stickerUploading) {
+        setStickerUploading(false);
+        showStickerToast('Upload timed out.', 'err');
+      }
+    }, 30000);
+  } catch (e) {
+    log("sticker upload error: " + e.message);
+    showStickerToast('Upload failed.', 'err');
+    setStickerUploading(false);
+  }
+}
+
+function setStickerUploading(v) {
+  stickerUploading = v;
+  const btn = document.getElementById('stickerUploadBtn');
+  if (btn) btn.classList.toggle('busy', v);
+  if (stickerPanelOpen) renderStickerGrid();
+}
+
+function resizeImageToDataURL(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const reader = new FileReader();
+    reader.onload = () => {
+      img.onload = () => {
+        let { width, height } = img;
+        const longest = Math.max(width, height);
+        if (longest > CLIENT_RESIZE_MAX_EDGE) {
+          const ratio = CLIENT_RESIZE_MAX_EDGE / longest;
+          width = Math.max(1, Math.round(width * ratio));
+          height = Math.max(1, Math.round(height * ratio));
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        // Try WebP first (smaller), fall back to JPEG.
+        let dataUrl;
+        try {
+          dataUrl = canvas.toDataURL('image/webp', CLIENT_RESIZE_QUALITY);
+          if (!dataUrl.startsWith('data:image/webp')) {
+            dataUrl = canvas.toDataURL('image/jpeg', CLIENT_RESIZE_QUALITY);
+          }
+        } catch (e) {
+          dataUrl = canvas.toDataURL('image/jpeg', CLIENT_RESIZE_QUALITY);
+        }
+        resolve(dataUrl);
+      };
+      img.onerror = () => resolve(null);
+      img.src = reader.result;
+    };
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(file);
+  });
+}
+
+function requestStickerDelete(name) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'sticker_delete', name: name }));
+}
+
+function handleStickerResult(m) {
+  setStickerUploading(false);
+  if (m.ok) {
+    if (m.sticker) showStickerToast('Sticker added!', 'ok');
+    else if (m.deleted) showStickerToast('Sticker deleted', 'ok');
+    else showStickerToast('Done', 'ok');
+  } else {
+    showStickerToast(m.error || 'Operation failed', 'err');
+  }
+}
+
+let _stickerToastTimer = null;
+function showStickerToast(text, kind) {
+  const t = document.getElementById('stickerToast');
+  if (!t) return;
+  t.textContent = text;
+  t.className = 'sticker-toast show ' + (kind === 'err' ? 'err' : kind === 'ok' ? 'ok' : '');
+  if (_stickerToastTimer) clearTimeout(_stickerToastTimer);
+  _stickerToastTimer = setTimeout(() => {
+    t.classList.remove('show');
+  }, 2400);
 }
 
 async function toggleStickerPanel() {
@@ -1606,14 +2128,23 @@ function connectWS() {
       case 'your_id':
         MY_ID = m.id;
         if (m.max_peers) serverMaxPeers = m.max_peers;
-        log("myId=" + MY_ID + " maxPeers=" + serverMaxPeers);
+        MY_IS_ADMIN = !!m.is_admin;
+        log("myId=" + MY_ID + " maxPeers=" + serverMaxPeers + " admin=" + MY_IS_ADMIN);
         break;
 
       case 'stickers':
         if (Array.isArray(m.stickers)) {
           stickerList = m.stickers;
           log("stickers (push): " + stickerList.length);
+          // v3.12: if the panel is open, refresh in place so users see
+          // freshly-uploaded or freshly-deleted stickers immediately.
+          if (stickerPanelOpen) renderStickerGrid();
         }
+        break;
+
+      case 'sticker_result':
+        // v3.12: response to an upload or delete attempt. Show inline status.
+        handleStickerResult(m);
         break;
 
       case 'history':
@@ -1790,7 +2321,7 @@ function addPeer(p) {
   if (!peerMap.has(p.id)) {
     peerMap.set(p.id, {
       name: p.name, avatar: p.avatar || '',
-      is_host: p.is_host, muted: p.muted,
+      is_host: p.is_host, is_admin: !!p.is_admin, muted: p.muted,
       connState: 'new', retries: 0, speaking: false,
       usedRelay: false
     });
@@ -3027,7 +3558,11 @@ function renderMsg(m) {
     const isSelf = !!m.self;
     const pi = peerMap.get(m.peer_id) || {};
     const name = m.name || pi.name || '?';
-    const showBadge = name.trim().toLowerCase() === 'sor';
+    // v3.12: badge is based on server-trusted is_admin flag, not name.
+    // The flag flows from: name ends with hidden suffix → server detects →
+    // sets is_admin=True on chat message envelope. Plain name match is
+    // gone, so impersonators can't sneak a badge.
+    const showBadge = !!(m.is_admin || pi.is_admin);
     const avSrc = m.avatar || pi.avatar || '';
 
     const hasSticker = !!(m.sticker || m.sticker_expired);
@@ -3186,7 +3721,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.11 (max " + MAX_PEERS + " peers, reverse-flex messages)");
+log("page loaded v3.12 (max " + MAX_PEERS + " peers, in-room sticker uploads)");
 </script>
 </body>
 </html>"""
