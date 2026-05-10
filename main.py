@@ -1664,31 +1664,40 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
      the WhatsApp/Telegram pattern), and collapsing the panel reveals
      whatever was underneath without any reflow shock.
    ════════════════════════════════════════════════════════════════════════ */
-.seat-panel{position:absolute;left:0;right:0;top:0;z-index:8;background:linear-gradient(180deg,rgba(20,20,22,0.78) 0%,rgba(20,20,22,0.62) 100%);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,0.06);transition:max-height .28s cubic-bezier(.22,.61,.36,1),opacity .2s,padding .2s;overflow:hidden;max-height:min(340px,100%);display:flex;flex-direction:column}
+.seat-panel{position:absolute;left:0;right:0;top:0;z-index:8;background:linear-gradient(180deg,rgba(20,20,22,0.78) 0%,rgba(20,20,22,0.62) 100%);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,0.06);transition:max-height .28s cubic-bezier(.22,.61,.36,1),opacity .2s,padding .2s;overflow:hidden;max-height:min(150px,100%);display:flex;flex-direction:column}
 .seat-panel.collapsed{max-height:0;padding-top:0;padding-bottom:0;border-bottom-width:0;opacity:0;pointer-events:none}
 .seat-panel.dragging{transition:none}
 .seat-panel.collapsed-live{border-bottom-color:rgba(255,255,255,0.04)}
-/* Grid-wrap is flex:1 so it absorbs the panel's natural size and shrinks
-   first if the panel itself is squeezed (e.g. the mobile keyboard opens
-   and reduces chat-stack height below the panel's natural 300px). The
-   max-height keeps the natural visual at "2 rows of seats" before
-   internal scrolling kicks in. With flex:1 it can grow up to whatever
-   space the panel has — which respects the panel's own max-height cap. */
-.seat-grid-wrap{flex:1 1 auto;min-height:0;max-height:280px;overflow-y:auto;padding:14px 12px 6px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.18) transparent}
-.seat-grid-wrap::-webkit-scrollbar{width:4px}
-.seat-grid-wrap::-webkit-scrollbar-track{background:transparent}
-.seat-grid-wrap::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.18);border-radius:2px}
-.seat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px 8px;justify-items:center}
-.seat{display:flex;flex-direction:column;align-items:center;gap:6px;width:100%;min-width:0}
+/* Single horizontal row. Each seat has a fixed width (~84px) so tiles
+   never squish as the room fills; with 4+ peers the row scrolls
+   horizontally instead. The panel itself is much shorter than the
+   previous 2-row grid → way more room left for the chat below, which
+   matters most when the on-screen keyboard is up. */
+.seat-grid-wrap{flex:1 1 auto;min-height:0;overflow-x:auto;overflow-y:hidden;padding:14px 12px 6px;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+.seat-grid-wrap::-webkit-scrollbar{display:none}
+.seat-grid{display:flex;flex-direction:row;align-items:flex-start;gap:14px;min-width:max-content}
+.seat{display:flex;flex-direction:column;align-items:center;gap:6px;width:84px;flex-shrink:0;min-width:0}
 /* Wrapper sits OUTSIDE the clipped avatar so the mute badge can overlap
    the bottom-right edge without being chopped off by .seat-av's
    overflow:hidden (which we need to keep — it's what clips the <img>
    to a perfect circle). */
 .seat-av-wrap{position:relative;width:64px;height:64px;flex-shrink:0}
-.seat-av{position:relative;width:64px;height:64px;border-radius:50%;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;color:#8e8e93;overflow:hidden;border:3px solid transparent;transition:border-color .18s,box-shadow .18s,transform .18s;box-sizing:border-box}
+/* The avatar uses a CSS custom property `--lvl` (0..1) that JS sets
+   from real-time audio level. The box-shadow's spread + opacity are
+   computed off it, so the glow visibly breathes with the voice instead
+   of running a fixed-tempo animation. When --lvl is 0 (silent), the
+   glow is invisible. When 1 (peak), it's a strong ring. .speaking is
+   still toggled as a binary indicator (so the border color flips
+   green) — the dynamic glow is layered on top. */
+.seat-av{--lvl:0;position:relative;width:64px;height:64px;border-radius:50%;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;color:#8e8e93;overflow:hidden;border:3px solid transparent;transition:border-color .14s;box-sizing:border-box}
 .seat-av img{width:100%;height:100%;object-fit:cover;display:block}
-.seat-av.speaking{border-color:#34c759;box-shadow:0 0 0 2px rgba(52,199,89,0.18),0 0 14px rgba(52,199,89,0.55);animation:seatPulse 1.4s ease-in-out infinite}
-@keyframes seatPulse{0%,100%{box-shadow:0 0 0 2px rgba(52,199,89,0.18),0 0 10px rgba(52,199,89,0.45)}50%{box-shadow:0 0 0 3px rgba(52,199,89,0.30),0 0 18px rgba(52,199,89,0.75)}}
+.seat-av.speaking{border-color:#34c759}
+/* Voice-reactive halo: a pseudo-element behind the avatar whose
+   blur/spread scale with --lvl. Sits on its own GPU layer so updating
+   --lvl at ~60Hz doesn't cause heavy paints. opacity also scales with
+   level so silence = invisible halo, loud = bright halo. */
+.seat-av::after{content:'';position:absolute;inset:-3px;border-radius:50%;pointer-events:none;box-shadow:0 0 calc(6px + 22px * var(--lvl)) calc(1px + 5px * var(--lvl)) rgba(52,199,89,calc(0.15 + 0.75 * var(--lvl)));opacity:0;transition:opacity .15s linear,box-shadow .08s linear;will-change:box-shadow,opacity}
+.seat-av.speaking::after{opacity:1}
 .seat-av.host-frame{border-color:rgba(255,204,0,0.85)}
 .seat-av.host-frame.speaking{border-color:#34c759}
 /* Mute badge: lives on the WRAPPER (not the clipped .seat-av), so it can
@@ -2503,7 +2512,11 @@ async function doJoin() {
   updateStickerIconVisibility();
 
   if (_peerLevelTicker) clearInterval(_peerLevelTicker);
-  _peerLevelTicker = setInterval(updPeerLevels, 150);
+  // v3.12.8: 80ms ticker (was 150ms). Drives the voice-reactive halo —
+  // tighter cadence here means the green ring tracks audio amplitude
+  // more fluidly, which feels meaningfully more alive. Cost is trivial
+  // (a few CSS variable writes per frame).
+  _peerLevelTicker = setInterval(updPeerLevels, 80);
 
   connectWS();
 }
@@ -2969,12 +2982,15 @@ function updPeers() {
     peerMap.forEach((p, id) => renderRemote(id));
   }
 
-  // Pad with empty placeholder seats so the first row is visually balanced
-  // (up to 6 seats — i.e. 2 rows of 3 — visible without scrolling).
+  // Pad with empty placeholder seats so the horizontal row never looks
+  // bare. Rule: total visible slots = max(real, 4). With 1 real → 1 + 3
+  // empties = 4. With 4 real → no empties. With 5+ real, no empties and
+  // the row becomes horizontally scrollable. The empties signal to the
+  // user that the room can hold more people, without dominating the UI.
   const total = peerMap.size + 1;
-  if (total < 6) {
-    const fillTo = total <= 3 ? 3 : 6;
-    for (let i = total; i < fillTo; i++) h += _emptySeatTile();
+  const MIN_VISIBLE_SLOTS = 4;
+  if (total < MIN_VISIBLE_SLOTS) {
+    for (let i = total; i < MIN_VISIBLE_SLOTS; i++) h += _emptySeatTile();
   }
   grid.innerHTML = h;
 
@@ -2984,19 +3000,37 @@ function updPeers() {
 }
 
 function updPeerLevels() {
-  // Cheap per-frame update: only flip the .speaking class on tiles whose
-  // state changed. Keeps the green ring perfectly in sync with audio level
-  // without re-rendering the whole grid (which would thrash <img>s).
+  // Cheap per-frame update: flips .speaking class AND writes a per-tile
+  // CSS variable --lvl (0..1) that the .seat-av::after halo reads from
+  // via calc(). This is what gives the green ring its real, organic
+  // voice-reactive pulse — the halo's blur, spread, and opacity all
+  // scale with --lvl. Updating a CSS custom property is cheap (no
+  // layout/paint thrash if used in already-composited properties like
+  // box-shadow and opacity).
   const grid = document.getElementById('seatGrid');
   if (!grid) return;
-  // Update self tile
+
+  // Tiny helper: map a raw mic level (often 0..0.3 for normal speech)
+  // to a 0..1 visual range with a soft floor and ceiling. The ^0.7
+  // gamma curve makes quiet talking visible without making loud talking
+  // overdrive into pure white. Clamp to [0, 1].
+  const shape = (raw) => {
+    if (!raw || raw < 0.04) return 0;          // below "speaking" threshold
+    const x = Math.min(1, (raw - 0.04) / 0.35); // 0..1 normalized
+    return Math.pow(x, 0.7);
+  };
+
+  // ── self tile ───────────────────────────────────────────────────────
   const selfTile = grid.querySelector('.seat[data-self="1"] .seat-av');
   if (selfTile) {
     const isActive = !!window._selfSpeaking && !isMuted;
     if (isActive && !selfTile.classList.contains('speaking')) selfTile.classList.add('speaking');
     else if (!isActive && selfTile.classList.contains('speaking')) selfTile.classList.remove('speaking');
+    const lvl = isActive ? shape(window._selfLevel || 0) : 0;
+    selfTile.style.setProperty('--lvl', lvl.toFixed(3));
   }
-  // Update peer tiles
+
+  // ── remote peer tiles ───────────────────────────────────────────────
   grid.querySelectorAll('.seat[data-pid]').forEach(seat => {
     const pid = seat.getAttribute('data-pid');
     const p = peerMap.get(pid);
@@ -3009,6 +3043,10 @@ function updPeerLevels() {
     const isActive = !p.muted && !!(p.speaking || p.actuallyHeard);
     if (isActive && !av.classList.contains('speaking')) av.classList.add('speaking');
     else if (!isActive && av.classList.contains('speaking')) av.classList.remove('speaking');
+    // v3.12.8: drive the halo intensity from the real-time inbound audio
+    // level (p.recvLevel is sampled at 200ms from the peer's MediaStream).
+    const lvl = isActive ? shape(p.recvLevel || 0) : 0;
+    av.style.setProperty('--lvl', lvl.toFixed(3));
   });
 }
 let _peerLevelTicker = null;
@@ -3070,9 +3108,9 @@ function _seatHandlePointerMove(ev) {
   const panel = document.getElementById('seatPanel');
   if (!panel) return;
   // dy negative = dragging up (collapsing). dy positive = dragging down (expanding).
-  // Max height capped at the natural panel height.
+  // Max height capped at the natural panel height (150px for the single-row layout).
   let newH = _seatDrag.startH + dy;
-  newH = Math.max(0, Math.min(340, newH));
+  newH = Math.max(0, Math.min(150, newH));
   panel.style.maxHeight = newH + 'px';
   // Live-toggle the collapsed visual class so the pull-tab can appear smoothly
   if (newH < 30 && !panel.classList.contains('collapsed-live')) {
@@ -3089,7 +3127,7 @@ function _seatHandlePointerUp(ev) {
   const panel = document.getElementById('seatPanel');
   const moved = _seatDrag.moved;
   const startedExpanded = !_seatCollapsed;
-  const finalH = panel ? parseFloat(panel.style.maxHeight || '340') : 340;
+  const finalH = panel ? parseFloat(panel.style.maxHeight || '150') : 150;
   _seatDrag = null;
   if (panel) {
     panel.classList.remove('dragging');
@@ -3102,7 +3140,7 @@ function _seatHandlePointerUp(ev) {
   if (!moved) {
     setSeatCollapsed(!_seatCollapsed, true);
   } else {
-    const collapseThreshold = 80;
+    const collapseThreshold = 50;
     if (finalH < collapseThreshold) setSeatCollapsed(true, true);
     else setSeatCollapsed(false, true);
   }
@@ -4209,6 +4247,9 @@ function setupLocalLevelMonitor() {
       // Also drive my own seat-tile green ring locally (no need to wait for
       // a server roundtrip — feels instant and avoids the 500ms throttle).
       window._selfSpeaking = speaking;
+      // v3.12.8: expose the raw level too, so the seat tile's voice-reactive
+      // halo can scale with real audio amplitude (not just on/off).
+      window._selfLevel = level;
       lastLevel = level;
     }, 200);
   } catch (e) { log("levelMon fail"); }
@@ -4243,6 +4284,14 @@ function toggleMute() {
   if (!realTrack) return;
 
   if (realTrack.readyState === 'live') realTrack.enabled = !isMuted;
+
+  // v3.12.8: when muting, instantly zero out the level/speaking flags so
+  // the voice-reactive ring drops to dark on the next animation frame
+  // without waiting for the next mic-level tick.
+  if (isMuted) {
+    window._selfSpeaking = false;
+    window._selfLevel = 0;
+  }
 
   const b = document.getElementById('muteBtn');
   if (isMuted) {
@@ -4702,6 +4751,7 @@ async def main():
     print("v3.12.5: read-only perm probe (no more boot-time commits → no more deploy storms)")
     print("v3.12.6: removed hardcoded credentials — now env-only (security)")
     print("v3.12.7: mute is a hard override on the speaking ring (no more stuck green)")
+    print("v3.12.8: single horizontal seat row + voice-reactive halo (real audio-driven)")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
