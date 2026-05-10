@@ -821,9 +821,12 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
     # v3.12: tell the client whether they're admin so they can show the
     # delete (×) buttons on stickers. The client never decides this on its
     # own — server is source of truth.
+    # Also tell them whether they're host so the seat tile can render the
+    # Host badge / gold frame on their own avatar.
     await ws.send_json({"type": "your_id", "id": peer_id,
                         "max_peers": MAX_PEERS_PER_ROOM,
-                        "is_admin": is_admin})
+                        "is_admin": is_admin,
+                        "is_host": is_host})
 
     # v3.10: also send the current sticker list on join, so the picker is
     # ready to open instantly without an extra round trip. Client also
@@ -1462,16 +1465,64 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .av-in{display:none}
 .debug{position:fixed;top:52px;left:0;right:0;z-index:9;background:rgba(0,0,0,.92);color:#0f0;font:11px monospace;padding:4px;max-height:200px;overflow-y:auto;display:none;white-space:pre-wrap}
 .debug.show{display:block}
-.peer-status{display:flex;gap:6px;align-items:center;overflow-x:auto;padding:4px 12px;flex-shrink:0;position:relative;z-index:8}
-.peer-status::-webkit-scrollbar{display:none}
-.p-s{flex-shrink:0;display:flex;align-items:center;gap:4px;background:rgba(255,255,255,0.08);padding:4px 10px;border-radius:12px;font-size:11px;transition:.2s}
-.p-s.speaking{background:rgba(52,199,89,0.3);box-shadow:0 0 8px rgba(52,199,89,0.5)}
-.p-s .dot{width:8px;height:8px;border-radius:50%;background:#8e8e93;transition:.2s}
-.p-s .dot.conn{background:#34c759}
-.p-s .dot.fail{background:#ff3b30}
-.p-s .dot.relay{background:#ff9500}
-.p-s .dot.warn{background:#ffcc00}
-.p-s .dot.connecting{background:#ffcc00;animation:pulse 1.2s infinite}
+/* ════════════════════════════════════════════════════════════════════════
+   SEAT PANEL — professional grid of voice-call seats
+   ════════════════════════════════════════════════════════════════════════
+   Layout:
+     • Panel sits below the header. 3-column grid of avatar tiles.
+     • 6 tiles fit on screen at once (3 cols × 2 rows). 7+ scrolls vertically.
+     • Each tile = circular avatar + name (with tiny status dot inline).
+     • Speaking → green ring around avatar pulses & glows.
+     • Muted → small mic-off badge on bottom-right of avatar.
+     • Host → "Host" badge under avatar (small chip).
+     • Bottom edge has a drag handle: pull DOWN to collapse, a tiny pull-tab
+       remains at the top of the chat so the user can re-open it.
+   ════════════════════════════════════════════════════════════════════════ */
+.seat-panel{position:relative;z-index:8;flex-shrink:0;background:linear-gradient(180deg,rgba(20,20,22,0.78) 0%,rgba(20,20,22,0.62) 100%);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,0.06);transition:max-height .28s cubic-bezier(.22,.61,.36,1),opacity .2s,padding .2s;overflow:hidden;max-height:340px}
+.seat-panel.collapsed{max-height:0;padding-top:0;padding-bottom:0;border-bottom-width:0;opacity:0;pointer-events:none}
+.seat-panel.dragging{transition:none}
+.seat-panel.collapsed-live{border-bottom-color:rgba(255,255,255,0.04)}
+.seat-grid-wrap{max-height:280px;overflow-y:auto;padding:14px 12px 6px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.18) transparent}
+.seat-grid-wrap::-webkit-scrollbar{width:4px}
+.seat-grid-wrap::-webkit-scrollbar-track{background:transparent}
+.seat-grid-wrap::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.18);border-radius:2px}
+.seat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px 8px;justify-items:center}
+.seat{display:flex;flex-direction:column;align-items:center;gap:6px;width:100%;min-width:0}
+.seat-av{position:relative;width:64px;height:64px;border-radius:50%;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;color:#8e8e93;overflow:hidden;flex-shrink:0;border:3px solid transparent;transition:border-color .18s,box-shadow .18s,transform .18s}
+.seat-av img{width:100%;height:100%;object-fit:cover;display:block}
+.seat-av.speaking{border-color:#34c759;box-shadow:0 0 0 2px rgba(52,199,89,0.18),0 0 14px rgba(52,199,89,0.55);animation:seatPulse 1.4s ease-in-out infinite}
+@keyframes seatPulse{0%,100%{box-shadow:0 0 0 2px rgba(52,199,89,0.18),0 0 10px rgba(52,199,89,0.45)}50%{box-shadow:0 0 0 3px rgba(52,199,89,0.30),0 0 18px rgba(52,199,89,0.75)}}
+.seat-av.host-frame{border-color:rgba(255,204,0,0.85)}
+.seat-av.host-frame.speaking{border-color:#34c759}
+.seat-mute{position:absolute;right:-2px;bottom:-2px;width:22px;height:22px;border-radius:50%;background:#ff3b30;border:2px solid rgba(20,20,22,0.95);display:flex;align-items:center;justify-content:center;color:#fff}
+.seat-mute svg{width:11px;height:11px}
+.seat-name-row{display:flex;align-items:center;gap:5px;max-width:100%;min-width:0}
+.seat-dot{width:7px;height:7px;border-radius:50%;background:#8e8e93;flex-shrink:0;transition:background .2s,box-shadow .2s}
+.seat-dot.conn{background:#34c759;box-shadow:0 0 4px rgba(52,199,89,0.6)}
+.seat-dot.fail{background:#ff3b30;box-shadow:0 0 4px rgba(255,59,48,0.6)}
+.seat-dot.relay{background:#ff9500;box-shadow:0 0 4px rgba(255,149,0,0.6)}
+.seat-dot.warn{background:#ffcc00;box-shadow:0 0 4px rgba(255,204,0,0.6)}
+.seat-dot.connecting{background:#ffcc00;animation:pulse 1.2s infinite}
+.seat-name{font-size:12px;font-weight:500;color:#fff;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:.1px}
+.seat-badge{font-size:9px;font-weight:700;padding:1px 6px;border-radius:6px;background:linear-gradient(135deg,#ffd54a,#ffb300);color:#3a2400;letter-spacing:.4px;text-transform:uppercase;line-height:1.4;margin-top:-2px}
+.seat-empty{opacity:.32}
+.seat-empty .seat-av{background:rgba(255,255,255,0.04);border-style:dashed;border-color:rgba(255,255,255,0.10)}
+.seat-empty .seat-av svg{width:26px;height:26px;color:rgba(255,255,255,0.18)}
+.seat-empty .seat-name{color:rgba(255,255,255,0.25);font-style:italic}
+
+/* Bottom drag handle of the panel — large hit target, small visual chip */
+.seat-handle{position:relative;height:18px;display:flex;align-items:center;justify-content:center;cursor:grab;user-select:none;touch-action:none;background:linear-gradient(180deg,transparent,rgba(0,0,0,0.18))}
+.seat-handle:active{cursor:grabbing}
+.seat-handle::before{content:'';width:42px;height:4px;border-radius:2px;background:rgba(255,255,255,0.28);transition:background .18s,width .18s}
+.seat-handle:hover::before{background:rgba(255,255,255,0.45);width:54px}
+
+/* Pull-tab shown when the panel is collapsed — sits flush under header */
+.seat-pull-tab{position:relative;z-index:8;flex-shrink:0;height:0;overflow:hidden;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,rgba(20,20,22,0.85),rgba(20,20,22,0.55) 80%,transparent);transition:height .25s cubic-bezier(.22,.61,.36,1);cursor:pointer;touch-action:none;user-select:none}
+.seat-pull-tab.show{height:22px}
+.seat-pull-tab-grip{display:flex;align-items:center;gap:6px;padding:3px 14px 4px;border-radius:0 0 12px 12px;background:rgba(40,40,44,0.92);border:1px solid rgba(255,255,255,0.08);border-top:none;font-size:10px;font-weight:600;color:rgba(255,255,255,0.72);letter-spacing:.3px}
+.seat-pull-tab-grip svg{width:11px;height:11px}
+.seat-pull-tab-grip .dotline{width:24px;height:3px;border-radius:1.5px;background:rgba(255,255,255,0.55)}
+
 @keyframes pulse{50%{opacity:0.4}}
 .hidden{display:none!important}
 
@@ -1512,7 +1563,21 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 <button class="menu-btn" onclick="document.getElementById('dbg').classList.toggle('show')">&#8942;</button>
 </div>
 
-<div class="peer-status" id="pstat"></div>
+<!-- Seat panel: avatar-tile grid for the call. Collapsible via the bottom handle. -->
+<div class="seat-panel" id="seatPanel">
+  <div class="seat-grid-wrap" id="seatGridWrap">
+    <div class="seat-grid" id="seatGrid"></div>
+  </div>
+  <div class="seat-handle" id="seatHandle" aria-label="Drag to collapse seats" role="separator"></div>
+</div>
+<!-- Pull-tab shown when collapsed — tap or pull down to re-open -->
+<div class="seat-pull-tab" id="seatPullTab" aria-label="Pull down to show seats">
+  <div class="seat-pull-tab-grip">
+    <span class="dotline"></span>
+    <span id="seatPullCount">0/0</span>
+    <span class="dotline"></span>
+  </div>
+</div>
 
 <div class="messages-wrap">
   <div class="messages" id="msgs"></div>
@@ -2282,7 +2347,8 @@ function connectWS() {
         MY_ID = m.id;
         if (m.max_peers) serverMaxPeers = m.max_peers;
         MY_IS_ADMIN = !!m.is_admin;
-        log("myId=" + MY_ID + " maxPeers=" + serverMaxPeers + " admin=" + MY_IS_ADMIN);
+        isHost = !!m.is_host;
+        log("myId=" + MY_ID + " maxPeers=" + serverMaxPeers + " admin=" + MY_IS_ADMIN + " host=" + isHost);
         break;
 
       case 'stickers':
@@ -2339,6 +2405,11 @@ function connectWS() {
             log("I'm smaller (" + MY_ID + "<" + p.id + ") -> wait");
           }
         }
+        // Always render the grid after the initial peer list — otherwise the
+        // user sees an empty panel when they're alone in the room until
+        // someone else joins.
+        updPeers();
+        updCount();
         break;
       }
 
@@ -2489,60 +2560,273 @@ function updCount() {
   document.getElementById('mcount').textContent = total + '/' + serverMaxPeers + ' in call';
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// SEAT GRID — replaces the old pill strip. Same data sources, new look.
+// ════════════════════════════════════════════════════════════════════════════
+// • Each call participant (including yourself) gets a tile with:
+//     - circular avatar (or first-letter fallback)
+//     - speaking ring: green border + glow when speaking
+//     - mute badge (bottom-right of avatar) when muted
+//     - host frame (gold border) for the host
+//     - name + tiny status dot (the existing connection-quality dot logic)
+//     - "Host" chip under the host's name
+// • The grid is 3 columns wide. Six tiles fit on screen at once. With more
+//   than 6 participants, the grid scrolls vertically inside .seat-grid-wrap.
+// • Empty placeholder tiles are shown when the room isn't full (up to 6
+//   visible) so the layout stays balanced — purely cosmetic.
+// • The whole panel is collapsible — see the seat-handle drag logic below.
+
+function _seatDotClass(p, id) {
+  // Mirrors the old pill's dot logic exactly so connection quality stays
+  // accurate. Returns one of: 'conn' | 'fail' | 'relay' | 'warn' | 'connecting'.
+  let dot = '';
+  if (p.connState === 'connected') {
+    const smoothed = lossEwma[id] !== undefined ? lossEwma[id] : (p.lossPct || 0);
+    const onRelay = peerRelay[id] || p.usedRelay;
+    const muted = p.muted;
+    const heardRecently = p.lastHeardAt && (Date.now() - p.lastHeardAt) < 8000;
+    const noPacketsArriving = (p.recvRate !== undefined) && (p.recvRate < 1);
+    const audioActuallyBroken = !muted && !heardRecently && noPacketsArriving && smoothed > 15;
+    if (audioActuallyBroken) dot = 'fail';
+    else if (onRelay) dot = (smoothed > 12) ? 'warn' : 'relay';
+    else dot = (smoothed > 12) ? 'warn' : 'conn';
+  } else if (p.connState === 'failed' || p.connState === 'closed') {
+    dot = 'fail';
+  } else if (p.connState === 'connecting' || p.connState === 'checking' || p.connState === 'new') {
+    dot = 'connecting';
+  }
+  return dot;
+}
+
+function _avatarHTML(name, avatarData) {
+  const initial = name && name.length ? esc(name[0].toUpperCase()) : '?';
+  if (avatarData) {
+    return '<img src="' + avatarData + '" alt="">';
+  }
+  return '<span>' + initial + '</span>';
+}
+
+const MUTE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/></svg>';
+const EMPTY_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"/></svg>';
+
+function _seatTile(opts) {
+  // opts: { name, avatar, dot, speaking, muted, isHost, isYou, pid }
+  const speakingClass = opts.speaking ? ' speaking' : '';
+  const hostFrame = opts.isHost ? ' host-frame' : '';
+  const muteBadge = opts.muted
+    ? '<span class="seat-mute" aria-label="Muted">' + MUTE_SVG + '</span>'
+    : '';
+  const hostBadge = opts.isHost ? '<span class="seat-badge">Host</span>' : '';
+  const nameTxt = esc(opts.name) + (opts.isYou ? ' (You)' : '');
+  const pidAttr = opts.pid ? ' data-pid="' + opts.pid + '"' : ' data-self="1"';
+  return (
+    '<div class="seat"' + pidAttr + '>' +
+      '<div class="seat-av' + speakingClass + hostFrame + '">' +
+        _avatarHTML(opts.name, opts.avatar) +
+        muteBadge +
+      '</div>' +
+      '<div class="seat-name-row">' +
+        '<span class="seat-dot ' + opts.dot + '"></span>' +
+        '<span class="seat-name">' + nameTxt + '</span>' +
+      '</div>' +
+      hostBadge +
+    '</div>'
+  );
+}
+
+function _emptySeatTile() {
+  return (
+    '<div class="seat seat-empty" aria-hidden="true">' +
+      '<div class="seat-av">' + EMPTY_SVG + '</div>' +
+      '<div class="seat-name-row"><span class="seat-name">Empty</span></div>' +
+    '</div>'
+  );
+}
+
 function updPeers() {
-  const el = document.getElementById('pstat');
+  const grid = document.getElementById('seatGrid');
+  if (!grid) return;
   let h = '';
-  const selfDot = isMuted ? 'fail' : 'conn';
-  h += '<div class="p-s"><div class="dot ' + selfDot + '"></div>' + esc(myName) + ' (You)</div>';
-  peerMap.forEach((p, id) => {
-    let dot = '';
-    if (p.connState === 'connected') {
-      const smoothed = lossEwma[id] !== undefined ? lossEwma[id] : (p.lossPct || 0);
-      const onRelay = peerRelay[id] || p.usedRelay;
-      const muted = p.muted;
-      const heardRecently = p.lastHeardAt && (Date.now() - p.lastHeardAt) < 8000;
-      const noPacketsArriving = (p.recvRate !== undefined) && (p.recvRate < 1);
-
-      const audioActuallyBroken = !muted && !heardRecently && noPacketsArriving && smoothed > 15;
-
-      if (audioActuallyBroken) {
-        dot = 'fail';
-      } else if (onRelay) {
-        dot = (smoothed > 12) ? 'warn' : 'relay';
-      } else {
-        dot = (smoothed > 12) ? 'warn' : 'conn';
-      }
-    } else if (p.connState === 'failed' || p.connState === 'closed') dot = 'fail';
-    else if (p.connState === 'connecting' || p.connState === 'checking' || p.connState === 'new') dot = 'connecting';
-    const speakClass = (p.speaking || p.actuallyHeard) ? ' speaking' : '';
-    const muteIcon = p.muted ? ' &#128263;' : '';
-    const levelPct = Math.min(100, Math.round((p.recvLevel || 0) * 200));
-    const levelBar = p.connState === 'connected'
-      ? '<span style="display:inline-block;width:24px;height:4px;background:rgba(255,255,255,0.15);border-radius:2px;margin-left:4px;vertical-align:middle;overflow:hidden"><span style="display:block;width:' + levelPct + '%;height:100%;background:#34c759;transition:width .1s"></span></span>'
-      : '';
-    h += '<div class="p-s' + speakClass + '" data-pid="' + id + '"><div class="dot ' + dot + '"></div>' + esc(p.name) + muteIcon + levelBar + '</div>';
+  // Self tile first
+  h += _seatTile({
+    name: myName,
+    avatar: myAvatar,
+    dot: isMuted ? 'fail' : 'conn',
+    speaking: !!window._selfSpeaking,
+    muted: isMuted,
+    isHost: !!isHost,
+    isYou: true,
+    pid: ''
   });
-  el.innerHTML = h;
+  peerMap.forEach((p, id) => {
+    h += _seatTile({
+      name: p.name,
+      avatar: p.avatar,
+      dot: _seatDotClass(p, id),
+      speaking: !!(p.speaking || p.actuallyHeard),
+      muted: !!p.muted,
+      isHost: !!p.is_host,
+      isYou: false,
+      pid: id
+    });
+  });
+  // Pad with empty placeholder seats so the first row is visually balanced
+  // (up to 6 seats — i.e. 2 rows of 3 — visible without scrolling).
+  const total = peerMap.size + 1;
+  if (total < 6) {
+    const fillTo = total <= 3 ? 3 : 6;
+    for (let i = total; i < fillTo; i++) h += _emptySeatTile();
+  }
+  grid.innerHTML = h;
+
+  // Pull-tab count (shown when panel is collapsed)
+  const pullCount = document.getElementById('seatPullCount');
+  if (pullCount) pullCount.textContent = total + '/' + serverMaxPeers + ' in call';
 }
 
 function updPeerLevels() {
-  const el = document.getElementById('pstat');
-  if (!el) return;
-  el.querySelectorAll('[data-pid]').forEach(div => {
-    const pid = div.getAttribute('data-pid');
+  // Cheap per-frame update: only flip the .speaking class on tiles whose
+  // state changed. Keeps the green ring perfectly in sync with audio level
+  // without re-rendering the whole grid (which would thrash <img>s).
+  const grid = document.getElementById('seatGrid');
+  if (!grid) return;
+  // Update self tile
+  const selfTile = grid.querySelector('.seat[data-self="1"] .seat-av');
+  if (selfTile) {
+    const isActive = !!window._selfSpeaking && !isMuted;
+    if (isActive && !selfTile.classList.contains('speaking')) selfTile.classList.add('speaking');
+    else if (!isActive && selfTile.classList.contains('speaking')) selfTile.classList.remove('speaking');
+  }
+  // Update peer tiles
+  grid.querySelectorAll('.seat[data-pid]').forEach(seat => {
+    const pid = seat.getAttribute('data-pid');
     const p = peerMap.get(pid);
     if (!p) return;
-    const innerBar = div.querySelector('span > span');
-    if (innerBar) {
-      const lvl = Math.min(100, Math.round((p.recvLevel || 0) * 200));
-      innerBar.style.width = lvl + '%';
-    }
-    const isActive = p.speaking || p.actuallyHeard;
-    if (isActive && !div.classList.contains('speaking')) div.classList.add('speaking');
-    else if (!isActive && div.classList.contains('speaking')) div.classList.remove('speaking');
+    const av = seat.querySelector('.seat-av');
+    if (!av) return;
+    const isActive = !!(p.speaking || p.actuallyHeard);
+    if (isActive && !av.classList.contains('speaking')) av.classList.add('speaking');
+    else if (!isActive && av.classList.contains('speaking')) av.classList.remove('speaking');
   });
 }
 let _peerLevelTicker = null;
+
+// ════════════════════════════════════════════════════════════════════════════
+// SEAT PANEL DRAG-TO-COLLAPSE
+// ════════════════════════════════════════════════════════════════════════════
+// The user can grab the bottom handle and drag the panel up to collapse it,
+// or tap the small pull-tab below the header to expand it again. Tap on the
+// handle alone (no drag) toggles collapsed state — same affordance as a
+// disclosure chip. State is preserved in memory only (resets each session,
+// which matches the rest of the UI's state).
+
+let _seatCollapsed = false;
+let _seatDrag = null;
+
+function setSeatCollapsed(collapsed, animate) {
+  _seatCollapsed = !!collapsed;
+  const panel = document.getElementById('seatPanel');
+  const tab = document.getElementById('seatPullTab');
+  if (!panel || !tab) return;
+  if (!animate) panel.classList.add('dragging');
+  panel.style.maxHeight = '';  // clear any inline height set by the drag
+  if (_seatCollapsed) {
+    panel.classList.add('collapsed');
+    tab.classList.add('show');
+  } else {
+    panel.classList.remove('collapsed');
+    tab.classList.remove('show');
+  }
+  if (!animate) {
+    // force reflow then re-enable transitions
+    void panel.offsetHeight;
+    panel.classList.remove('dragging');
+  }
+}
+
+function _seatHandlePointerDown(ev) {
+  // Only react to primary button / single touch
+  if (ev.button !== undefined && ev.button !== 0) return;
+  const panel = document.getElementById('seatPanel');
+  if (!panel) return;
+  const rect = panel.getBoundingClientRect();
+  _seatDrag = {
+    startY: ev.clientY,
+    startH: rect.height,
+    moved: false,
+    pointerId: ev.pointerId
+  };
+  panel.classList.add('dragging');
+  try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
+  ev.preventDefault();
+}
+
+function _seatHandlePointerMove(ev) {
+  if (!_seatDrag) return;
+  const dy = ev.clientY - _seatDrag.startY;
+  if (Math.abs(dy) > 3) _seatDrag.moved = true;
+  const panel = document.getElementById('seatPanel');
+  if (!panel) return;
+  // dy negative = dragging up (collapsing). dy positive = dragging down (expanding).
+  // Max height capped at the natural panel height.
+  let newH = _seatDrag.startH + dy;
+  newH = Math.max(0, Math.min(340, newH));
+  panel.style.maxHeight = newH + 'px';
+  // Live-toggle the collapsed visual class so the pull-tab can appear smoothly
+  if (newH < 30 && !panel.classList.contains('collapsed-live')) {
+    panel.classList.add('collapsed-live');
+    document.getElementById('seatPullTab').classList.add('show');
+  } else if (newH >= 30 && panel.classList.contains('collapsed-live')) {
+    panel.classList.remove('collapsed-live');
+    document.getElementById('seatPullTab').classList.remove('show');
+  }
+}
+
+function _seatHandlePointerUp(ev) {
+  if (!_seatDrag) return;
+  const panel = document.getElementById('seatPanel');
+  const moved = _seatDrag.moved;
+  const startedExpanded = !_seatCollapsed;
+  const finalH = panel ? parseFloat(panel.style.maxHeight || '340') : 340;
+  _seatDrag = null;
+  if (panel) {
+    panel.classList.remove('dragging');
+    panel.classList.remove('collapsed-live');
+  }
+  // Decision:
+  //   - If the user just tapped without moving → toggle.
+  //   - If they dragged: anything below ~50% of normal height → collapse.
+  //                      anything above → expand.
+  if (!moved) {
+    setSeatCollapsed(!_seatCollapsed, true);
+  } else {
+    const collapseThreshold = 80;
+    if (finalH < collapseThreshold) setSeatCollapsed(true, true);
+    else setSeatCollapsed(false, true);
+  }
+  try { ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
+}
+
+function initSeatPanel() {
+  const handle = document.getElementById('seatHandle');
+  const tab = document.getElementById('seatPullTab');
+  if (handle) {
+    handle.addEventListener('pointerdown', _seatHandlePointerDown);
+    handle.addEventListener('pointermove', _seatHandlePointerMove);
+    handle.addEventListener('pointerup', _seatHandlePointerUp);
+    handle.addEventListener('pointercancel', _seatHandlePointerUp);
+  }
+  if (tab) {
+    // Tap or drag-down on the pull-tab also expands.
+    tab.addEventListener('click', () => {
+      if (_seatCollapsed) setSeatCollapsed(false, true);
+    });
+  }
+}
+// Wire up handlers once the DOM is ready (the script tag is at the end of
+// <body> already so the elements exist, but we still guard for safety).
+if (document.readyState !== 'loading') initSeatPanel();
+else document.addEventListener('DOMContentLoaded', initSeatPanel);
 
 // ════════════════════════════════════════════════════════════════════════════
 // v3.11 SCROLL LOGIC FOR REVERSE-FLEX MESSAGE LIST
@@ -3556,6 +3840,9 @@ function setupLocalLevelMonitor() {
           lastSent = now;
         }
       }
+      // Also drive my own seat-tile green ring locally (no need to wait for
+      // a server roundtrip — feels instant and avoids the 500ms throttle).
+      window._selfSpeaking = speaking;
       lastLevel = level;
     }, 200);
   } catch (e) { log("levelMon fail"); }
@@ -3912,7 +4199,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.12 (max " + MAX_PEERS + " peers, in-room sticker uploads)");
+log("page loaded v3.12 (max " + MAX_PEERS + " peers, in-room sticker uploads, seat-grid UI)");
 </script>
 </body>
 </html>"""
@@ -4010,6 +4297,7 @@ async def main():
     print("v3.11: messages bottom-anchored via column-reverse flex")
     print("v3.12: in-room sticker uploads + admin via hidden suffix")
     print("v3.12.1: sync GitHub stickers on boot, await commits for reliability")
+    print("v3.12.2: pro seat-grid UI (avatar tiles, speaking ring, drag-collapse)")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
