@@ -1441,11 +1441,6 @@ let MY_ID = "";
 let MY_IS_ADMIN = false;
 let serverMaxPeers = MAX_PEERS;
 let ws = null, localStream = null, myName = "", myAvatar = "";
-// v3.12: myJoinName preserves the RAW name typed by the user (which may
-// include the hidden admin suffix). Sent to the server in the join
-// handshake so it can authenticate admin. myName holds the stripped
-// version we display in our own UI (peer status bar, etc).
-let myJoinName = "";
 let isMuted = false, isHost = false;
 let leaving = false;
 let wsRetries = 0;
@@ -2023,23 +2018,9 @@ function watchLocalTrack() {
 }
 
 async function doJoin() {
-  const rawName = document.getElementById('nameIn').value.trim();
-  if (!rawName) { alert("Enter name"); return; }
-  // v3.12: if user typed the hidden admin suffix (e.g. "Sor-"), strip it
-  // for local display. The raw value (with "-") is still sent to the
-  // server in the join handshake so it can verify admin status. The
-  // server-stripped name will be the one other peers see; we strip it
-  // ourselves here so OUR own UI (peer status bar "(You)" tag, etc.)
-  // also shows the clean name.
-  const ADMIN_BASE = "sor";
-  const ADMIN_SUFFIX = "-";
-  let displayName = rawName;
-  if (rawName.toLowerCase() === (ADMIN_BASE + ADMIN_SUFFIX)) {
-    displayName = rawName.slice(0, ADMIN_BASE.length);  // preserve casing
-  }
-  myName = displayName;
-  // Send the RAW name to the server so the suffix can authenticate admin.
-  myJoinName = rawName;
+  const n = document.getElementById('nameIn').value.trim();
+  if (!n) { alert("Enter name"); return; }
+  myName = n;
   document.getElementById('joinBtn').disabled = true;
   document.getElementById('joinBtn').textContent = "...";
 
@@ -2127,7 +2108,7 @@ function connectWS() {
   ws.onopen = () => {
     log("WS open");
     wsRetries = 0;
-    ws.send(JSON.stringify({ type: 'join', name: myJoinName || myName, avatar: myAvatar }));
+    ws.send(JSON.stringify({ type: 'join', name: myName, avatar: myAvatar }));
   };
 
   ws.onmessage = async (ev) => {
