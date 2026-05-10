@@ -364,72 +364,61 @@ def _generate_sticker_filename() -> str:
 
 
 async def _github_verify_write_permission() -> Tuple[bool, str]:
-    """v3.12.3 / v3.12.4: Boot-time sanity check that the configured token
-    can actually WRITE to the repo, not just read. Returns (ok, reason).
+    """v3.12.5: Boot-time sanity check that the configured token can WRITE
+    to the repo. Returns (ok, reason).
 
-    Why we do a real write probe rather than just checking permissions:
-    fine-grained PATs (the "github_pat_..." kind) return HTTP 404 — not
-    403 — to hide repos they don't have write access to. A simple GET on
-    /repos/{owner}/{repo} can succeed for a read-only token but lie about
-    write capability. The only reliable test is to actually attempt a
-    PUT (and clean up after ourselves with a DELETE).
+    IMPORTANT: This used to do a real PUT+DELETE dance against the repo,
+    which committed two files per boot. That was a disaster on Render
+    when auto-deploy was on: every commit triggered a redeploy, which
+    triggered another probe, which triggered more commits — an infinite
+    deploy storm. Lesson learned: the probe MUST be read-only.
 
-    The probe writes a tiny file `.perm-check-<uuid>.txt` under the
-    stickers folder, then immediately deletes it. If both succeed, we
-    know commits + deletes both work. We swallow all errors here — this
-    is informational only, never fatal.
+    The new approach: GET /repos/{owner}/{repo} returns a `permissions`
+    object on authenticated requests, with `push: true` if the token has
+    write access. This works correctly for:
+      • Fine-grained PATs with 'Contents: Read and write' → push=true
+      • Fine-grained PATs with 'Contents: Read' only → push=false
+      • Classic PATs with `repo` scope → push=true (admin=true too)
+      • Tokens that can't see the repo at all → 404, treated as failure
+
+    A fine-grained PAT lacking ALL access returns 404 on this endpoint,
+    so we can distinguish "no access" from "read-only access" cleanly.
     """
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return False, "creds not set"
 
-    probe_name = f".perm-check-{uuid.uuid4().hex[:8]}.txt"
-    api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_STICKERS_PATH}/{probe_name}"
+    api = f"https://api.github.com/repos/{GITHUB_REPO}"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    body = {
-        "message": "perm check (auto, will be deleted)",
-        "content": base64.b64encode(b"ok").decode("ascii"),
-        "branch": GITHUB_BRANCH,
-    }
     try:
         async with aiohttp.ClientSession() as s:
-            # Step 1: PUT a tiny file
-            async with s.put(api, json=body, headers=headers, timeout=15) as r:
-                if r.status not in (200, 201):
-                    txt = await r.text()
-                    if r.status == 404:
-                        return False, (f"PUT got 404 — fine-grained token "
-                                       f"likely missing 'Contents: write' on "
-                                       f"{GITHUB_REPO!r} (or repo selector "
-                                       f"excludes it). Body: {txt[:160]}")
-                    if r.status == 401:
-                        return False, "PUT got 401 — token invalid or expired"
-                    if r.status == 403:
-                        return False, f"PUT got 403 — forbidden. Body: {txt[:160]}"
-                    return False, f"PUT got {r.status}. Body: {txt[:160]}"
-                created = await r.json()
-                sha = (created.get("content") or {}).get("sha", "")
-
-            # Step 2: DELETE it back so we don't pollute the repo. If the
-            # PUT worked, DELETE should too — but if it doesn't we report
-            # the discrepancy because uploaded stickers won't be deletable
-            # by the admin in-UI either.
-            if sha:
-                del_body = {
-                    "message": "perm check cleanup (auto)",
-                    "sha": sha,
-                    "branch": GITHUB_BRANCH,
-                }
-                async with s.delete(api, json=del_body, headers=headers, timeout=15) as r2:
-                    if r2.status not in (200, 204):
-                        return True, (f"WRITE works, but DELETE returned "
-                                      f"{r2.status} — admin sticker deletion "
-                                      f"may fail. Probe file {probe_name} "
-                                      f"left in repo.")
-            return True, "ok"
+            async with s.get(api, headers=headers, timeout=15) as r:
+                body = await r.text()
+                if r.status == 404:
+                    return False, (f"Got 404 on /repos/{GITHUB_REPO} — token "
+                                   f"can't see this repo. For fine-grained "
+                                   f"PATs this means the repo selector "
+                                   f"excludes it OR the token has no perms "
+                                   f"on it at all.")
+                if r.status == 401:
+                    return False, "Got 401 — token invalid or expired"
+                if r.status != 200:
+                    return False, f"Got HTTP {r.status}: {body[:160]}"
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    return False, f"Repo info JSON parse failed: {body[:160]}"
+                perms = data.get("permissions") or {}
+                can_write = bool(perms.get("push") or perms.get("admin")
+                                 or perms.get("maintain"))
+                if can_write:
+                    return True, "ok"
+                return False, ("Repo visible but token has READ-ONLY access. "
+                               "Fine-grained PAT needs 'Contents: Read and "
+                               "write' (not just Read).")
     except asyncio.TimeoutError:
         return False, "GitHub timed out during probe"
     except Exception as e:
@@ -4682,6 +4671,7 @@ async def main():
     print("v3.12.2: pro seat-grid UI (avatar tiles, speaking ring, drag-collapse)")
     print("v3.12.3: keyboard-proof seat panel overlay + GitHub perm self-check")
     print("v3.12.4: viewport-locked layout (header never lifts) + real write probe + /health/github")
+    print("v3.12.5: read-only perm probe (no more boot-time commits → no more deploy storms)")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
