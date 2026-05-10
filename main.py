@@ -296,7 +296,19 @@ async def _github_commit_sticker(filename: str, file_bytes: bytes) -> Tuple[bool
                     return False, ("GitHub forbidden (403) — token lacks "
                                    "'Contents: write' permission for this repo")
                 if r.status == 404:
-                    return False, f"GitHub repo or path not found (404) — check GITHUB_REPO={GITHUB_REPO!r} and branch={GITHUB_BRANCH!r}"
+                    # NOTE: GitHub fine-grained PATs (the "github_pat_..." ones)
+                    # return 404 — NOT 403 — when they lack 'Contents: write'
+                    # permission for the target repo. They literally hide the
+                    # repo's existence from a token that can't write to it.
+                    # So 404 here usually means: token is missing the write
+                    # permission, OR the repo selector on the token doesn't
+                    # include this specific repo, OR GITHUB_REPO/branch is
+                    # genuinely wrong. We surface all three possibilities.
+                    return False, (f"GitHub 404 — usually means the fine-grained "
+                                   f"token lacks 'Contents: Read and write' for "
+                                   f"{GITHUB_REPO!r}, OR the token's repo "
+                                   f"selector doesn't include this repo. Verify "
+                                   f"at github.com/settings/personal-access-tokens.")
                 if r.status == 422:
                     return False, "GitHub rejected the file (422) — usually means it already exists"
                 return False, f"GitHub returned HTTP {r.status}"
@@ -351,40 +363,77 @@ def _generate_sticker_filename() -> str:
     return f"up_{uuid.uuid4().hex[:10]}.webp"
 
 
-async def _github_verify_write_permission() -> bool:
-    """v3.12.3: Boot-time sanity check. Returns True if the configured
-    GitHub token actually has push (write) access to the configured repo.
-    Lets us print a loud, actionable warning at startup instead of waiting
-    until a user tries to upload a sticker to discover the auth is broken.
+async def _github_verify_write_permission() -> Tuple[bool, str]:
+    """v3.12.3 / v3.12.4: Boot-time sanity check that the configured token
+    can actually WRITE to the repo, not just read. Returns (ok, reason).
 
-    We hit /repos/{owner}/{repo} which returns a `permissions` object on
-    authenticated requests. `permissions.push == True` means the token
-    can write to the repo. This costs one cheap API call and tells us
-    everything we need.
+    Why we do a real write probe rather than just checking permissions:
+    fine-grained PATs (the "github_pat_..." kind) return HTTP 404 — not
+    403 — to hide repos they don't have write access to. A simple GET on
+    /repos/{owner}/{repo} can succeed for a read-only token but lie about
+    write capability. The only reliable test is to actually attempt a
+    PUT (and clean up after ourselves with a DELETE).
+
+    The probe writes a tiny file `.perm-check-<uuid>.txt` under the
+    stickers folder, then immediately deletes it. If both succeed, we
+    know commits + deletes both work. We swallow all errors here — this
+    is informational only, never fatal.
     """
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        return False
-    api = f"https://api.github.com/repos/{GITHUB_REPO}"
+        return False, "creds not set"
+
+    probe_name = f".perm-check-{uuid.uuid4().hex[:8]}.txt"
+    api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_STICKERS_PATH}/{probe_name}"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    body = {
+        "message": "perm check (auto, will be deleted)",
+        "content": base64.b64encode(b"ok").decode("ascii"),
+        "branch": GITHUB_BRANCH,
+    }
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(api, headers=headers, timeout=15) as r:
-                if r.status != 200:
+            # Step 1: PUT a tiny file
+            async with s.put(api, json=body, headers=headers, timeout=15) as r:
+                if r.status not in (200, 201):
                     txt = await r.text()
-                    print(f"[github] perm check {r.status}: {txt[:200]}")
-                    return False
-                data = await r.json()
-                perms = data.get("permissions") or {}
-                # `push` is True for fine-grained tokens with Contents: write,
-                # for classic tokens with `repo` scope, and for repo collabs.
-                return bool(perms.get("push") or perms.get("admin") or perms.get("maintain"))
+                    if r.status == 404:
+                        return False, (f"PUT got 404 — fine-grained token "
+                                       f"likely missing 'Contents: write' on "
+                                       f"{GITHUB_REPO!r} (or repo selector "
+                                       f"excludes it). Body: {txt[:160]}")
+                    if r.status == 401:
+                        return False, "PUT got 401 — token invalid or expired"
+                    if r.status == 403:
+                        return False, f"PUT got 403 — forbidden. Body: {txt[:160]}"
+                    return False, f"PUT got {r.status}. Body: {txt[:160]}"
+                created = await r.json()
+                sha = (created.get("content") or {}).get("sha", "")
+
+            # Step 2: DELETE it back so we don't pollute the repo. If the
+            # PUT worked, DELETE should too — but if it doesn't we report
+            # the discrepancy because uploaded stickers won't be deletable
+            # by the admin in-UI either.
+            if sha:
+                del_body = {
+                    "message": "perm check cleanup (auto)",
+                    "sha": sha,
+                    "branch": GITHUB_BRANCH,
+                }
+                async with s.delete(api, json=del_body, headers=headers, timeout=15) as r2:
+                    if r2.status not in (200, 204):
+                        return True, (f"WRITE works, but DELETE returned "
+                                      f"{r2.status} — admin sticker deletion "
+                                      f"may fail. Probe file {probe_name} "
+                                      f"left in repo.")
+            return True, "ok"
+    except asyncio.TimeoutError:
+        return False, "GitHub timed out during probe"
     except Exception as e:
-        print(f"[github] perm check err: {e}")
-        return False
+        return False, f"probe error: {type(e).__name__}: {e}"
 
 
 async def _github_sync_stickers_to_disk() -> int:
@@ -735,6 +784,36 @@ async def sticker_file(name: str):
 async def turn_endpoint():
     servers = await get_ice_servers()
     return JSONResponse({"iceServers": servers})
+
+
+@app.get("/health/github")
+async def health_github():
+    """v3.12.4: Browser-accessible diagnostic for sticker persistence.
+    Hit https://<your-app>.onrender.com/health/github to see whether the
+    GitHub creds work and uploads will survive restarts. Safe to share —
+    we never echo the token, only whether it's set and whether the probe
+    passed.
+    """
+    out = {
+        "github_token_set": bool(GITHUB_TOKEN),
+        "github_token_prefix": GITHUB_TOKEN[:11] + "..." if GITHUB_TOKEN else "",
+        "github_repo": GITHUB_REPO or "(not set)",
+        "github_branch": GITHUB_BRANCH,
+        "stickers_path": GITHUB_STICKERS_PATH,
+        "local_stickers_dir": STICKERS_DIR,
+        "local_stickers_count": len(list_stickers()),
+        "max_stickers": MAX_STICKERS,
+    }
+    if GITHUB_TOKEN and GITHUB_REPO:
+        ok, reason = await _github_verify_write_permission()
+        out["write_probe_ok"] = ok
+        out["write_probe_reason"] = reason
+        out["uploads_will_persist"] = bool(ok)
+    else:
+        out["write_probe_ok"] = False
+        out["write_probe_reason"] = "GITHUB_TOKEN or GITHUB_REPO not set"
+        out["uploads_will_persist"] = False
+    return JSONResponse(out)
 
 
 @app.get("/turn-status")
@@ -1353,14 +1432,33 @@ CALL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <title>Silent Hill</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fff}
-.app{display:flex;flex-direction:column;height:100vh;height:100dvh;position:relative}
+/* ════════════════════════════════════════════════════════════════════════
+   VIEWPORT LOCK — keep the header + seat panel fixed when keyboard opens
+   ════════════════════════════════════════════════════════════════════════
+   On mobile, when an input is focused and the on-screen keyboard appears,
+   the browser will lift the entire page up to keep the focused field
+   visible — pushing the header and seat panel out of view at the top.
+
+   Two-part fix:
+     1. html/body are LOCKED at the layout viewport size, with all scroll
+        and overscroll disabled. The browser has no page-level scroll
+        container to lift, so it can't move the page up.
+     2. .app is `position:fixed; inset:0` so it tracks the *visual* viewport
+        directly. When the keyboard opens, the visual viewport shrinks
+        from below and `inset:0` follows it (browsers anchor fixed
+        elements to the visual viewport when a soft keyboard is open).
+        The header stays at the top, the input bar stays at the bottom of
+        what's visible, and only the chat-stack in between absorbs the
+        change.
+   ════════════════════════════════════════════════════════════════════════ */
+html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;inset:0;width:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fff;touch-action:manipulation}
+.app{display:flex;flex-direction:column;position:fixed;inset:0;height:100dvh;max-height:100dvh}
 .bg{position:fixed;inset:0;z-index:0;background:url('/bg.jpg') center/cover no-repeat;opacity:0.4}
 .bg::after{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,0.6),rgba(0,0,0,0.3),rgba(0,0,0,0.7))}
 .header{position:relative;z-index:10;background:rgba(13,13,13,0.95);backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,255,255,0.06);padding:8px 12px;display:flex;align-items:center;gap:10px;flex-shrink:0}
@@ -3016,6 +3114,70 @@ if (document.readyState !== 'loading') initSeatPanel();
 else document.addEventListener('DOMContentLoaded', initSeatPanel);
 
 // ════════════════════════════════════════════════════════════════════════════
+// VISUAL VIEWPORT TRACKER — bulletproof keyboard handling
+// ════════════════════════════════════════════════════════════════════════════
+// CSS alone (position:fixed; inset:0) is *almost* enough on modern browsers,
+// but iOS Safari and some Android Chrome builds still occasionally lift the
+// layout viewport when an input is focused and would otherwise be obscured
+// by the keyboard. The visualViewport API gives us the *actual* visible
+// rectangle of the page, accounting for the keyboard. We mirror its size
+// onto .app via inline styles so:
+//   • The header NEVER scrolls off the top.
+//   • The seat panel stays anchored under the header.
+//   • The chat-stack between header and input shrinks, and the messages
+//     inside it remain scrollable normally.
+//   • The input bar sits exactly above the keyboard, never under it.
+// We also pin window scroll to (0,0) — if the browser tries to lift the
+// page despite our CSS, we snap it back instantly.
+// ────────────────────────────────────────────────────────────────────────────
+(function setupVisualViewportLock() {
+  const vv = window.visualViewport;
+  const app = () => document.getElementById('app');
+  function applyVV() {
+    const a = app();
+    if (!a) return;
+    if (vv) {
+      // Use the visual viewport's actual height. When the keyboard opens
+      // this number drops; .app shrinks with it. offsetTop > 0 means the
+      // browser has already scrolled the page — we cancel that.
+      a.style.height = vv.height + 'px';
+      a.style.top = vv.offsetTop + 'px';
+    } else {
+      // Old browsers: rely purely on CSS dvh.
+      a.style.height = '';
+      a.style.top = '';
+    }
+    // Always pin window scroll to 0 — if anything tried to lift the page,
+    // undo it immediately.
+    if (window.scrollY !== 0 || window.scrollX !== 0) {
+      window.scrollTo(0, 0);
+    }
+  }
+  if (vv) {
+    vv.addEventListener('resize', applyVV);
+    vv.addEventListener('scroll', applyVV);
+  }
+  window.addEventListener('resize', applyVV);
+  // Also re-apply when an input gains/loses focus — this is the moment the
+  // browser tries hardest to lift the page.
+  document.addEventListener('focusin', () => {
+    // Two passes: one immediately, one after the keyboard-open animation
+    // (typically ~250-350ms on Android, ~200ms on iOS) finishes settling.
+    applyVV();
+    setTimeout(applyVV, 50);
+    setTimeout(applyVV, 350);
+  }, true);
+  document.addEventListener('focusout', () => {
+    applyVV();
+    setTimeout(applyVV, 50);
+    setTimeout(applyVV, 350);
+  }, true);
+  // Initial apply
+  if (document.readyState !== 'loading') applyVV();
+  else document.addEventListener('DOMContentLoaded', applyVV);
+})();
+
+// ════════════════════════════════════════════════════════════════════════════
 // v3.11 SCROLL LOGIC FOR REVERSE-FLEX MESSAGE LIST
 // ════════════════════════════════════════════════════════════════════════════
 // Mental model:
@@ -4460,21 +4622,33 @@ async def main():
         print(f"[github-sync] pulling stickers from {GITHUB_REPO}/{GITHUB_STICKERS_PATH}@{GITHUB_BRANCH} ...")
         synced = await _github_sync_stickers_to_disk()
         print(f"[github-sync] {synced} sticker(s) downloaded fresh from GitHub")
-        # v3.12.3: verify the token actually has WRITE permission on the
-        # repo. We don't want to find this out only when a user uploads
-        # something. We probe with a 1-byte test file to /tmp-perm-check
-        # and immediately delete it; the dance proves PUT+DELETE both work.
-        ok_write = await _github_verify_write_permission()
+        # v3.12.4: write+delete probe — proves the token can actually push,
+        # which is the ONLY way to be sure with fine-grained PATs (they 404
+        # on writes they can't do, so a read-only token will appear "fine"
+        # to a permissions GET).
+        ok_write, reason = await _github_verify_write_permission()
         if ok_write:
-            print("[github-sync] write permission verified — uploads will persist")
+            if reason == "ok":
+                print(f"[github-sync] write probe PASSED — uploads will persist")
+            else:
+                # Partial success (write OK, delete not OK)
+                print(f"[github-sync] write probe partial: {reason}")
         else:
             print("!" * 70)
-            print("! [github-sync] WRITE PERMISSION CHECK FAILED                       !")
-            print("! Stickers can be DOWNLOADED from GitHub, but new uploads will NOT  !")
-            print("! be saved back. Token is missing 'Contents: write' on this repo,  !")
-            print("! or the repo/branch is wrong. Existing s1.jpg..s5.jpg will keep    !")
-            print("! showing (they're committed in the repo) but new ones will vanish !")
-            print("! after every restart/redeploy until you fix the token.             !")
+            print("! [github-sync] WRITE PROBE FAILED                                  !")
+            print(f"! Reason: {reason[:60]:<60}!" if len(reason) <= 60 else f"! Reason: {reason[:58]}..!")
+            if len(reason) > 60:
+                # Print the full reason on its own line, unwrapped
+                print(f"! Full reason:")
+                # Wrap to 66-char lines to fit our banner
+                rest = reason
+                while rest:
+                    chunk, rest = rest[:66], rest[66:]
+                    print(f"!   {chunk}")
+            print("! Stickers will appear in-room but will VANISH on every restart.   !")
+            print("! Existing s1.jpg..s5.jpg keep working (already in repo).          !")
+            print("! Fix: github.com/settings/personal-access-tokens →                 !")
+            print("!      this token → 'Contents: Read and write' on this repo.       !")
             print("!" * 70)
     else:
         print("!" * 70)
@@ -4507,6 +4681,7 @@ async def main():
     print("v3.12.1: sync GitHub stickers on boot, await commits for reliability")
     print("v3.12.2: pro seat-grid UI (avatar tiles, speaking ring, drag-collapse)")
     print("v3.12.3: keyboard-proof seat panel overlay + GitHub perm self-check")
+    print("v3.12.4: viewport-locked layout (header never lifts) + real write probe + /health/github")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
