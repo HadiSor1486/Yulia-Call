@@ -1682,22 +1682,46 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
    overflow:hidden (which we need to keep — it's what clips the <img>
    to a perfect circle). */
 .seat-av-wrap{position:relative;width:64px;height:64px;flex-shrink:0}
-/* The avatar uses a CSS custom property `--lvl` (0..1) that JS sets
-   from real-time audio level. The box-shadow's spread + opacity are
-   computed off it, so the glow visibly breathes with the voice instead
-   of running a fixed-tempo animation. When --lvl is 0 (silent), the
-   glow is invisible. When 1 (peak), it's a strong ring. .speaking is
-   still toggled as a binary indicator (so the border color flips
-   green) — the dynamic glow is layered on top. */
 .seat-av{--lvl:0;position:relative;width:64px;height:64px;border-radius:50%;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;color:#8e8e93;overflow:hidden;border:3px solid transparent;transition:border-color .14s;box-sizing:border-box}
 .seat-av img{width:100%;height:100%;object-fit:cover;display:block}
 .seat-av.speaking{border-color:#34c759}
-/* Voice-reactive halo: a pseudo-element behind the avatar whose
-   blur/spread scale with --lvl. Sits on its own GPU layer so updating
-   --lvl at ~60Hz doesn't cause heavy paints. opacity also scales with
-   level so silence = invisible halo, loud = bright halo. */
-.seat-av::after{content:'';position:absolute;inset:-3px;border-radius:50%;pointer-events:none;box-shadow:0 0 calc(6px + 22px * var(--lvl)) calc(1px + 5px * var(--lvl)) rgba(52,199,89,calc(0.15 + 0.75 * var(--lvl)));opacity:0;transition:opacity .15s linear,box-shadow .08s linear;will-change:box-shadow,opacity}
-.seat-av.speaking::after{opacity:1}
+/* Voice-reactive halo: a pseudo-element behind the avatar.
+   v3.12.9 fix: CSS custom properties inside calc() don't interpolate
+   by default — they snap. So in v3.12.8 the halo looked frozen. The
+   fix is two-fold:
+     1. Register --lvl with @property so the browser knows it's a
+        <number> and CAN interpolate it across transitions. Then
+        anything using calc(... * var(--lvl)) animates smoothly.
+     2. Layer a visible scale-pulse on top, driven by the level too —
+        gives a real "breathing" feel even when level is steady.
+   Browsers without @property support (older Safari) still get the
+   transitions on opacity + transform, so the ring still moves. */
+@property --lvl {
+  syntax: '<number>';
+  inherits: true;
+  initial-value: 0;
+}
+/* The halo: position, base styles, and the level-driven box-shadow.
+   transform/opacity are set in .speaking so a continuous breath
+   animation can play on top without fighting the static rule. */
+.seat-av::after{content:'';position:absolute;inset:-3px;border-radius:50%;pointer-events:none;box-shadow:0 0 calc(6px + 26px * var(--lvl)) calc(1px + 6px * var(--lvl)) rgba(52,199,89,calc(0.18 + 0.78 * var(--lvl)));opacity:0;transform:scale(1);transition:opacity .18s linear,box-shadow .14s ease-out;will-change:box-shadow,opacity,transform}
+/* When speaking: show the halo (opacity:1) AND run a continuous breath
+   keyframe so the ring visibly pulses even when audio level is steady.
+   The breath adds a ±6% scale + ±15% opacity ripple on a 1.4s cycle —
+   subtle enough to feel organic, not robotic. The level-driven
+   box-shadow runs in parallel, so loud speech still produces a bigger
+   bloom on top of the breath. */
+.seat-av.speaking::after{opacity:1;animation:seatHaloBreath 1.4s ease-in-out infinite}
+@keyframes seatHaloBreath{
+  0%,100%{transform:scale(calc(1 + 0.04 * var(--lvl)));opacity:0.85}
+  50%   {transform:scale(calc(1.06 + 0.08 * var(--lvl)));opacity:1}
+}
+/* Subtle continuous heartbeat for the ring border so it never looks
+   completely static when someone speaks at a steady volume. This is
+   independent of the level-driven halo above — it's a slow, gentle
+   border-color pulse that just adds life. */
+.seat-av.speaking{animation:seatBorderPulse 1.6s ease-in-out infinite}
+@keyframes seatBorderPulse{0%,100%{border-color:rgba(52,199,89,0.85)}50%{border-color:rgba(52,199,89,1)}}
 .seat-av.host-frame{border-color:rgba(255,204,0,0.85)}
 .seat-av.host-frame.speaking{border-color:#34c759}
 /* Mute badge: lives on the WRAPPER (not the clipped .seat-av), so it can
@@ -2982,16 +3006,25 @@ function updPeers() {
     peerMap.forEach((p, id) => renderRemote(id));
   }
 
-  // Pad with empty placeholder seats so the horizontal row never looks
-  // bare. Rule: total visible slots = max(real, 4). With 1 real → 1 + 3
-  // empties = 4. With 4 real → no empties. With 5+ real, no empties and
-  // the row becomes horizontally scrollable. The empties signal to the
-  // user that the room can hold more people, without dominating the UI.
+  // ─── Empty-seat padding rule ─────────────────────────────────────────
+  // Two principles working together:
+  //   (a) Minimum 4 visible slots — so a small room (1-3 people) still
+  //       looks balanced with placeholder seats filling the rest.
+  //   (b) After all visible seats are filled, always trail with ONE
+  //       empty "invite" slot so users see there's room to grow.
+  // Combined formula: visible = clamp(real + 1, 4, room_max).
+  //   • 1 real  → 1 + 3 empties = 4 slots
+  //   • 3 real  → 3 + 1 empty   = 4 slots
+  //   • 4 real  → 4 + 1 empty   = 5 slots  (rule b kicks in)
+  //   • 5 real  → 5 + 1 empty   = 6 slots
+  //   • 14 real → 14 + 1 empty  = 15 slots
+  //   • 15 real → 15 + 0 empty  = 15 slots (room full — no invite slot)
+  // The single trailing empty makes new joins feel natural: as soon as
+  // someone fills the invite slot, a fresh invite slot appears after them.
   const total = peerMap.size + 1;
   const MIN_VISIBLE_SLOTS = 4;
-  if (total < MIN_VISIBLE_SLOTS) {
-    for (let i = total; i < MIN_VISIBLE_SLOTS; i++) h += _emptySeatTile();
-  }
+  const visible = Math.min(Math.max(total + 1, MIN_VISIBLE_SLOTS), serverMaxPeers);
+  for (let i = total; i < visible; i++) h += _emptySeatTile();
   grid.innerHTML = h;
 
   // Pull-tab count (shown when panel is collapsed)
@@ -4752,6 +4785,8 @@ async def main():
     print("v3.12.6: removed hardcoded credentials — now env-only (security)")
     print("v3.12.7: mute is a hard override on the speaking ring (no more stuck green)")
     print("v3.12.8: single horizontal seat row + voice-reactive halo (real audio-driven)")
+    print("v3.12.9: halo actually animates now (@property for var interp + continuous breath)")
+    print("v3.12.10: trailing invite-slot — always 1 empty after real seats, capped at room max")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
