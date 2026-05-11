@@ -1,45 +1,30 @@
 """
-Silent Hill Voice Call Bot — v3.12 BEAST MODE (IN-ROOM STICKER UPLOADS)
+Silent Hill Voice Call Bot — v3.13 BEAST MODE (MESSAGE DELETION + SWIPE REPLY)
 ═══════════════════════════════════════════════════════════════════════════════
-v3.12 — STICKERS CAN BE UPLOADED FROM INSIDE THE ROOM, ADMIN CAN DELETE,
-        ALL WITH RAM SAFETY AND GITHUB PERSISTENCE.
+v3.13 — USERS CAN DELETE THEIR OWN MESSAGES + SWIPE-TO-REPLY + LONG-PRESS
+         DELETE UI.
 
-  WHAT'S NEW SINCE v3.11:
-    • [+] button in the sticker panel header lets ANY user upload a new
-          sticker. The image is resized client-side first (max 1024px,
-          WebP @ 0.85) so a 4 MB phone photo becomes ~80 KB before it
-          ever leaves the device. The server then defensively re-resizes
-          and re-encodes (Pillow → WebP @ q=85), strips EXIF, and writes
-          to STICKERS_DIR. The new sticker is broadcast live to every
-          peer in every room — it appears in the picker instantly, no
-          rejoin needed.
-    • Hard cap of 30 stickers (MAX_STICKERS env var). Upload at the cap
-          is rejected with a clear toast — admin must delete first.
-    • RAM guard: an asyncio.Semaphore(1) wraps the Pillow decode so we
-          never have two heavy resize jobs in memory at once. Concurrent
-          uploads queue. Plus a 5 MB hard limit on the raw upload bytes
-          so a malicious payload can't OOM the bot.
-    • Atomic count check via asyncio.Lock so two simultaneous uploads
-          can't sneak past MAX_STICKERS.
-    • Persistence on Render: if GITHUB_TOKEN + GITHUB_REPO env vars are
-          set, every uploaded/deleted sticker is committed to your repo
-          in the background via the GitHub Contents API. Survives
-          restarts and redeploys. If not set, uploads still work for the
-          current process lifetime.
-    • Hidden-suffix admin auth: joining as "Sor-" (or any
-          ADMIN_NAME_BASE+ADMIN_NAME_SUFFIX) marks the user admin
-          server-side and strips the "-" before display. Plain "Sor" is
-          treated as a regular peer with no badge and no powers. The
-          Host badge and the delete (×) buttons on stickers now key off
-          the server-trusted is_admin flag, never off the displayed
-          name. Impersonation is structurally impossible.
-    • Auto-generated unique filenames (up_<10hex>.webp) — no name
-          collisions, no traversal surface.
+  WHAT'S NEW SINCE v3.12:
+    • Message deletion: each user can delete ONLY messages they sent.
+          Long-press your own message → red trash bin appears → tap to
+          delete. The bin auto-hides after 3 seconds or when tapping
+          elsewhere. Deleted messages show a "This message was deleted"
+          placeholder, preserving the sender's avatar and name.
+    • Swipe-to-reply: swipe OTHER people's messages to the RIGHT to
+          reply. Swipe YOUR OWN messages to the LEFT to reply. Smooth
+          dampened animation with spring-back — no message cutting.
+          Vertical scroll is preserved when the gesture is more up/down
+          than left/right.
+    • Server verifies ownership via peer_id before accepting any deletion.
+          Only the original sender can delete their message. Deleted state
+          is persisted in the chat file and broadcast to all room peers.
 
-  EVERYTHING FROM v3.11 IS UNTOUCHED:
+  EVERYTHING FROM v3.12 IS UNTOUCHED:
+    • In-room sticker uploads with RAM safety and GitHub persistence
+    • Hidden-suffix admin auth ("Sor-")
     • Reverse-flex bottom-anchored messages (WhatsApp/Telegram pattern)
     • All scroll lock / unread / jump-button logic
-    • All v3.10 stickers, replies, image preview, typing
+    • All stickers, replies, image preview, typing
     • All memory hardening, all WebRTC reliability
     • All TURN failover, all Kyodo bot integration
 
@@ -1329,6 +1314,58 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                                     "deleted": target})
                 print(f"[stickers] deleted {target} by admin {name}")
 
+            # ── v3.13: message deletion (users can only delete their own) ──
+            # Client sends { type: "delete_msg", msg_id: "..." }
+            # Server verifies the message was sent by this peer_id, marks it
+            # deleted in the chat file, and broadcasts to all room peers.
+            elif mt == "delete_msg":
+                target_msg_id = msg.get("msg_id", "")
+                if not target_msg_id:
+                    await ws.send_json({"type": "delete_result", "ok": False,
+                                        "error": "No message ID"})
+                    continue
+                chat_file = f"{room_id}_chat.json"
+                all_msgs = json_read(chat_file, [])
+                found = False
+                for mm in all_msgs:
+                    if mm.get("id") == target_msg_id:
+                        # Ownership check: only the original sender can delete
+                        if mm.get("peer_id") != peer_id:
+                            await ws.send_json({"type": "delete_result", "ok": False,
+                                                "error": "You can only delete your own messages"})
+                            found = True
+                            break
+                        # Mark deleted: preserve metadata (name, avatar, time)
+                        # but strip all content
+                        mm["deleted"] = True
+                        mm["text"] = ""
+                        mm["image"] = ""
+                        mm["sticker"] = ""
+                        json_write(chat_file, all_msgs)
+                        await ws.send_json({"type": "delete_result", "ok": True,
+                                            "msg_id": target_msg_id})
+                        # Broadcast deletion to everyone in the room
+                        deletion_payload = {
+                            "type": "msg_deleted",
+                            "msg_id": target_msg_id,
+                            "peer_id": mm.get("peer_id"),
+                            "name": mm.get("name"),
+                            "avatar": mm.get("avatar"),
+                            "is_admin": mm.get("is_admin"),
+                            "time": mm.get("time"),
+                        }
+                        for p_other, pd_other in room["peers"].items():
+                            try:
+                                await pd_other["ws"].send_json(deletion_payload)
+                            except Exception:
+                                pass
+                        found = True
+                        print(f"[delete] {name} deleted msg {target_msg_id}")
+                        break
+                if not found:
+                    await ws.send_json({"type": "delete_result", "ok": False,
+                                        "error": "Message not found"})
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -1516,10 +1553,17 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 .msg-bubble{padding:8px 14px;border-radius:18px;font-size:14px;line-height:1.4;word-break:break-word;white-space:pre-wrap}
 .msg-row.other .msg-bubble{background:#2c2c2e;border-bottom-left-radius:4px}
 .msg-row.self .msg-bubble{background:#007aff;border-bottom-right-radius:4px}
-.msg-row{cursor:pointer;transition:opacity .15s}
+.msg-row{cursor:pointer;transition:opacity .15s;position:relative;touch-action:pan-y;user-select:none;-webkit-user-select:none}
 .msg-row:active{opacity:0.6}
 .msg-row.system{cursor:default}
 .msg-row.system:active{opacity:1}
+/* ─── v3.13: swipe-to-reply + long-press delete ─── */
+.msg-content{transition:transform .3s cubic-bezier(.2,.7,.2,1);will-change:transform}
+.msg-delete-btn{position:absolute;top:50%;right:6px;transform:translateY(-50%);width:34px;height:34px;border-radius:50%;background:#ff3b30;border:none;color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:5;box-shadow:0 2px 10px rgba(0,0,0,.5);animation:msgIn .15s ease-out;padding:0}
+.msg-row.self .msg-delete-btn{right:auto;left:6px}
+.msg-delete-btn svg{width:16px;height:16px;pointer-events:none}
+.msg-delete-btn:active{transform:translateY(-50%) scale(.9)}
+.msg-deleted{color:#8e8e93;font-size:13px;font-style:italic;padding:6px 0;opacity:.65}
 .chat-img{max-width:240px;max-height:300px;border-radius:12px;display:block;cursor:pointer;margin:2px 0}
 .img-expired{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.55);font-size:12px;font-style:italic;margin:2px 0}
 .img-expired svg{width:18px;height:18px;flex-shrink:0;opacity:0.6}
@@ -2602,6 +2646,17 @@ function connectWS() {
       case 'sticker_result':
         // v3.12: response to an upload or delete attempt. Show inline status.
         handleStickerResult(m);
+        break;
+
+      // ── v3.13: message deletion handlers ──
+      case 'msg_deleted':
+        handleMsgDeleted(m);
+        break;
+
+      case 'delete_result':
+        if (!m.ok) {
+          showStickerToast(m.error || 'Delete failed', 'err', 4000);
+        }
         break;
 
       case 'history':
@@ -4492,12 +4547,143 @@ function appendToVisualBottom(container, node) {
   container.insertBefore(node, container.firstChild);
 }
 
+// ── v3.13: handle incoming message deletion broadcast ──────────────────────
+function handleMsgDeleted(m) {
+  const c = document.getElementById('msgs');
+  if (!c || !m.msg_id) return;
+  const row = c.querySelector('[data-msg-id="' + esc(m.msg_id) + '"]');
+  if (!row) return;
+  const wasAtBottom = isAtBottom();
+  const isSelf = row.classList.contains('self');
+  const pi = peerMap.get(m.peer_id) || {};
+  const name = m.name || pi.name || '?';
+  const avSrc = m.avatar || pi.avatar || '';
+  const showBadge = !!(m.is_admin || pi.is_admin);
+  let avHTML;
+  if (avSrc) avHTML = '<div class="avatar"><img src="' + esc(avSrc) + '"></div>';
+  else avHTML = '<div class="avatar"><span>' + esc(name[0].toUpperCase()) + '</span></div>';
+  const header = '<div class="msg-header"><span class="msg-name">' + esc(name) + '</span>' + (showBadge ? '<span class="msg-badge host">Host</span>' : '') + '</div>';
+  row.innerHTML = avHTML + '<div class="msg-content">' + header + '<div class="msg-deleted">This message was deleted</div></div>';
+  row.style.pointerEvents = 'none';
+  if (wasAtBottom) scrollToLatest(false);
+}
+
+// ── v3.13: swipe-to-reply + long-press-delete gestures ─────────────────────
+// Swipe OTHER people's messages RIGHT to reply.
+// Swipe YOUR own messages LEFT to reply.
+// Long-press YOUR own message to reveal a red trash bin.
+function attachMessageGestures(row, m) {
+  if (m.deleted || m.kind === 'system' || !m.id) return;
+  const content = row.querySelector('.msg-content');
+  if (!content) return;
+  let startX = 0, startY = 0, startTime = 0;
+  let isDragging = false;
+  let longPressTimer = null;
+  let didSwipe = false;
+  let didLongPress = false;
+  let deleteBtn = null;
+  const isOwn = !!m.self;
+  const SWIPE_THRESHOLD = 55;
+  const LONG_PRESS_MS = 500;
+
+  function removeDeleteBtn() {
+    if (deleteBtn) { deleteBtn.remove(); deleteBtn = null; }
+  }
+  function showDeleteBtn() {
+    removeDeleteBtn();
+    document.querySelectorAll('.msg-delete-btn').forEach(function(b) { b.remove(); });
+    deleteBtn = document.createElement('button');
+    deleteBtn.className = 'msg-delete-btn';
+    deleteBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+    deleteBtn.title = 'Delete message';
+    deleteBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'delete_msg', msg_id: m.id }));
+      }
+      removeDeleteBtn();
+    });
+    row.appendChild(deleteBtn);
+    setTimeout(removeDeleteBtn, 3000);
+  }
+  document.addEventListener('click', function onDocClick(e) {
+    if (deleteBtn && !row.contains(e.target)) removeDeleteBtn();
+  });
+
+  function onStart(x, y) {
+    startX = x; startY = y; startTime = Date.now();
+    isDragging = false; didSwipe = false; didLongPress = false;
+    longPressTimer = setTimeout(function() {
+      if (!isDragging && isOwn) { didLongPress = true; showDeleteBtn(); }
+    }, LONG_PRESS_MS);
+  }
+  function onMove(x, y) {
+    if (!startTime) return;
+    var dx = x - startX, dy = y - startY;
+    if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 10) {
+      if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+      startTime = 0; return;
+    }
+    if (!isDragging && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) {
+      isDragging = true;
+      if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+    }
+    if (!isDragging) return;
+    var validDir = isOwn ? (dx < 0) : (dx > 0);
+    if (!validDir) return;
+    var cap = isOwn ? Math.max(dx, -110) : Math.min(dx, 110);
+    content.style.transition = 'none';
+    content.style.transform = 'translateX(' + (cap * 0.35) + 'px)';
+    didSwipe = true;
+  }
+  function onEnd(x, y) {
+    if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+    content.style.transition = 'transform .3s cubic-bezier(.2,.7,.2,1)';
+    content.style.transform = '';
+    if (didSwipe && startTime) {
+      var dx = x - startX;
+      var triggered = isOwn ? (dx < -SWIPE_THRESHOLD) : (dx > SWIPE_THRESHOLD);
+      if (triggered) startReply(m);
+    }
+    startTime = 0; isDragging = false;
+  }
+
+  row.addEventListener('touchstart', function(e) {
+    onStart(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: true });
+  row.addEventListener('touchmove', function(e) {
+    onMove(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: true });
+  row.addEventListener('touchend', function(e) {
+    onEnd(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+  }, { passive: true });
+  row.addEventListener('mousedown', function(e) {
+    if (e.button !== 0) return;
+    onStart(e.clientX, e.clientY);
+  });
+  row.addEventListener('mousemove', function(e) {
+    if (e.buttons & 1) onMove(e.clientX, e.clientY);
+  });
+  row.addEventListener('mouseup', function(e) {
+    if (e.button !== 0) return;
+    onEnd(e.clientX, e.clientY);
+  });
+
+  row.addEventListener('click', function(ev) {
+    if (didSwipe) { didSwipe = false; return; }
+    if (didLongPress) { didLongPress = false; return; }
+    if (deleteBtn) { removeDeleteBtn(); return; }
+    var t = ev.target;
+    if (t.classList && t.classList.contains('chat-img')) {
+      ev.stopPropagation(); openImagePreview(t.src); return;
+    }
+    if (t.tagName === 'IMG' && t.closest('.avatar')) return;
+    startReply(m);
+  });
+}
+
 function renderMsg(m) {
   const c = document.getElementById('msgs'); if (!c) return;
-
-  // v3.11: detect "was at bottom" BEFORE we add the new node. With
-  // column-reverse, distanceFromVisualBottom is |scrollTop|, which is
-  // unaffected by the insertion (the browser anchors scroll naturally).
   const wasAtBottom = isAtBottom();
 
   if (m.kind === 'system') {
@@ -4509,10 +4695,6 @@ function renderMsg(m) {
     const isSelf = !!m.self;
     const pi = peerMap.get(m.peer_id) || {};
     const name = m.name || pi.name || '?';
-    // v3.12: badge is based on server-trusted is_admin flag, not name.
-    // The flag flows from: name ends with hidden suffix → server detects →
-    // sets is_admin=True on chat message envelope. Plain name match is
-    // gone, so impersonators can't sneak a badge.
     const showBadge = !!(m.is_admin || pi.is_admin);
     const avSrc = m.avatar || pi.avatar || '';
 
@@ -4520,15 +4702,27 @@ function renderMsg(m) {
     const hasImage = !!(m.image || m.image_expired);
     const hasText = !!(m.text && m.text.length > 0);
     const stickerOnly = hasSticker && !hasText && !hasImage;
+    const isDeleted = !!m.deleted;
 
     const row = document.createElement('div');
     row.className = 'msg-row ' + (isSelf ? 'self' : 'other');
-    if (stickerOnly) row.classList.add('has-sticker-only');
+    if (stickerOnly && !isDeleted) row.classList.add('has-sticker-only');
+    if (m.id) row.setAttribute('data-msg-id', m.id);
 
     let avHTML;
     if (avSrc) avHTML = '<div class="avatar"><img src="' + esc(avSrc) + '"></div>';
     else avHTML = '<div class="avatar"><span>' + esc(name[0].toUpperCase()) + '</span></div>';
     const header = '<div class="msg-header"><span class="msg-name">' + esc(name) + '</span>' + (showBadge ? '<span class="msg-badge host">Host</span>' : '') + '</div>';
+
+    // v3.13: deleted messages show a placeholder with avatar + name
+    if (isDeleted) {
+      row.innerHTML = avHTML + '<div class="msg-content">' + header + '<div class="msg-deleted">This message was deleted</div></div>';
+      row.style.pointerEvents = 'none';
+      appendToVisualBottom(c, row);
+      if (m.self || wasAtBottom) scrollToLatest(false);
+      else { unreadCount++; updateJumpButton(); }
+      return;
+    }
 
     let replyHTML = '';
     if (m.reply_to) {
@@ -4571,27 +4765,12 @@ function renderMsg(m) {
 
     row.innerHTML = avHTML + '<div class="msg-content">' + contentHTML + '</div>';
 
-    row.addEventListener('click', (ev) => {
-      const t = ev.target;
-      if (t.classList && t.classList.contains('chat-img')) {
-        ev.stopPropagation();
-        openImagePreview(t.src);
-        return;
-      }
-      if (t.tagName === 'IMG' && t.closest('.avatar')) return;
-      startReply(m);
-    });
+    // v3.13: attach swipe-to-reply and long-press-delete gestures
+    attachMessageGestures(row, m);
 
     appendToVisualBottom(c, row);
   }
 
-  // v3.11: with column-reverse, the browser already keeps the bottom
-  // pinned automatically when content is added at the visual bottom and
-  // the user is at the bottom. We still nudge scrollTop to 0 for self
-  // messages (so we ALWAYS see what we just sent) and for the
-  // wasAtBottom case (defensive: keep us pinned even if some browser
-  // edge case nudged the scroll). When the user is scrolled UP reading
-  // history, we don't move them — we just bump the unread badge.
   if (m.self || wasAtBottom) {
     scrollToLatest(false);
   } else {
@@ -4672,7 +4851,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.12 (max " + MAX_PEERS + " peers, in-room sticker uploads, seat-grid UI)");
+log("page loaded v3.13 (max " + MAX_PEERS + " peers, sticker uploads, seat-grid, msg deletion, swipe reply)");
 </script>
 </body>
 </html>"""
@@ -4815,6 +4994,7 @@ async def main():
     print("v3.12.11: rolled back voice-reactive halo to the reliable gentle keyframe pulse")
     print("v3.12.12: hysteresis on speaking detect — snappy stop, no mid-speech flicker")
     print("v3.12.13: cleanup pass — fixed stale comments, dead refs, banner version")
+    print("v3.13: message deletion (own msgs only) + swipe-to-reply + long-press delete UI")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
