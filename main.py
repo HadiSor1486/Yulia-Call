@@ -1619,15 +1619,19 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 /* ─── v3.13: Image send preview overlay (WhatsApp style) ─── */
 .img-send-overlay{position:fixed;inset:0;z-index:350;background:rgba(0,0,0,0.93);display:flex;flex-direction:column;animation:msgIn .2s}
 .img-send-preview{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;min-height:0}
-.img-send-preview img{max-width:95vw;max-height:70vh;border-radius:12px;object-fit:contain}
-.img-send-bar{background:rgba(20,20,22,0.98);padding:12px 16px;display:flex;align-items:center;gap:10px;border-top:1px solid rgba(255,255,255,0.06)}
-.img-send-caption{flex:1;height:40px;border-radius:20px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.05);color:#fff;padding:0 16px;font-size:14px;outline:none}
+.img-send-preview img{max-width:95vw;max-height:65vh;border-radius:12px;object-fit:contain}
+/* Bottom bar: caption on top row, buttons on bottom row — always fits on mobile */
+.img-send-bar{background:rgba(20,20,22,0.98);padding:10px 12px calc(10px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:8px;border-top:1px solid rgba(255,255,255,0.06)}
+.img-send-caption{width:100%;height:44px;border-radius:22px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.05);color:#fff;padding:0 16px;font-size:15px;outline:none}
 .img-send-caption::placeholder{color:#8e8e93}
-.img-send-btn{height:40px;padding:0 18px;border-radius:20px;border:none;background:#007aff;color:#fff;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap}
+.img-send-actions{display:flex;align-items:center;gap:8px;justify-content:flex-end}
+.img-send-btn{height:40px;padding:0 20px;border-radius:20px;border:none;background:#007aff;color:#fff;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;flex-shrink:0;display:flex;align-items:center;justify-content:center;gap:4px}
 .img-send-btn.vo-btn{background:linear-gradient(135deg,#ff9500,#ff6b00);color:#fff}
-.img-send-btn:active{transform:scale(.95)}
-.img-send-cancel{height:40px;padding:0 14px;border-radius:20px;border:1px solid rgba(255,255,255,0.15);background:transparent;color:#8e8e93;font-size:14px;cursor:pointer}
+.img-send-btn:active{transform:scale(.93)}
+.img-send-cancel{height:40px;padding:0 16px;border-radius:20px;border:1px solid rgba(255,255,255,0.15);background:transparent;color:#8e8e93;font-size:14px;cursor:pointer;flex-shrink:0;white-space:nowrap}
 .img-send-cancel:active{opacity:.7}
+/* View Once button: icon + short label on all screens */
+.img-send-btn.vo-btn .vo-text{font-size:13px}
 .chat-img{max-width:240px;max-height:300px;border-radius:12px;display:block;cursor:pointer;margin:2px 0}
 .img-expired{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.55);font-size:12px;font-style:italic;margin:2px 0}
 .img-expired svg{width:18px;height:18px;flex-shrink:0;opacity:0.6}
@@ -4557,23 +4561,36 @@ function showImagePreviewOverlay(dataUrl) {
   const overlay = document.createElement('div');
   overlay.id = 'imgSendOverlay';
   overlay.className = 'img-send-overlay';
+  // v3.13-fix: two-row layout — caption on top, buttons below. Always fits on mobile.
+  // Uses addEventListener (not inline onclick) for 100% cross-browser reliability.
   overlay.innerHTML =
     '<div class="img-send-preview">' +
       '<img src="' + esc(dataUrl) + '" alt="Preview">' +
     '</div>' +
     '<div class="img-send-bar">' +
       '<input type="text" class="img-send-caption" id="imgCaption" placeholder="Add a caption..." maxlength="200">' +
-      '<button class="img-send-cancel" onclick="hideImagePreviewOverlay()">Cancel</button>' +
-      '<button class="img-send-btn vo-btn" onclick="sendImageFromPreview(true)" title="View Once">' +
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;vertical-align:middle;margin-right:4px"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>View Once' +
-      '</button>' +
-      '<button class="img-send-btn" onclick="sendImageFromPreview(false)">Send</button>' +
+      '<div class="img-send-actions">' +
+        '<button class="img-send-cancel" id="imgCancelBtn">Cancel</button>' +
+        '<button class="img-send-btn vo-btn" id="imgVoBtn" title="View Once">' +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:middle;pointer-events:none"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>' +
+          '<span class="vo-text">Once</span>' +
+        '</button>' +
+        '<button class="img-send-btn" id="imgSendBtn">Send</button>' +
+      '</div>' +
     '</div>';
   document.body.appendChild(overlay);
-  // Auto-focus the caption input (but don't pop keyboard on mobile until user taps)
-  const capIn = document.getElementById('imgCaption');
-  if (capIn && !('ontouchstart' in window)) capIn.focus();
-  // Enter key in caption sends
+
+  // Wire up buttons with addEventListener (never inline onclick)
+  const cancelBtn = document.getElementById('imgCancelBtn');
+  const voBtn     = document.getElementById('imgVoBtn');
+  const sendBtn   = document.getElementById('imgSendBtn');
+  const capIn     = document.getElementById('imgCaption');
+
+  if (cancelBtn) cancelBtn.addEventListener('click', hideImagePreviewOverlay);
+  if (voBtn)     voBtn.addEventListener('click',     function() { sendImageFromPreview(true);  });
+  if (sendBtn)   sendBtn.addEventListener('click',   function() { sendImageFromPreview(false); });
+
+  // Enter key in caption sends normally (not view-once)
   if (capIn) {
     capIn.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -4581,6 +4598,10 @@ function showImagePreviewOverlay(dataUrl) {
         sendImageFromPreview(false);
       }
     });
+    // Focus caption on desktop only — on mobile we don't auto-focus to avoid keyboard popping
+    if (!('ontouchstart' in window)) {
+      setTimeout(function() { capIn.focus(); }, 50);
+    }
   }
 }
 
