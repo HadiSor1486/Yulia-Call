@@ -3497,11 +3497,13 @@ function clearConnectionTimer(pc) {
   if (pc) pc._connTimerFires = 0;
 }
 
-function startConnectionTimer(pid) {
+// v3.13-fix: startConnectionTimer now accepts an optional customTimeout.
+// The "brand new PC" grace period uses this to schedule 30s instead of 10s.
+function startConnectionTimer(pid, customTimeout) {
   const pc = peers[pid];
   if (!pc || pc._connTimer) return;
   pc._connTimerFires = pc._connTimerFires || 0;
-  const timeoutMs = connTimerMs();
+  const timeoutMs = customTimeout || connTimerMs();
   pc._connTimer = setTimeout(() => {
     pc._connTimer = null;
     if (peers[pid] !== pc || pc.connectionState === 'connected' || pc.connectionState === 'closed') {
@@ -3519,10 +3521,13 @@ function startConnectionTimer(pid) {
       if (pc._connTimerFires < 3) startConnectionTimer(pid);
       return;
     }
+    // v3.13-fix: brand new PCs get 30s grace (10s base + 20s extra).
+    // Previously startConnectionTimer(pid) was called which only gave 10s,
+    // causing premature ICE restarts and broken audio.
     if (pc.iceConnectionState === 'new' && pc._connTimerFires === 0) {
       log("CONN-TIMER " + pid + " brand new PC, more time");
       pc._connTimerFires++;
-      startConnectionTimer(pid);
+      startConnectionTimer(pid, connTimerMs() + 20000);  // 30s grace, not 10s
       return;
     }
     if (pc.iceConnectionState === 'checking') {
