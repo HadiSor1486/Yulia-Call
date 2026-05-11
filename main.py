@@ -53,8 +53,13 @@ try:
 except ImportError:
     KYODO_OK = False
 
-# v3.13: UNO card game engine
-from uno_game import uno_manager
+# v3.13: UNO card game engine (optional — bot works even if file is missing)
+UNO_OK = False
+try:
+    from uno_game import uno_manager
+    UNO_OK = True
+except ImportError:
+    uno_manager = None  # type: ignore
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────
 # User explicitly requested credentials remain hardcoded as defaults.
@@ -1318,37 +1323,34 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
             # ═══════════════════════════════════════════════════════════════
             # v3.13 — UNO CARD GAME
             # ═══════════════════════════════════════════════════════════════
-            elif mt == "uno_join":
+            elif mt == "uno_join" and UNO_OK:
                 game = uno_manager.get_or_create(room_id)
                 ok = game.add_player(peer_id, name)
                 if ok:
-                    # Broadcast updated lobby to everyone in the room
-                    payload = {"type": "uno_state", "state": game.get_state(peer_id)}
                     for p, pd in room["peers"].items():
                         try:
                             gs = game.get_state(p)
-                            await pd["ws"].send_json({**payload, "your_state": gs})
+                            await pd["ws"].send_json({"type": "uno_state", "your_state": gs})
                         except Exception:
                             pass
                 else:
                     await ws.send_json({"type": "uno_error",
                                         "error": "Cannot join game (started or full)"})
 
-            elif mt == "uno_leave":
+            elif mt == "uno_leave" and UNO_OK:
                 game = uno_manager.get(room_id)
                 if game:
-                    new_creator = game.remove_player(peer_id)
-                    payload = {"type": "uno_state", "state": game.get_state(peer_id)}
+                    game.remove_player(peer_id)
                     for p, pd in room["peers"].items():
                         try:
                             gs = game.get_state(p)
-                            await pd["ws"].send_json({**payload, "your_state": gs})
+                            await pd["ws"].send_json({"type": "uno_state", "your_state": gs})
                         except Exception:
                             pass
                     if not game.players:
                         uno_manager.remove(room_id)
 
-            elif mt == "uno_start":
+            elif mt == "uno_start" and UNO_OK:
                 game = uno_manager.get(room_id)
                 if game and game.creator_id == peer_id and game.game_state == "lobby":
                     ok, msg = game.start()
@@ -1366,18 +1368,19 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                     await ws.send_json({"type": "uno_error",
                                         "error": "Only the creator can start"})
 
-            elif mt == "uno_play":
+            elif mt == "uno_play" and UNO_OK:
                 game = uno_manager.get(room_id)
                 if game and game.game_state == "playing":
                     card_id = msg.get("card_id")
                     chosen_color = msg.get("color")
                     ok, reason, event = game.play_card(peer_id, card_id, chosen_color)
                     if ok and event:
-                        payload = {"type": "uno_event", "event": event}
                         for p, pd in room["peers"].items():
                             try:
                                 gs = game.get_state(p)
-                                await pd["ws"].send_json({**payload, "your_state": gs})
+                                await pd["ws"].send_json({"type": "uno_event",
+                                                          "event": event,
+                                                          "your_state": gs})
                             except Exception:
                                 pass
                         if game.game_state == "finished":
@@ -1385,37 +1388,39 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                     else:
                         await ws.send_json({"type": "uno_error", "error": reason})
 
-            elif mt == "uno_draw":
+            elif mt == "uno_draw" and UNO_OK:
                 game = uno_manager.get(room_id)
                 if game and game.game_state == "playing":
                     ok, reason, event = game.draw_card(peer_id)
                     if ok and event:
-                        payload = {"type": "uno_event", "event": event}
                         for p, pd in room["peers"].items():
                             try:
                                 gs = game.get_state(p)
-                                await pd["ws"].send_json({**payload, "your_state": gs})
+                                await pd["ws"].send_json({"type": "uno_event",
+                                                          "event": event,
+                                                          "your_state": gs})
                             except Exception:
                                 pass
                     elif not ok:
                         await ws.send_json({"type": "uno_error", "error": reason})
 
-            elif mt == "uno_pass":
+            elif mt == "uno_pass" and UNO_OK:
                 game = uno_manager.get(room_id)
                 if game and game.game_state == "playing":
                     ok, reason, event = game.pass_turn(peer_id)
                     if ok and event:
-                        payload = {"type": "uno_event", "event": event}
                         for p, pd in room["peers"].items():
                             try:
                                 gs = game.get_state(p)
-                                await pd["ws"].send_json({**payload, "your_state": gs})
+                                await pd["ws"].send_json({"type": "uno_event",
+                                                          "event": event,
+                                                          "your_state": gs})
                             except Exception:
                                 pass
                     elif not ok:
                         await ws.send_json({"type": "uno_error", "error": reason})
 
-            elif mt == "uno_call_uno":
+            elif mt == "uno_call_uno" and UNO_OK:
                 game = uno_manager.get(room_id)
                 if game:
                     ok, reason, event = game.call_uno(peer_id)
@@ -1429,27 +1434,32 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                     if not ok:
                         await ws.send_json({"type": "uno_error", "error": reason})
 
-            elif mt == "uno_catch":
+            elif mt == "uno_catch" and UNO_OK:
                 game = uno_manager.get(room_id)
                 if game:
                     target_id = msg.get("target_id")
                     ok, reason, event = game.catch_uno(peer_id, target_id)
                     if event:
-                        payload = {"type": "uno_event", "event": event}
                         for p, pd in room["peers"].items():
                             try:
                                 gs = game.get_state(p)
-                                await pd["ws"].send_json({**payload, "your_state": gs})
+                                await pd["ws"].send_json({"type": "uno_event",
+                                                          "event": event,
+                                                          "your_state": gs})
                             except Exception:
                                 pass
                     if not ok:
                         await ws.send_json({"type": "uno_error", "error": reason})
 
-            elif mt == "uno_state_request":
+            elif mt == "uno_state_request" and UNO_OK:
                 game = uno_manager.get(room_id)
                 if game:
                     gs = game.get_state(peer_id)
                     await ws.send_json({"type": "uno_state", "your_state": gs})
+
+            elif mt.startswith("uno_") and not UNO_OK:
+                await ws.send_json({"type": "uno_error",
+                                    "error": "UNO not available — uno_game.py missing on server"})
 
     except WebSocketDisconnect:
         pass
@@ -1465,22 +1475,23 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
         if peer_id in room["peers"]:
             del room["peers"][peer_id]
         # v3.13: remove from UNO game if active
-        try:
-            game = uno_manager.get(room_id)
-            if game and peer_id in game.players:
-                game.remove_player(peer_id)
-                if not game.players:
-                    uno_manager.remove(room_id)
-                else:
-                    for p, pd in room["peers"].items():
-                        try:
-                            gs = game.get_state(p)
-                            await pd["ws"].send_json({"type": "uno_state",
-                                                      "your_state": gs})
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+        if UNO_OK:
+            try:
+                game = uno_manager.get(room_id)
+                if game and peer_id in game.players:
+                    game.remove_player(peer_id)
+                    if not game.players:
+                        uno_manager.remove(room_id)
+                    elif room:  # only broadcast if room still exists
+                        for p, pd in room["peers"].items():
+                            try:
+                                gs = game.get_state(p)
+                                await pd["ws"].send_json({"type": "uno_state",
+                                                          "your_state": gs})
+                            except Exception:
+                                pass
+            except Exception:
+                pass
         lm = {"type": "peer_left", "peer_id": peer_id, "name": name}
         sm = {"type": "chat", "kind": "system",
               "text": f"{name} left the call",
@@ -5601,21 +5612,24 @@ log("page loaded v3.13 (max " + MAX_PEERS + " peers, stickers, seat-grid, UNO ga
 async def _game_tick():
     """v3.13: Periodic UNO game turn timeout checker. Runs every 2 seconds
     to catch players who ran out of time."""
+    if not UNO_OK:
+        while True:
+            await asyncio.sleep(3600)
     await asyncio.sleep(5)
     while True:
         try:
             for rid, game in list(uno_manager.games.items()):
-                if game.game_state == "playing":
+                if game.game_state == "playing" and game.player_order:
                     event = game.check_timeout()
                     if event:
                         room = rooms.get(rid)
                         if room:
-                            payload = {"type": "uno_event", "event": event,
-                                       "game_state": game.get_state("")}
                             for p, pd in room["peers"].items():
                                 try:
                                     state = game.get_state(p)
-                                    await pd["ws"].send_json({**payload, "your_state": state})
+                                    await pd["ws"].send_json({"type": "uno_event",
+                                                              "event": event,
+                                                              "your_state": state})
                                 except Exception:
                                     pass
         except Exception as e:
@@ -5625,6 +5639,9 @@ async def _game_tick():
 
 async def _game_cleanup():
     """v3.13: Clean up finished/abandoned UNO games."""
+    if not UNO_OK:
+        while True:
+            await asyncio.sleep(3600)
     await asyncio.sleep(60)
     while True:
         try:
