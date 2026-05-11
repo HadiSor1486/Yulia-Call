@@ -1606,16 +1606,16 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 .msg-delete-btn svg{width:16px;height:16px;pointer-events:none}
 .msg-delete-btn:active{transform:translateY(-50%) scale(.85);transition:transform .1s}
 .msg-deleted{color:#8e8e93;font-size:13px;font-style:italic;padding:6px 0;opacity:.65}
-/* ─── v3.13: View Once image placeholders (Instagram style) ─── */
-.viewonce-card{width:200px;height:240px;border-radius:14px;background:#1a1a1e;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;cursor:pointer;position:relative;overflow:hidden;border:1px solid rgba(255,255,255,0.06);transition:transform .15s,opacity .2s}
-.viewonce-card:active{transform:scale(.97)}
-.viewonce-card svg{width:36px;height:36px;color:#8e8e93}
-.viewonce-card .vo-label{font-size:13px;font-weight:600;color:#8e8e93;letter-spacing:.3px}
-.viewonce-card .vo-sub{font-size:11px;color:#555}
-.viewonce-card .vo-timer{position:absolute;top:8px;right:8px;width:22px;height:22px;opacity:.6}
-.viewonce-opened{width:200px;height:60px;border-radius:14px;background:#1a1a1e;display:flex;align-items:center;justify-content:center;gap:8px;border:1px solid rgba(255,255,255,0.04);opacity:.55}
-.viewonce-opened svg{width:18px;height:18px;color:#555}
-.viewonce-opened .vo-label{font-size:12px;color:#555;font-weight:500}
+/* ─── v3.13: View Once image placeholders (compact pill style) ───
+   Small inline pill like WhatsApp/Instagram — icon + "Photo" text.
+   Each user sees "Opened" only after THEY personally open it. */
+.viewonce-card{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:18px;background:#007aff;color:#fff;font-size:14px;font-weight:600;cursor:pointer;transition:transform .15s,opacity .2s;user-select:none;-webkit-user-select:none}
+.viewonce-card:active{transform:scale(.95)}
+.viewonce-card .vo-icon-wrap{position:relative;width:20px;height:20px;display:flex;align-items:center;justify-content:center}
+.viewonce-card .vo-icon-wrap svg{width:20px;height:20px}
+.viewonce-card .vo-num{position:absolute;font-size:9px;font-weight:800;color:#fff;top:50%;left:50%;transform:translate(-50%,-50%);margin-top:0.5px}
+.viewonce-opened{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:18px;background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.45);font-size:14px;font-weight:500;pointer-events:none;user-select:none}
+.viewonce-opened svg{width:16px;height:16px;opacity:.5}
 /* ─── v3.13: Image send preview overlay (WhatsApp style) ─── */
 .img-send-overlay{position:fixed;inset:0;z-index:350;background:rgba(0,0,0,0.93);display:flex;flex-direction:column;animation:msgIn .2s}
 .img-send-preview{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;min-height:0}
@@ -2733,9 +2733,21 @@ function connectWS() {
         break;
 
       // ── v3.13: view-once opened tracking ──
+      // Someone opened a view-once image. Only update the SENDER's UI.
+      // The opener already updated their own UI locally in openImagePreview().
+      // Other recipients keep seeing "Photo" — they can still open it.
       case 'msg_opened':
-        // Someone opened a view-once image. Update the placeholder in the DOM.
-        if (m.msg_id) markViewOnceOpened(m.msg_id);
+        if (m.msg_id) {
+          const voRow = document.getElementById('msgs');
+          if (voRow) {
+            const row = voRow.querySelector('[data-msg-id="' + esc(m.msg_id) + '"]');
+            // Only the sender sees "Opened" when someone else opens it.
+            // Everyone else keeps their "Photo" pill until they personally open.
+            if (row && row.classList.contains('self')) {
+              markViewOnceOpened(m.msg_id);
+            }
+          }
+        }
         break;
 
       case 'history':
@@ -4703,27 +4715,21 @@ function openImagePreview(src, msgId, isViewOnce) {
   document.body.appendChild(overlay);
 }
 
-// v3.13: replace a view-once placeholder card with the "Opened" ghost state.
-// Called both locally (when this user opens) and via WS broadcast (when
-// ANY user opens — so the sender sees it too).
+// v3.13: swap a view-once "Photo" pill for the "Opened" pill.
+// Called locally when this user opens an image, or for the sender
+// when they receive the msg_opened broadcast.
 function markViewOnceOpened(msgId) {
   const c = document.getElementById('msgs');
   if (!c) return;
   const row = c.querySelector('[data-msg-id="' + esc(msgId) + '"]');
   if (!row) return;
-  const content = row.querySelector('.msg-content');
-  if (!content) return;
-  // Already showing "Opened"? Done.
-  if (content.querySelector('.viewonce-opened')) return;
-  // Build the "Opened" ghost placeholder
+  const card = row.querySelector('.viewonce-card');
+  if (!card) return;  // already "Opened" or not a view-once message
+  // Replace the clickable "Photo" pill with the faded "Opened" pill
   const openedHTML = '<div class="viewonce-opened">' +
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>' +
-    '<span class="vo-label">Opened</span></div>';
-  // Preserve the existing header (name + badge), replace everything else
-  const headerEl = content.querySelector('.msg-header');
-  const headerHTML = headerEl ? headerEl.outerHTML : '';
-  content.innerHTML = headerHTML + openedHTML;
-  row.style.pointerEvents = 'none';
+    'Opened</div>';
+  card.outerHTML = openedHTML;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -4947,41 +4953,36 @@ function renderMsg(m) {
       }
       contentHTML = header + replyHTML + stickerHTML;
     } else {
-      // v3.13: view-once images render as placeholder cards, not direct <img>
+      // v3.13-fix: view-once images — compact pill, per-user "Opened" state.
+      // Each user sees "Opened" only after THEY personally open it.
+      // The sender sees "Opened" when anyone opens it (tracked server-side).
       const isViewOnce = !!m.view_once;
-      const alreadyOpened = isViewOnce && (
-        viewOnceOpened.has(m.id) ||
-        (Array.isArray(m.opened_by) && m.opened_by.length > 0)
-      );
+      const iOpenedIt = isViewOnce && viewOnceOpened.has(m.id);
+      const senderSeesOpened = isViewOnce && !!m.self && Array.isArray(m.opened_by) && m.opened_by.length > 0;
+      const showAsOpened = iOpenedIt || senderSeesOpened;
 
-      if (isViewOnce && !alreadyOpened) {
-        // Unopened view-once: Instagram-style placeholder card
-        const isSender = !!m.self;
-        const voLabel = isSender ? 'Photo' : 'View once';
-        const voIcon = isSender
-          ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
-          : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
-        const cardId = 'vo-' + esc(m.id);
-        imgHTML = '<div class="viewonce-card" id="' + cardId + '" data-vo-src="' + esc(m.image) + '" data-vo-id="' + esc(m.id) + '">' +
-                    (isSender ? '<svg class="vo-timer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' : '') +
-                    voIcon +
-                    '<span class="vo-label">' + voLabel + '</span>' +
-                    '<span class="vo-sub">Tap to view</span>' +
+      if (isViewOnce && !showAsOpened) {
+        // Unopened: compact blue pill with circle-"1" icon + "Photo"
+        const voIcon = '<span class="vo-icon-wrap">' +
+                         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/></svg>' +
+                         '<span class="vo-num">1</span>' +
+                       '</span>';
+        imgHTML = '<div class="viewonce-card" data-vo-src="' + esc(m.image) + '" data-vo-id="' + esc(m.id) + '">' +
+                    voIcon + 'Photo' +
                   '</div>';
         let textHTML = '';
         if (m.text) textHTML = '<div class="msg-text">' + esc(m.text) + '</div>';
         const bubbleClass = 'msg-bubble has-img' + (m.text ? ' has-text' : '');
         contentHTML = header + '<div class="' + bubbleClass + '">' + replyHTML + imgHTML + textHTML + '</div>';
-      } else if (isViewOnce && alreadyOpened) {
-        // Opened view-once: ghost placeholder
+      } else if (isViewOnce && showAsOpened) {
+        // Opened by this user: faded "Opened" pill (non-interactive)
         imgHTML = '<div class="viewonce-opened">' +
                     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>' +
-                    '<span class="vo-label">Opened</span></div>';
+                    'Opened</div>';
         let textHTML = '';
         if (m.text) textHTML = '<div class="msg-text">' + esc(m.text) + '</div>';
         const bubbleClass = 'msg-bubble' + (m.text ? ' has-text' : '');
         contentHTML = header + '<div class="' + bubbleClass + '">' + replyHTML + imgHTML + textHTML + '</div>';
-        row.style.pointerEvents = 'none';
       } else {
         // Normal image (non-view-once)
         let imgHTML = '';
