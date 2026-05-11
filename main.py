@@ -1,47 +1,30 @@
 """
-Silent Hill Voice Call Bot — v3.12 BEAST MODE (IN-ROOM STICKER UPLOADS)
+Silent Hill Voice Call Bot — v3.13 BEAST MODE + UNO CARD GAME
 ═══════════════════════════════════════════════════════════════════════════════
-v3.12 — STICKERS CAN BE UPLOADED FROM INSIDE THE ROOM, ADMIN CAN DELETE,
-        ALL WITH RAM SAFETY AND GITHUB PERSISTENCE.
+v3.13 — CLASSIC UNO CARD GAME BUILT INTO THE CALL ROOM.
 
-  WHAT'S NEW SINCE v3.11:
-    • [+] button in the sticker panel header lets ANY user upload a new
-          sticker. The image is resized client-side first (max 1024px,
-          WebP @ 0.85) so a 4 MB phone photo becomes ~80 KB before it
-          ever leaves the device. The server then defensively re-resizes
-          and re-encodes (Pillow → WebP @ q=85), strips EXIF, and writes
-          to STICKERS_DIR. The new sticker is broadcast live to every
-          peer in every room — it appears in the picker instantly, no
-          rejoin needed.
-    • Hard cap of 30 stickers (MAX_STICKERS env var). Upload at the cap
-          is rejected with a clear toast — admin must delete first.
-    • RAM guard: an asyncio.Semaphore(1) wraps the Pillow decode so we
-          never have two heavy resize jobs in memory at once. Concurrent
-          uploads queue. Plus a 5 MB hard limit on the raw upload bytes
-          so a malicious payload can't OOM the bot.
-    • Atomic count check via asyncio.Lock so two simultaneous uploads
-          can't sneak past MAX_STICKERS.
-    • Persistence on Render: if GITHUB_TOKEN + GITHUB_REPO env vars are
-          set, every uploaded/deleted sticker is committed to your repo
-          in the background via the GitHub Contents API. Survives
-          restarts and redeploys. If not set, uploads still work for the
-          current process lifetime.
-    • Hidden-suffix admin auth: joining as "Sor-" (or any
-          ADMIN_NAME_BASE+ADMIN_NAME_SUFFIX) marks the user admin
-          server-side and strips the "-" before display. Plain "Sor" is
-          treated as a regular peer with no badge and no powers. The
-          Host badge and the delete (×) buttons on stickers now key off
-          the server-trusted is_admin flag, never off the displayed
-          name. Impersonation is structurally impossible.
-    • Auto-generated unique filenames (up_<10hex>.webp) — no name
-          collisions, no traversal surface.
+  WHAT'S NEW SINCE v3.12:
+    • Gaming console button (controller icon) sits in the header, left
+          of the leave button. Tap to open the Game Lobby panel.
+    • UNO — first supported game. Players in a voice room can join a
+          UNO lobby (2-4 players), the creator starts, and everyone plays
+          in real-time via WebSocket messages.
+    • Full UNO rules: Skip, Reverse, Draw 2, Wild, Wild Draw 4, UNO call,
+          catch (forgot to say UNO penalty = draw 2), and challenge.
+    • 30-second turn timer per player — auto-draw and auto-pass on timeout.
+    • Pure CSS cards — realistic gradients, no external image assets needed.
+    • Card selection → color picker for wilds → play. Visual feedback for
+          playable vs non-playable cards. Current color indicator.
+    • Game state lives server-side; all actions broadcast to all players.
+    • Clean separation: uno_game.py holds all game logic, main.py only
+          has WebSocket routing and UI hooks. Zero changes to existing
+          voice call / sticker / chat functionality.
 
-  EVERYTHING FROM v3.11 IS UNTOUCHED:
-    • Reverse-flex bottom-anchored messages (WhatsApp/Telegram pattern)
-    • All scroll lock / unread / jump-button logic
-    • All v3.10 stickers, replies, image preview, typing
-    • All memory hardening, all WebRTC reliability
-    • All TURN failover, all Kyodo bot integration
+  EVERYTHING FROM v3.12 IS UNTOUCHED:
+    • In-room sticker uploads with GitHub persistence
+    • Hidden-suffix admin auth, Host badge system
+    • Reverse-flex messages, seat-grid UI, drag-to-collapse
+    • All WebRTC reliability, TURN failover, Kyodo bot integration
 
 ═══════════════════════════════════════════════════════════════════════════════
 """
@@ -69,6 +52,9 @@ try:
     KYODO_OK = True
 except ImportError:
     KYODO_OK = False
+
+# v3.13: UNO card game engine
+from uno_game import uno_manager
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────
 # User explicitly requested credentials remain hardcoded as defaults.
@@ -1329,6 +1315,142 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                                     "deleted": target})
                 print(f"[stickers] deleted {target} by admin {name}")
 
+            # ═══════════════════════════════════════════════════════════════
+            # v3.13 — UNO CARD GAME
+            # ═══════════════════════════════════════════════════════════════
+            elif mt == "uno_join":
+                game = uno_manager.get_or_create(room_id)
+                ok = game.add_player(peer_id, name)
+                if ok:
+                    # Broadcast updated lobby to everyone in the room
+                    payload = {"type": "uno_state", "state": game.get_state(peer_id)}
+                    for p, pd in room["peers"].items():
+                        try:
+                            gs = game.get_state(p)
+                            await pd["ws"].send_json({**payload, "your_state": gs})
+                        except Exception:
+                            pass
+                else:
+                    await ws.send_json({"type": "uno_error",
+                                        "error": "Cannot join game (started or full)"})
+
+            elif mt == "uno_leave":
+                game = uno_manager.get(room_id)
+                if game:
+                    new_creator = game.remove_player(peer_id)
+                    payload = {"type": "uno_state", "state": game.get_state(peer_id)}
+                    for p, pd in room["peers"].items():
+                        try:
+                            gs = game.get_state(p)
+                            await pd["ws"].send_json({**payload, "your_state": gs})
+                        except Exception:
+                            pass
+                    if not game.players:
+                        uno_manager.remove(room_id)
+
+            elif mt == "uno_start":
+                game = uno_manager.get(room_id)
+                if game and game.creator_id == peer_id and game.game_state == "lobby":
+                    ok, msg = game.start()
+                    if ok:
+                        for p, pd in room["peers"].items():
+                            try:
+                                gs = game.get_state(p)
+                                await pd["ws"].send_json({"type": "uno_started",
+                                                          "your_state": gs})
+                            except Exception:
+                                pass
+                    else:
+                        await ws.send_json({"type": "uno_error", "error": msg})
+                else:
+                    await ws.send_json({"type": "uno_error",
+                                        "error": "Only the creator can start"})
+
+            elif mt == "uno_play":
+                game = uno_manager.get(room_id)
+                if game and game.game_state == "playing":
+                    card_id = msg.get("card_id")
+                    chosen_color = msg.get("color")
+                    ok, reason, event = game.play_card(peer_id, card_id, chosen_color)
+                    if ok and event:
+                        payload = {"type": "uno_event", "event": event}
+                        for p, pd in room["peers"].items():
+                            try:
+                                gs = game.get_state(p)
+                                await pd["ws"].send_json({**payload, "your_state": gs})
+                            except Exception:
+                                pass
+                        if game.game_state == "finished":
+                            uno_manager.remove(room_id)
+                    else:
+                        await ws.send_json({"type": "uno_error", "error": reason})
+
+            elif mt == "uno_draw":
+                game = uno_manager.get(room_id)
+                if game and game.game_state == "playing":
+                    ok, reason, event = game.draw_card(peer_id)
+                    if ok and event:
+                        payload = {"type": "uno_event", "event": event}
+                        for p, pd in room["peers"].items():
+                            try:
+                                gs = game.get_state(p)
+                                await pd["ws"].send_json({**payload, "your_state": gs})
+                            except Exception:
+                                pass
+                    elif not ok:
+                        await ws.send_json({"type": "uno_error", "error": reason})
+
+            elif mt == "uno_pass":
+                game = uno_manager.get(room_id)
+                if game and game.game_state == "playing":
+                    ok, reason, event = game.pass_turn(peer_id)
+                    if ok and event:
+                        payload = {"type": "uno_event", "event": event}
+                        for p, pd in room["peers"].items():
+                            try:
+                                gs = game.get_state(p)
+                                await pd["ws"].send_json({**payload, "your_state": gs})
+                            except Exception:
+                                pass
+                    elif not ok:
+                        await ws.send_json({"type": "uno_error", "error": reason})
+
+            elif mt == "uno_call_uno":
+                game = uno_manager.get(room_id)
+                if game:
+                    ok, reason, event = game.call_uno(peer_id)
+                    if event:
+                        for p, pd in room["peers"].items():
+                            try:
+                                await pd["ws"].send_json({"type": "uno_event",
+                                                          "event": event})
+                            except Exception:
+                                pass
+                    if not ok:
+                        await ws.send_json({"type": "uno_error", "error": reason})
+
+            elif mt == "uno_catch":
+                game = uno_manager.get(room_id)
+                if game:
+                    target_id = msg.get("target_id")
+                    ok, reason, event = game.catch_uno(peer_id, target_id)
+                    if event:
+                        payload = {"type": "uno_event", "event": event}
+                        for p, pd in room["peers"].items():
+                            try:
+                                gs = game.get_state(p)
+                                await pd["ws"].send_json({**payload, "your_state": gs})
+                            except Exception:
+                                pass
+                    if not ok:
+                        await ws.send_json({"type": "uno_error", "error": reason})
+
+            elif mt == "uno_state_request":
+                game = uno_manager.get(room_id)
+                if game:
+                    gs = game.get_state(peer_id)
+                    await ws.send_json({"type": "uno_state", "your_state": gs})
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -1342,6 +1464,23 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                 pass
         if peer_id in room["peers"]:
             del room["peers"][peer_id]
+        # v3.13: remove from UNO game if active
+        try:
+            game = uno_manager.get(room_id)
+            if game and peer_id in game.players:
+                game.remove_player(peer_id)
+                if not game.players:
+                    uno_manager.remove(room_id)
+                else:
+                    for p, pd in room["peers"].items():
+                        try:
+                            gs = game.get_state(p)
+                            await pd["ws"].send_json({"type": "uno_state",
+                                                      "your_state": gs})
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         lm = {"type": "peer_left", "peer_id": peer_id, "name": name}
         sm = {"type": "chat", "kind": "system",
               "text": f"{name} left the call",
@@ -1595,6 +1734,11 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 .input-send{align-self:flex-end}
 .leave-header-btn{width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:none;border:none;color:#ff3b30;cursor:pointer;padding:0}
 .leave-header-btn svg{width:20px;height:20px}
+/* v3.13: Gaming console button in header */
+.games-btn{width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:none;border:none;color:#34c759;cursor:pointer;padding:0;margin-right:2px;position:relative}
+.games-btn svg{width:22px;height:22px}
+.games-btn .games-dot{position:absolute;top:2px;right:2px;width:8px;height:8px;border-radius:50%;background:#34c759;display:none}
+.games-btn.has-game .games-dot{display:block;animation:pulse 1.2s infinite}
 
 /* ───── STICKER PICKER PANEL (v3.10 — bottom sheet, Kyodo-style) ───── */
 .sticker-panel{position:fixed;left:0;right:0;bottom:0;z-index:120;background:rgba(20,20,22,0.98);backdrop-filter:blur(20px);border-top-left-radius:18px;border-top-right-radius:18px;border-top:1px solid rgba(255,255,255,0.08);max-height:55vh;display:flex;flex-direction:column;transform:translateY(100%);transition:transform .25s cubic-bezier(.2,.7,.2,1);box-shadow:0 -8px 24px rgba(0,0,0,0.4);padding-bottom:env(safe-area-inset-bottom)}
@@ -1746,7 +1890,182 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 .room-full-sub{font-size:13px;color:#7a6a55;max-width:280px;line-height:1.5}
 .room-full-retry{margin-top:24px;height:42px;padding:0 22px;border-radius:21px;border:none;background:#3a2e1f;color:#e8dcc4;font-size:14px;font-weight:600;cursor:pointer}
 .room-full-retry:active{opacity:0.85}
-</style>
+
+/* ══════════════════════════════════════════════════════════════════════════
+   v3.13 — GAME LOBBY & UNO CARD GAME
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Game Lobby Panel ── */
+.game-lobby{position:fixed;left:0;right:0;bottom:0;z-index:130;background:rgba(14,14,16,0.98);backdrop-filter:blur(24px);border-top-left-radius:20px;border-top-right-radius:20px;border-top:1px solid rgba(255,255,255,0.08);max-height:70vh;display:flex;flex-direction:column;transform:translateY(100%);transition:transform .3s cubic-bezier(.2,.7,.2,1);box-shadow:0 -10px 30px rgba(0,0,0,0.5);padding-bottom:env(safe-area-inset-bottom)}
+.game-lobby.open{transform:translateY(0)}
+.game-lobby-handle{width:44px;height:5px;border-radius:3px;background:rgba(255,255,255,0.18);margin:8px auto 4px;flex-shrink:0}
+.game-lobby-header{display:flex;align-items:center;justify-content:space-between;padding:8px 16px 12px;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,0.06)}
+.game-lobby-title{font-size:17px;font-weight:700;color:#fff;letter-spacing:.3px}
+.game-lobby-close{width:32px;height:32px;border-radius:50%;border:none;background:rgba(255,255,255,0.08);color:#fff;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1}
+.game-lobby-body{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
+.game-lobby-body::-webkit-scrollbar{width:0}
+
+/* Available games grid */
+.games-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.game-card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:16px;display:flex;flex-direction:column;align-items:center;gap:10px;cursor:pointer;transition:transform .15s,background .15s}
+.game-card:active{transform:scale(.96);background:rgba(255,255,255,0.07)}
+.game-card-icon{width:56px;height:56px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:28px;background:linear-gradient(135deg,#ff3b30,#ff9500);box-shadow:0 4px 14px rgba(255,59,48,0.3)}
+.game-card-name{font-size:15px;font-weight:600;color:#fff}
+.game-card-desc{font-size:12px;color:#8e8e93;text-align:center;line-height:1.4}
+.game-card-players{font-size:11px;color:#34c759;font-weight:600;margin-top:2px}
+
+/* UNO Lobby info */
+.uno-lobby-info{background:rgba(255,255,255,0.03);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:10px}
+.uno-lobby-row{display:flex;align-items:center;justify-content:space-between}
+.uno-lobby-label{font-size:13px;color:#8e8e93}
+.uno-lobby-value{font-size:13px;font-weight:600;color:#fff}
+.uno-lobby-players{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+.uno-lobby-player-chip{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;background:rgba(255,255,255,0.06);font-size:13px;font-weight:500}
+.uno-lobby-player-chip .dot{width:8px;height:8px;border-radius:50%;background:#34c759}
+.uno-lobby-player-chip.creator{background:rgba(255,204,0,0.12);color:#ffd54a}
+.uno-start-btn{width:100%;height:46px;border-radius:12px;border:none;background:linear-gradient(135deg,#34c759,#30d158);color:#fff;font-size:15px;font-weight:700;cursor:pointer;margin-top:6px;transition:opacity .15s}
+.uno-start-btn:disabled{opacity:.4;cursor:not-allowed}
+.uno-start-btn:active:not(:disabled){opacity:.85}
+.uno-leave-btn{width:100%;height:40px;border-radius:12px;border:1px solid rgba(255,59,48,0.4);background:transparent;color:#ff3b30;font-size:14px;font-weight:600;cursor:pointer;margin-top:8px}
+.uno-leave-btn:active{background:rgba(255,59,48,0.1)}
+
+/* ── UNO Game Panel ── */
+.uno-panel{position:fixed;inset:0;z-index:140;background:linear-gradient(160deg,#0d1f0d 0%,#0a150a 40%,#0d0d0d 100%);display:none;flex-direction:column;overflow:hidden}
+.uno-panel.active{display:flex}
+.uno-panel-header{flex-shrink:0;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:rgba(0,0,0,0.3);border-bottom:1px solid rgba(255,255,255,0.06)}
+.uno-panel-header-left{display:flex;align-items:center;gap:10px}
+.uno-back-btn{width:34px;height:34px;border-radius:50%;border:none;background:rgba(255,255,255,0.08);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:18px}
+.uno-title{font-size:16px;font-weight:700;color:#fff;letter-spacing:.5px}
+.uno-turn-indicator{font-size:12px;color:#34c759;font-weight:600;padding:4px 12px;border-radius:10px;background:rgba(52,199,89,0.12)}
+.uno-turn-indicator.waiting{color:#ff9500;background:rgba(255,149,0,0.12)}
+.uno-timer{font-size:14px;font-weight:700;color:#fff;font-variant-numeric:tabular-nums;min-width:28px;text-align:center}
+.uno-timer.warning{color:#ff3b30;animation:pulse .8s infinite}
+
+/* Opponent bar */
+.uno-opponents{flex-shrink:0;display:flex;gap:10px;padding:10px 14px;overflow-x:auto;scrollbar-width:none}
+.uno-opponents::-webkit-scrollbar{display:none}
+.uno-opponent{flex-shrink:0;display:flex;flex-direction:column;align-items:center;gap:5px;padding:8px 12px;border-radius:14px;background:rgba(255,255,255,0.04);border:2px solid transparent;transition:border-color .2s;min-width:70px}
+.uno-opponent.current-turn{border-color:#34c759;background:rgba(52,199,89,0.06)}
+.uno-opponent-avatar{width:38px;height:38px;border-radius:50%;background:#2c2c2e;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:600;color:#8e8e93}
+.uno-opponent-name{font-size:11px;font-weight:500;color:#fff;max-width:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.uno-opponent-count{font-size:12px;font-weight:700;color:#8e8e93}
+.uno-opponent-count.uno{color:#ff3b30;font-size:11px;text-transform:uppercase;letter-spacing:1px}
+
+/* Game board */
+.uno-board{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;min-height:0;padding:10px}
+
+/* Discard pile */
+.uno-discard-pile{position:relative;width:90px;height:135px}
+.uno-discard-card{position:absolute;width:90px;height:135px;border-radius:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:42px;font-weight:800;box-shadow:0 4px 16px rgba(0,0,0,0.5);transition:transform .3s}
+
+/* Deck */
+.uno-deck-wrap{display:flex;flex-direction:column;align-items:center;gap:8px}
+.uno-deck{position:relative;width:80px;height:120px;border-radius:10px;background:linear-gradient(135deg,#1a1a2e,#16213e);border:2px solid rgba(255,255,255,0.15);display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 3px 12px rgba(0,0,0,0.4);transition:transform .15s}
+.uno-deck:active{transform:scale(.95)}
+.uno-deck-inner{width:60px;height:90px;border-radius:6px;border:2px dashed rgba(255,255,255,0.2);display:flex;align-items:center;justify-content:center}
+.uno-deck-inner span{font-size:28px;font-weight:800;color:rgba(255,255,255,0.3);transform:rotate(-15deg)}
+.uno-deck-label{font-size:11px;color:#8e8e93;font-weight:500}
+
+/* Direction indicator */
+.uno-direction{font-size:13px;color:#8e8e93;display:flex;align-items:center;gap:6px}
+.uno-direction-arrow{font-size:16px;color:#34c759;transition:transform .3s}
+.uno-direction-arrow.ccw{transform:scaleX(-1)}
+
+/* Current color indicator */
+.uno-color-indicator{width:24px;height:24px;border-radius:50%;border:3px solid rgba(255,255,255,0.3);box-shadow:0 0 10px currentColor;transition:background .3s,box-shadow .3s}
+
+/* Pending draw badge */
+.uno-pending-draw{position:fixed;top:56px;left:50%;transform:translateX(-50%);z-index:145;background:rgba(255,59,48,0.95);color:#fff;padding:8px 20px;border-radius:20px;font-size:13px;font-weight:700;box-shadow:0 4px 14px rgba(0,0,0,0.4);display:none;animation:msgIn .2s}
+.uno-pending-draw.show{display:block}
+
+/* ── UNO CARDS (pure CSS) ── */
+.uno-card{width:72px;height:108px;border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;cursor:pointer;user-select:none;-webkit-user-select:none;flex-shrink:0;transition:transform .15s,box-shadow .15s;border:2px solid rgba(255,255,255,0.25);overflow:hidden}
+.uno-card:active{transform:scale(.95)!important}
+.uno-card::before{content:'';position:absolute;inset:3px;border-radius:7px;border:2px solid rgba(255,255,255,0.3);pointer-events:none}
+.uno-card::after{content:'';position:absolute;top:50%;left:50%;width:60%;height:60%;background:rgba(255,255,255,0.12);border-radius:50%;transform:translate(-50%,-50%);pointer-events:none}
+.uno-card .card-corner{position:absolute;font-size:10px;font-weight:700;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.4);z-index:2}
+.uno-card .card-corner.tl{top:5px;left:5px}
+.uno-card .card-corner.br{bottom:5px;right:5px;transform:rotate(180deg)}
+.uno-card .card-center{font-size:36px;font-weight:800;color:#fff;text-shadow:0 2px 4px rgba(0,0,0,0.4);z-index:2;line-height:1}
+.uno-card .card-center.small{font-size:22px}
+.uno-card .card-center.wild-bg{background:linear-gradient(135deg,#ff3b30,#ff9500,#34c759,#007aff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+
+/* Card colors */
+.uno-card.red{background:linear-gradient(160deg,#ff3b30,#c41e1e)}
+.uno-card.yellow{background:linear-gradient(160deg,#ffcc00,#b38600)}
+.uno-card.green{background:linear-gradient(160deg,#34c759,#1e8c3a)}
+.uno-card.blue{background:linear-gradient(160deg,#007aff,#0051d5)}
+.uno-card.wild{background:linear-gradient(160deg,#1a1a2e,#0d0d1a);border-color:rgba(255,255,255,0.4)}
+
+/* Card in hand */
+.uno-card.in-hand{border-color:rgba(255,255,255,0.35)}
+.uno-card.in-hand:hover{transform:translateY(-8px);box-shadow:0 8px 24px rgba(0,0,0,0.4)}
+.uno-card.in-hand.disabled{opacity:.45;cursor:not-allowed;transform:none!important;filter:grayscale(.4)}
+.uno-card.in-hand.selected{border-color:#fff;box-shadow:0 0 0 3px rgba(255,255,255,0.3),0 8px 24px rgba(0,0,0,0.4);transform:translateY(-12px)!important}
+
+/* Card size variants */
+.uno-card.small{width:54px;height:81px;border-radius:8px}
+.uno-card.small .card-center{font-size:26px}
+.uno-card.small .card-center.small{font-size:16px}
+.uno-card.small .card-corner{font-size:8px}
+.uno-card.large{width:85px;height:128px;border-radius:12px}
+.uno-card.large .card-center{font-size:44px}
+
+/* ── Player hand ── */
+.uno-hand-wrap{flex-shrink:0;display:flex;flex-direction:column;gap:8px;padding:10px 12px 14px;background:rgba(0,0,0,0.25);border-top:1px solid rgba(255,255,255,0.06)}
+.uno-hand-label{display:flex;align-items:center;justify-content:space-between;padding:0 4px}
+.uno-hand-label span{font-size:12px;color:#8e8e93;font-weight:500}
+.uno-hand-label .count{font-size:12px;font-weight:700;color:#fff;background:rgba(255,255,255,0.1);padding:2px 10px;border-radius:8px}
+.uno-hand{display:flex;gap:6px;overflow-x:auto;padding:4px 2px 8px;scrollbar-width:none;justify-content:center}
+.uno-hand::-webkit-scrollbar{display:none}
+.uno-hand .uno-card{flex-shrink:0}
+
+/* Action buttons */
+.uno-actions{display:flex;gap:10px;justify-content:center;padding:0 0 8px}
+.uno-btn{height:38px;padding:0 20px;border-radius:19px;border:none;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;transition:opacity .15s,transform .15s}
+.uno-btn:active{transform:scale(.95)}
+.uno-btn:disabled{opacity:.4;cursor:not-allowed;transform:none!important}
+.uno-btn-primary{background:linear-gradient(135deg,#007aff,#0051d5);color:#fff}
+.uno-btn-secondary{background:rgba(255,255,255,0.1);color:#fff}
+.uno-btn-danger{background:linear-gradient(135deg,#ff3b30,#c41e1e);color:#fff}
+.uno-btn-success{background:linear-gradient(135deg,#34c759,#1e8c3a);color:#fff}
+.uno-btn-gold{background:linear-gradient(135deg,#ffd54a,#ff9500);color:#3a2400}
+
+/* Color picker for wild cards */
+.uno-color-picker{position:fixed;inset:0;z-index:150;background:rgba(0,0,0,0.85);display:none;align-items:center;justify-content:center;flex-direction:column;gap:20px}
+.uno-color-picker.show{display:flex}
+.uno-color-picker-title{font-size:18px;font-weight:700;color:#fff}
+.uno-color-options{display:flex;gap:16px}
+.uno-color-option{width:60px;height:60px;border-radius:16px;cursor:pointer;border:3px solid rgba(255,255,255,0.3);transition:transform .15s,border-color .15s;box-shadow:0 4px 14px rgba(0,0,0,0.4)}
+.uno-color-option:active{transform:scale(.9)}
+.uno-color-option:hover{border-color:#fff}
+.uno-color-red{background:linear-gradient(135deg,#ff3b30,#c41e1e)}
+.uno-color-yellow{background:linear-gradient(135deg,#ffcc00,#b38600)}
+.uno-color-green{background:linear-gradient(135deg,#34c759,#1e8c3a)}
+.uno-color-blue{background:linear-gradient(135deg,#007aff,#0051d5)}
+
+/* Game toast notifications */
+.uno-toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);z-index:145;background:rgba(28,28,30,0.96);color:#fff;padding:10px 18px;border-radius:14px;font-size:13px;font-weight:600;box-shadow:0 6px 20px rgba(0,0,0,0.5);border:1px solid rgba(255,255,255,0.1);opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;max-width:85vw;text-align:center}
+.uno-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* Game over screen */
+.uno-gameover{position:fixed;inset:0;z-index:150;background:rgba(0,0,0,0.92);display:none;flex-direction:column;align-items:center;justify-content:center;padding:32px;text-align:center;gap:16px}
+.uno-gameover.show{display:flex}
+.uno-gameover-trophy{font-size:64px;margin-bottom:8px}
+.uno-gameover-title{font-size:24px;font-weight:800;color:#fff}
+.uno-gameover-winner{font-size:17px;color:#34c759;font-weight:700}
+.uno-gameover-scores{display:flex;flex-direction:column;gap:8px;width:100%;max-width:280px;margin:8px 0}
+.uno-score-row{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-radius:10px;background:rgba(255,255,255,0.05)}
+.uno-score-row.winner{background:rgba(52,199,89,0.1);border:1px solid rgba(52,199,89,0.3)}
+.uno-score-name{font-size:14px;font-weight:500;color:#fff}
+.uno-score-value{font-size:14px;font-weight:700;color:#ffcc00}
+
+/* Catch UNO button */
+.uno-catch-btn{position:fixed;right:14px;bottom:180px;z-index:145;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#ff3b30,#ff6b35);color:#fff;border:none;font-size:11px;font-weight:800;cursor:pointer;box-shadow:0 4px 14px rgba(255,59,48,0.4);display:none;align-items:center;justify-content:center;flex-direction:column;gap:2px;animation:msgIn .3s}
+.uno-catch-btn.show{display:flex}
+.uno-catch-btn span:first-child{font-size:16px}
+
+/* ══════════════════════════════════════════════════════════════════════════ */
 </head>
 <body>
 <div class="bg"></div>
@@ -1770,6 +2089,7 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 <button class="back-btn" onclick="leaveCall()">&#8249;</button>
 <img class="group-icon" src="/ci.jpg" onerror="this.style.display='none'">
 <div class="group-info"><div class="group-name">Silent Hill</div><div class="group-meta" id="mcount">0 in call</div></div>
+<button class="games-btn" id="gamesBtn" onclick="toggleGameLobby()" title="Games"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2" ry="2"/><line x1="6" y1="10" x2="6.01" y2="10"/><line x1="10" y1="10" x2="10.01" y2="10"/><path d="M14 14l2 2 4-4"/></svg><span class="games-dot" id="gamesDot"></span></button>
 <button class="leave-header-btn" onclick="leaveCall()" title="Leave call"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></button>
 <button class="menu-btn" onclick="document.getElementById('dbg').classList.toggle('show')">&#8942;</button>
 </div>
@@ -1841,6 +2161,127 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
   <input type="file" id="stickerUploadInput" class="sticker-upload-input" accept="image/png,image/jpeg,image/jpg,image/webp,image/gif" onchange="onStickerFilePicked(event)">
 </div>
 <div id="stickerToast" class="sticker-toast" role="status" aria-live="polite"></div>
+
+<!-- ════════════════════════════════════════════════════════════════════════
+     v3.13 — GAME LOBBY PANEL
+     ════════════════════════════════════════════════════════════════════════ -->
+<div class="game-lobby" id="gameLobby">
+  <div class="game-lobby-handle"></div>
+  <div class="game-lobby-header">
+    <div class="game-lobby-title">Games</div>
+    <button class="game-lobby-close" onclick="toggleGameLobby()">&times;</button>
+  </div>
+  <div class="game-lobby-body" id="gameLobbyBody">
+    <!-- Available games -->
+    <div class="games-grid" id="gamesGrid">
+      <div class="game-card" onclick="joinUnoGame()">
+        <div class="game-card-icon">🃏</div>
+        <div class="game-card-name">UNO</div>
+        <div class="game-card-desc">Classic card game with special cards, draws, and wilds</div>
+        <div class="game-card-players">2-4 players</div>
+      </div>
+    </div>
+    <!-- UNO lobby info (shown after joining) -->
+    <div id="unoLobbySection" style="display:none">
+      <div class="uno-lobby-info">
+        <div class="uno-lobby-row"><span class="uno-lobby-label">Game</span><span class="uno-lobby-value">UNO</span></div>
+        <div class="uno-lobby-row"><span class="uno-lobby-label">Status</span><span class="uno-lobby-value" id="unoLobbyStatus">Waiting for players...</span></div>
+        <div class="uno-lobby-row"><span class="uno-lobby-label">Players</span><span class="uno-lobby-value" id="unoLobbyCount">0/4</span></div>
+        <div class="uno-lobby-players" id="unoLobbyPlayers"></div>
+      </div>
+      <button class="uno-start-btn" id="unoStartBtn" onclick="startUnoGame()" disabled>Start Game (need 2+)</button>
+      <button class="uno-leave-btn" onclick="leaveUnoGame()">Leave Game</button>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════
+     v3.13 — UNO GAME PANEL (full screen)
+     ════════════════════════════════════════════════════════════════════════ -->
+<div class="uno-panel" id="unoPanel">
+  <!-- Header -->
+  <div class="uno-panel-header">
+    <div class="uno-panel-header-left">
+      <button class="uno-back-btn" onclick="closeUnoPanel()">&#8249;</button>
+      <span class="uno-title">UNO</span>
+      <span class="uno-turn-indicator" id="unoTurnIndicator">Your turn!</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <div class="uno-color-indicator" id="unoColorIndicator" style="background:#007aff"></div>
+      <span class="uno-timer" id="unoTimer">30</span>
+    </div>
+  </div>
+
+  <!-- Opponents -->
+  <div class="uno-opponents" id="unoOpponents"></div>
+
+  <!-- Board: deck + discard -->
+  <div class="uno-board">
+    <div style="display:flex;align-items:center;gap:40px">
+      <!-- Deck -->
+      <div class="uno-deck-wrap">
+        <div class="uno-deck" id="unoDeck" onclick="drawCard()">
+          <div class="uno-deck-inner"><span>UNO</span></div>
+        </div>
+        <span class="uno-deck-label" id="unoDeckCount">108 cards</span>
+      </div>
+      <!-- Discard -->
+      <div class="uno-discard-pile" id="unoDiscardPile"></div>
+    </div>
+    <div class="uno-direction" id="unoDirectionInfo">
+      <span class="uno-direction-arrow" id="unoDirArrow">➜</span>
+      <span id="unoDirText">Clockwise</span>
+    </div>
+  </div>
+
+  <!-- Actions -->
+  <div class="uno-actions" id="unoActions">
+    <button class="uno-btn uno-btn-primary" id="unoDrawBtn" onclick="drawCard()">Draw</button>
+    <button class="uno-btn uno-btn-secondary hidden" id="unoPassBtn" onclick="passTurn()">Pass</button>
+    <button class="uno-btn uno-btn-gold" id="unoCallUnoBtn" onclick="callUno()">UNO!</button>
+  </div>
+
+  <!-- Player hand -->
+  <div class="uno-hand-wrap">
+    <div class="uno-hand-label">
+      <span>Your hand</span>
+      <span class="count" id="unoHandCount">0</span>
+    </div>
+    <div class="uno-hand" id="unoHand"></div>
+  </div>
+</div>
+
+<!-- Color picker overlay -->
+<div class="uno-color-picker" id="unoColorPicker">
+  <div class="uno-color-picker-title">Choose a color</div>
+  <div class="uno-color-options">
+    <div class="uno-color-option uno-color-red" onclick="chooseWildColor('red')"></div>
+    <div class="uno-color-option uno-color-yellow" onclick="chooseWildColor('yellow')"></div>
+    <div class="uno-color-option uno-color-green" onclick="chooseWildColor('green')"></div>
+    <div class="uno-color-option uno-color-blue" onclick="chooseWildColor('blue')"></div>
+  </div>
+</div>
+
+<!-- Game over screen -->
+<div class="uno-gameover" id="unoGameOver">
+  <div class="uno-gameover-trophy">🏆</div>
+  <div class="uno-gameover-title" id="unoGameOverTitle">Round Over!</div>
+  <div class="uno-gameover-winner" id="unoGameOverWinner"></div>
+  <div class="uno-gameover-scores" id="unoGameOverScores"></div>
+  <button class="uno-btn uno-btn-primary" onclick="closeUnoGameOver()">Back to Call</button>
+</div>
+
+<!-- Catch UNO floating button -->
+<button class="uno-catch-btn" id="unoCatchBtn" onclick="catchUno()">
+  <span>!</span>
+  <span>CATCH</span>
+</button>
+
+<!-- Pending draw badge -->
+<div class="uno-pending-draw" id="unoPendingDraw">Must draw +<span id="unoPendingCount">2</span></div>
+
+<!-- UNO toast -->
+<div class="uno-toast" id="unoToast"></div>
 
 <script>
 // ════════════════════════════════════════════════════════════════════════════
@@ -2602,6 +3043,26 @@ function connectWS() {
       case 'sticker_result':
         // v3.12: response to an upload or delete attempt. Show inline status.
         handleStickerResult(m);
+        break;
+
+      // v3.13: UNO game messages
+      case 'uno_state':
+        handleUnoState(m);
+        break;
+      case 'uno_started':
+        if (m.your_state) {
+          inUnoGame = true;
+          renderUnoGame(m.your_state);
+          openUnoPanel();
+          showUnoToast('UNO started!');
+        }
+        break;
+      case 'uno_event':
+        handleUnoEvent(m);
+        if (m.your_state) renderUnoGame(m.your_state);
+        break;
+      case 'uno_error':
+        showUnoToast(m.error || 'Game error', 3000);
         break;
 
       case 'history':
@@ -4658,6 +5119,464 @@ function sendMsg() {
   inEl.focus();
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// v3.13 — UNO CARD GAME CLIENT
+// ════════════════════════════════════════════════════════════════════════════
+
+let inUnoGame = false;
+let unoState = null;
+let gameLobbyOpen = false;
+let selectedCardId = null;
+let pendingWildCardId = null;
+let unoTimerInterval = null;
+let canPass = false;
+
+// ── Game Lobby ────────────────────────────────────────────────────────────
+
+function toggleGameLobby() {
+  if (gameLobbyOpen) closeGameLobby();
+  else openGameLobby();
+}
+
+function openGameLobby() {
+  const panel = document.getElementById('gameLobby');
+  if (panel) panel.classList.add('open');
+  gameLobbyOpen = true;
+  // Request current UNO state if we're in a game
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'uno_state_request' }));
+  }
+}
+
+function closeGameLobby() {
+  const panel = document.getElementById('gameLobby');
+  if (panel) panel.classList.remove('open');
+  gameLobbyOpen = false;
+}
+
+function joinUnoGame() {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'uno_join' }));
+  showUnoToast('Joining UNO...');
+}
+
+function leaveUnoGame() {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'uno_leave' }));
+  document.getElementById('unoLobbySection').style.display = 'none';
+  document.getElementById('gamesGrid').style.display = 'grid';
+  inUnoGame = false;
+  closeUnoPanel();
+}
+
+function startUnoGame() {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'uno_start' }));
+}
+
+// ── UNO Panel ─────────────────────────────────────────────────────────────
+
+function openUnoPanel() {
+  document.getElementById('unoPanel').classList.add('active');
+  closeGameLobby();
+}
+
+function closeUnoPanel() {
+  document.getElementById('unoPanel').classList.remove('active');
+  inUnoGame = false;
+  if (unoTimerInterval) {
+    clearInterval(unoTimerInterval);
+    unoTimerInterval = null;
+  }
+}
+
+// ── Card Rendering ────────────────────────────────────────────────────────
+
+function _unoCardColorClass(color) {
+  if (color === 'red') return 'red';
+  if (color === 'yellow') return 'yellow';
+  if (color === 'green') return 'green';
+  if (color === 'blue') return 'blue';
+  return 'wild';
+}
+
+function _unoCardSymbol(type, value) {
+  if (type === 'number') return String(value);
+  if (type === 'skip') return '⊘';
+  if (type === 'reverse') return '⇄';
+  if (type === 'draw2') return '+2';
+  if (type === 'wild') return 'W';
+  if (type === 'wild4') return '+4';
+  return '?';
+}
+
+function _unoCardCorner(type, value) {
+  if (type === 'number') return String(value);
+  if (type === 'skip') return '⊘';
+  if (type === 'reverse') return '⇄';
+  if (type === 'draw2') return '+2';
+  if (type === 'wild') return 'W';
+  if (type === 'wild4') return '+4';
+  return '';
+}
+
+function renderUnoCard(card, opts) {
+  opts = opts || {};
+  const sizeClass = opts.small ? 'small' : opts.large ? 'large' : '';
+  const colorClass = _unoCardColorClass(card.color);
+  const sym = _unoCardSymbol(card.type, card.value);
+  const corner = _unoCardCorner(card.type, card.value);
+  const isWild = card.type === 'wild' || card.type === 'wild4';
+  const centerClass = isWild ? 'wild-bg' : '';
+  const smallClass = (sym.length > 1 && card.type !== 'number') ? 'small' : '';
+  const clickAttr = opts.onClick ? ' onclick="' + opts.onClick + '"' : '';
+  const extraClass = opts.extraClass || '';
+  const dataAttr = opts.cardId !== undefined ? ' data-card-id="' + opts.cardId + '"' : '';
+
+  return (
+    '<div class="uno-card ' + colorClass + ' ' + sizeClass + ' ' + extraClass + '"' + clickAttr + dataAttr + '>' +
+      '<span class="card-corner tl">' + corner + '</span>' +
+      '<span class="card-center ' + centerClass + ' ' + smallClass + '">' + sym + '</span>' +
+      '<span class="card-corner br">' + corner + '</span>' +
+    '</div>'
+  );
+}
+
+// ── Game Board Rendering ──────────────────────────────────────────────────
+
+function renderUnoGame(state) {
+  if (!state) return;
+  unoState = state;
+
+  if (state.state === 'lobby') {
+    renderUnoLobby(state);
+    return;
+  }
+
+  if (state.state === 'playing' || state.state === 'finished') {
+    if (!inUnoGame) {
+      inUnoGame = true;
+      openUnoPanel();
+    }
+    renderUnoBoard(state);
+    renderUnoHand(state);
+    renderUnoOpponents(state);
+    renderUnoActions(state);
+    renderUnoTimer(state);
+    renderUnoColorIndicator(state);
+    renderUnoPendingDraw(state);
+
+    if (state.state === 'finished') {
+      showUnoGameOver(state);
+    }
+  }
+}
+
+function renderUnoLobby(state) {
+  const grid = document.getElementById('gamesGrid');
+  const lobbySection = document.getElementById('unoLobbySection');
+  const status = document.getElementById('unoLobbyStatus');
+  const count = document.getElementById('unoLobbyCount');
+  const playersDiv = document.getElementById('unoLobbyPlayers');
+  const startBtn = document.getElementById('unoStartBtn');
+
+  // Check if viewer is already in the game
+  const meInGame = state.players.some(function(p) { return p.peer_id === MY_ID; });
+
+  if (meInGame) {
+    grid.style.display = 'none';
+    lobbySection.style.display = 'block';
+    status.textContent = state.state === 'playing' ? 'Game in progress!' : 'Waiting for players...';
+    count.textContent = state.player_count + '/4';
+
+    playersDiv.innerHTML = state.players.map(function(p) {
+      const isMe = p.peer_id === MY_ID;
+      const creatorClass = p.is_creator ? 'creator' : '';
+      return '<div class="uno-lobby-player-chip ' + creatorClass + '">' +
+        '<span class="dot"></span>' +
+        esc(p.name) + (isMe ? ' (You)' : '') +
+        (p.is_creator ? ' ♛' : '') +
+      '</div>';
+    }).join('');
+
+    const canStart = state.can_start && state.player_count >= 2;
+    startBtn.disabled = !canStart;
+    startBtn.textContent = canStart ? 'Start Game!' : 'Start Game (need 2+)';
+  } else {
+    grid.style.display = 'grid';
+    lobbySection.style.display = 'none';
+  }
+}
+
+function renderUnoBoard(state) {
+  // Discard pile
+  const discardPile = document.getElementById('unoDiscardPile');
+  if (state.top_card) {
+    discardPile.innerHTML = renderUnoCard(state.top_card, {large: true});
+  }
+}
+
+function renderUnoHand(state) {
+  const handDiv = document.getElementById('unoHand');
+  const countLabel = document.getElementById('unoHandCount');
+  if (!handDiv) return;
+
+  const isMyTurn = state.current_player_id === MY_ID;
+  const playableIds = new Set(state.playable_ids || []);
+
+  handDiv.innerHTML = (state.my_hand || []).map(function(card) {
+    const canPlay = isMyTurn && playableIds.has(card.id);
+    const extraClass = 'in-hand' + (canPlay ? '' : ' disabled') + (selectedCardId === card.id ? ' selected' : '');
+    const clickCode = canPlay ? 'onCardClick(' + card.id + ')' : '';
+    return renderUnoCard(card, {
+      cardId: card.id,
+      extraClass: extraClass,
+      onClick: clickCode,
+    });
+  }).join('');
+
+  countLabel.textContent = (state.my_hand || []).length;
+}
+
+function renderUnoOpponents(state) {
+  const container = document.getElementById('unoOpponents');
+  if (!container) return;
+
+  let html = '';
+  for (var pid in state.other_hands) {
+    var opp = state.other_hands[pid];
+    var isCurrent = state.current_player_id === pid;
+    var unoClass = (opp.card_count === 1 && !opp.said_uno) ? 'uno' : '';
+    html += '<div class="uno-opponent ' + (isCurrent ? 'current-turn' : '') + '">' +
+      '<div class="uno-opponent-avatar">' + esc((opp.name || '?')[0].toUpperCase()) + '</div>' +
+      '<span class="uno-opponent-name">' + esc(opp.name) + '</span>' +
+      '<span class="uno-opponent-count ' + unoClass + '">' + (opp.card_count === 1 && !opp.said_uno ? 'UNO!' : opp.card_count) + '</span>' +
+    '</div>';
+  }
+  container.innerHTML = html;
+}
+
+function renderUnoActions(state) {
+  const isMyTurn = state.current_player_id === MY_ID;
+  const drawBtn = document.getElementById('unoDrawBtn');
+  const passBtn = document.getElementById('unoPassBtn');
+  const callUnoBtn = document.getElementById('unoCallUnoBtn');
+
+  if (drawBtn) {
+    drawBtn.style.display = isMyTurn ? 'flex' : 'none';
+    drawBtn.textContent = state.pending_draw > 0 ? 'Draw ' + state.pending_draw : 'Draw';
+  }
+  if (passBtn) passBtn.style.display = (isMyTurn && canPass) ? 'flex' : 'none';
+  if (callUnoBtn) {
+    const myHand = state.my_hand || [];
+    const canCall = myHand.length === 1 && !state.my_said_uno;
+    callUnoBtn.style.display = canCall ? 'flex' : 'none';
+  }
+}
+
+function renderUnoTimer(state) {
+  const timerEl = document.getElementById('unoTimer');
+  const indicator = document.getElementById('unoTurnIndicator');
+  if (!timerEl || !indicator) return;
+
+  if (state.state !== 'playing') {
+    timerEl.textContent = '--';
+    indicator.textContent = 'Waiting...';
+    indicator.className = 'uno-turn-indicator waiting';
+    return;
+  }
+
+  const isMyTurn = state.current_player_id === MY_ID;
+  indicator.textContent = isMyTurn ? 'Your turn!' : state.current_player_name + "'s turn";
+  indicator.className = 'uno-turn-indicator' + (isMyTurn ? '' : ' waiting');
+
+  // Update countdown
+  if (unoTimerInterval) clearInterval(unoTimerInterval);
+  function tick() {
+    if (!unoState || unoState.state !== 'playing') {
+      clearInterval(unoTimerInterval);
+      return;
+    }
+    var remaining = Math.max(0, unoState.time_remaining || 0);
+    timerEl.textContent = remaining;
+    if (remaining <= 5) timerEl.classList.add('warning');
+    else timerEl.classList.remove('warning');
+  }
+  tick();
+  unoTimerInterval = setInterval(tick, 1000);
+}
+
+function renderUnoColorIndicator(state) {
+  const el = document.getElementById('unoColorIndicator');
+  if (!el || !state.current_color) return;
+  var colors = {red: '#ff3b30', yellow: '#ffcc00', green: '#34c759', blue: '#007aff'};
+  el.style.background = colors[state.current_color] || '#666';
+  el.style.boxShadow = '0 0 12px ' + (colors[state.current_color] || '#666');
+}
+
+function renderUnoPendingDraw(state) {
+  const badge = document.getElementById('unoPendingDraw');
+  const count = document.getElementById('unoPendingCount');
+  if (!badge) return;
+  if (state.pending_draw > 0) {
+    badge.classList.add('show');
+    count.textContent = state.pending_draw;
+  } else {
+    badge.classList.remove('show');
+  }
+}
+
+// ── Card Interaction ──────────────────────────────────────────────────────
+
+function onCardClick(cardId) {
+  if (!unoState || unoState.current_player_id !== MY_ID) return;
+  var card = (unoState.my_hand || []).find(function(c) { return c.id === cardId; });
+  if (!card) return;
+
+  // Check if card is playable
+  var playableIds = new Set(unoState.playable_ids || []);
+  if (!playableIds.has(cardId)) return;
+
+  // If wild card, show color picker first
+  if (card.type === 'wild' || card.type === 'wild4') {
+    pendingWildCardId = cardId;
+    document.getElementById('unoColorPicker').classList.add('show');
+    return;
+  }
+
+  playCard(cardId);
+}
+
+function chooseWildColor(color) {
+  document.getElementById('unoColorPicker').classList.remove('show');
+  if (pendingWildCardId !== null) {
+    playCard(pendingWildCardId, color);
+    pendingWildCardId = null;
+  }
+}
+
+function playCard(cardId, color) {
+  if (!ws || ws.readyState !== 1) return;
+  var payload = { type: 'uno_play', card_id: cardId };
+  if (color) payload.color = color;
+  ws.send(JSON.stringify(payload));
+}
+
+function drawCard() {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'uno_draw' }));
+}
+
+function passTurn() {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'uno_pass' }));
+  canPass = false;
+}
+
+function callUno() {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'uno_call_uno' }));
+  showUnoToast('UNO!');
+}
+
+function catchUno() {
+  if (!unoState) return;
+  // Find a player with 1 card who didn't say UNO
+  for (var pid in unoState.other_hands) {
+    var opp = unoState.other_hands[pid];
+    if (opp.card_count === 1 && !opp.said_uno) {
+      ws.send(JSON.stringify({ type: 'uno_catch', target_id: pid }));
+      return;
+    }
+  }
+}
+
+// ── Toast & Game Over ─────────────────────────────────────────────────────
+
+function showUnoToast(text, duration) {
+  var t = document.getElementById('unoToast');
+  if (!t) return;
+  t.textContent = text;
+  t.classList.add('show');
+  setTimeout(function() { t.classList.remove('show'); }, duration || 2500);
+}
+
+function showUnoGameOver(state) {
+  var screen = document.getElementById('unoGameOver');
+  var title = document.getElementById('unoGameOverTitle');
+  var winner = document.getElementById('unoGameOverWinner');
+  var scores = document.getElementById('unoGameOverScores');
+  if (!screen) return;
+
+  var isWinner = state.winner_id === MY_ID;
+  title.textContent = isWinner ? 'You Win!' : 'Round Over!';
+  winner.textContent = state.winner_name + ' wins!';
+
+  // Build score rows
+  var html = '';
+  if (state.scores) {
+    for (var pid in state.scores) {
+      if (pid.startsWith('_')) continue;
+      var s = state.scores[pid];
+      var winClass = (pid === state.winner_id) ? 'winner' : '';
+      html += '<div class="uno-score-row ' + winClass + '">' +
+        '<span class="uno-score-name">' + esc(s.name) + '</span>' +
+        '<span class="uno-score-value">+' + s.score + '</span>' +
+      '</div>';
+    }
+  }
+  scores.innerHTML = html;
+  screen.classList.add('show');
+}
+
+function closeUnoGameOver() {
+  document.getElementById('unoGameOver').classList.remove('show');
+  closeUnoPanel();
+}
+
+// ── WS Message Handlers ───────────────────────────────────────────────────
+
+function handleUnoState(msg) {
+  if (msg.your_state) {
+    renderUnoGame(msg.your_state);
+    // Update lobby dot indicator
+    var dot = document.getElementById('gamesDot');
+    if (dot) {
+      var inGame = msg.your_state.state === 'lobby' || msg.your_state.state === 'playing';
+      var btn = document.getElementById('gamesBtn');
+      if (inGame) {
+        btn.classList.add('has-game');
+      } else {
+        btn.classList.remove('has-game');
+      }
+    }
+  }
+}
+
+function handleUnoEvent(msg) {
+  var ev = msg.event;
+  if (!ev) return;
+
+  if (ev.message) showUnoToast(ev.message, 3000);
+
+  // Handle special events
+  if (ev.type === 'draw' && ev.player_id === MY_ID && ev.can_play) {
+    canPass = true;  // drew and can play — show pass option
+    renderUnoActions(unoState);
+  }
+
+  if (ev.type === 'card_played' && ev.forgot_uno) {
+    // Show catch button briefly
+    var catchBtn = document.getElementById('unoCatchBtn');
+    if (catchBtn) {
+      catchBtn.classList.add('show');
+      setTimeout(function() { catchBtn.classList.remove('show'); }, 5000);
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+
 function leaveCall() {
   log("leave");
   leaving = true;
@@ -4672,13 +5591,49 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.12 (max " + MAX_PEERS + " peers, in-room sticker uploads, seat-grid UI)");
+log("page loaded v3.13 (max " + MAX_PEERS + " peers, stickers, seat-grid, UNO game)");
 </script>
 </body>
 </html>"""
 
 
 # ─── BACKGROUND TASKS ───────────────────────────────────────────────────────
+async def _game_tick():
+    """v3.13: Periodic UNO game turn timeout checker. Runs every 2 seconds
+    to catch players who ran out of time."""
+    await asyncio.sleep(5)
+    while True:
+        try:
+            for rid, game in list(uno_manager.games.items()):
+                if game.game_state == "playing":
+                    event = game.check_timeout()
+                    if event:
+                        room = rooms.get(rid)
+                        if room:
+                            payload = {"type": "uno_event", "event": event,
+                                       "game_state": game.get_state("")}
+                            for p, pd in room["peers"].items():
+                                try:
+                                    state = game.get_state(p)
+                                    await pd["ws"].send_json({**payload, "your_state": state})
+                                except Exception:
+                                    pass
+        except Exception as e:
+            print(f"[uno-tick] err: {e}")
+        await asyncio.sleep(2)
+
+
+async def _game_cleanup():
+    """v3.13: Clean up finished/abandoned UNO games."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            uno_manager.cleanup_empty()
+        except Exception as e:
+            print(f"[uno-cleanup] err: {e}")
+        await asyncio.sleep(120)
+
+
 async def keepalive():
     await asyncio.sleep(30)
     url = WEB_APP_URL if "onrender.com" in WEB_APP_URL else None
@@ -4815,12 +5770,15 @@ async def main():
     print("v3.12.11: rolled back voice-reactive halo to the reliable gentle keyframe pulse")
     print("v3.12.12: hysteresis on speaking detect — snappy stop, no mid-speech flicker")
     print("v3.12.13: cleanup pass — fixed stale comments, dead refs, banner version")
+    print("v3.13: UNO card game! Create/join rooms, 2-4 players, full rules + timer")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
         run_kyodo_bot(),
         keepalive(),
         memory_groomer(),
+        _game_tick(),
+        _game_cleanup(),
     )
 
 
