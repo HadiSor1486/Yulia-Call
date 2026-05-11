@@ -4555,9 +4555,10 @@ function pickChatImage(e) {
 }
 
 function showImagePreviewOverlay(dataUrl) {
-  _imgPreviewDataUrl = dataUrl;
-  // Remove any existing overlay
+  // Remove any existing overlay first (this clears _imgPreviewDataUrl)
   hideImagePreviewOverlay();
+  // NOW set the data URL — after hide is done clearing
+  _imgPreviewDataUrl = dataUrl;
   const overlay = document.createElement('div');
   overlay.id = 'imgSendOverlay';
   overlay.className = 'img-send-overlay';
