@@ -1,23 +1,29 @@
 """
-Silent Hill Voice Call Bot — v3.13 BEAST MODE (MESSAGE DELETION + SWIPE REPLY)
+Silent Hill Voice Call Bot — v3.13 BEAST MODE
 ═══════════════════════════════════════════════════════════════════════════════
-v3.13 — USERS CAN DELETE THEIR OWN MESSAGES + SWIPE-TO-REPLY + LONG-PRESS
-         DELETE UI.
+v3.13 — MESSAGE DELETION + SWIPE-TO-REPLY + LONG-PRESS DELETE UI +
+         WHATSAPP-STYLE IMAGE PREVIEW + VIEW ONCE.
 
   WHAT'S NEW SINCE v3.12:
     • Message deletion: each user can delete ONLY messages they sent.
-          Long-press your own message → red trash bin appears → tap to
-          delete. The bin auto-hides after 3 seconds or when tapping
-          elsewhere. Deleted messages show a "This message was deleted"
-          placeholder, preserving the sender's avatar and name.
-    • Swipe-to-reply: swipe OTHER people's messages to the RIGHT to
-          reply. Swipe YOUR OWN messages to the LEFT to reply. Smooth
-          dampened animation with spring-back — no message cutting.
-          Vertical scroll is preserved when the gesture is more up/down
-          than left/right.
-    • Server verifies ownership via peer_id before accepting any deletion.
-          Only the original sender can delete their message. Deleted state
-          is persisted in the chat file and broadcast to all room peers.
+          Long-press your own message → red trash bin appears (smooth
+          scale+fade animation) → tap to delete. Auto-hides after 3s or
+          on outside tap. Deleted messages show "This message was deleted"
+          placeholder with sender avatar + name preserved.
+    • Swipe-to-reply: swipe OTHER people's messages RIGHT to reply.
+          Swipe YOUR OWN messages LEFT to reply. Smooth dampened
+          translate with spring-back. No click-to-reply anymore —
+          swipe only, no accidental triggers.
+    • WhatsApp-style image sending: pick image → full-screen preview
+          overlay → type caption → choose "Send" or "View Once".
+          No more instant accidental sends.
+    • View Once images (Instagram-style): recipients see a grey
+          placeholder card with eye icon. Tap → full preview → on close
+          becomes "Opened" ghost. Sender sees "Photo" with timer icon
+          → changes to "Opened" when anyone views it. Server tracks
+          openers and broadcasts to all peers in real-time.
+    • Server verifies deletion ownership via peer_id. View-once open
+          tracking is server-backed with per-message opened_by list.
 
   EVERYTHING FROM v3.12 IS UNTOUCHED:
     • In-room sticker uploads with RAM safety and GitHub persistence
@@ -1052,6 +1058,9 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                         # v3.10: replies-to-stickers
                         "has_sticker": bool(rt.get("has_sticker")),
                     }
+                # v3.13: view-once image flag
+                view_once = bool(msg.get("view_once")) if image else False
+
                 cm = {"type": "chat", "kind": "user",
                       "id": str(uuid.uuid4())[:12],
                       "peer_id": peer_id,
@@ -1060,6 +1069,9 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                       "time": datetime.now().isoformat()}
                 if image:
                     cm["image"] = image
+                    if view_once:
+                        cm["view_once"] = True
+                        cm["opened_by"] = []  # tracks peer_ids who opened it
                 if sticker:
                     cm["sticker"] = sticker
                 if reply_to:
@@ -1073,6 +1085,35 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                             await pd["ws"].send_json(cm)
                     except Exception:
                         pass
+
+            # ── v3.13: view-once message opened tracking ────────────────
+            # Client sends { type: "msg_opened", msg_id: "..." } when they
+            # view a view-once image. Server records the opener and broadcasts
+            # to all room peers so the sender sees "Opened".
+            elif mt == "msg_opened":
+                target_msg_id = msg.get("msg_id", "")
+                if not target_msg_id:
+                    continue
+                chat_file = f"{room_id}_chat.json"
+                all_msgs = json_read(chat_file, [])
+                for mm in all_msgs:
+                    if mm.get("id") == target_msg_id and mm.get("view_once"):
+                        opened_by = mm.get("opened_by", [])
+                        if peer_id not in opened_by:
+                            opened_by.append(peer_id)
+                            mm["opened_by"] = opened_by
+                            json_write(chat_file, all_msgs)
+                        # Broadcast to everyone in the room
+                        opened_payload = {
+                            "type": "msg_opened",
+                            "msg_id": target_msg_id,
+                        }
+                        for p_other, pd_other in room["peers"].items():
+                            try:
+                                await pd_other["ws"].send_json(opened_payload)
+                            except Exception:
+                                pass
+                        break
 
             elif mt in ("webrtc_offer", "webrtc_answer", "webrtc_ice", "request_relay"):
                 target = msg.get("to")
@@ -1559,11 +1600,34 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 .msg-row.system:active{opacity:1}
 /* ─── v3.13: swipe-to-reply + long-press delete ─── */
 .msg-content{transition:transform .3s cubic-bezier(.2,.7,.2,1);will-change:transform}
-.msg-delete-btn{position:absolute;top:50%;right:6px;transform:translateY(-50%);width:34px;height:34px;border-radius:50%;background:#ff3b30;border:none;color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:5;box-shadow:0 2px 10px rgba(0,0,0,.5);animation:msgIn .15s ease-out;padding:0}
+.msg-delete-btn{position:absolute;top:50%;right:6px;transform:translateY(-50%) scale(0.5);width:34px;height:34px;border-radius:50%;background:#ff3b30;border:none;color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:5;box-shadow:0 2px 10px rgba(0,0,0,.5);opacity:0;padding:0;animation:binPop .28s cubic-bezier(.34,1.56,.64,1) forwards}
+@keyframes binPop{from{opacity:0;transform:translateY(-50%) scale(0.4)}to{opacity:1;transform:translateY(-50%) scale(1)}}
 .msg-row.self .msg-delete-btn{right:auto;left:6px}
 .msg-delete-btn svg{width:16px;height:16px;pointer-events:none}
-.msg-delete-btn:active{transform:translateY(-50%) scale(.9)}
+.msg-delete-btn:active{transform:translateY(-50%) scale(.85);transition:transform .1s}
 .msg-deleted{color:#8e8e93;font-size:13px;font-style:italic;padding:6px 0;opacity:.65}
+/* ─── v3.13: View Once image placeholders (Instagram style) ─── */
+.viewonce-card{width:200px;height:240px;border-radius:14px;background:#1a1a1e;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;cursor:pointer;position:relative;overflow:hidden;border:1px solid rgba(255,255,255,0.06);transition:transform .15s,opacity .2s}
+.viewonce-card:active{transform:scale(.97)}
+.viewonce-card svg{width:36px;height:36px;color:#8e8e93}
+.viewonce-card .vo-label{font-size:13px;font-weight:600;color:#8e8e93;letter-spacing:.3px}
+.viewonce-card .vo-sub{font-size:11px;color:#555}
+.viewonce-card .vo-timer{position:absolute;top:8px;right:8px;width:22px;height:22px;opacity:.6}
+.viewonce-opened{width:200px;height:60px;border-radius:14px;background:#1a1a1e;display:flex;align-items:center;justify-content:center;gap:8px;border:1px solid rgba(255,255,255,0.04);opacity:.55}
+.viewonce-opened svg{width:18px;height:18px;color:#555}
+.viewonce-opened .vo-label{font-size:12px;color:#555;font-weight:500}
+/* ─── v3.13: Image send preview overlay (WhatsApp style) ─── */
+.img-send-overlay{position:fixed;inset:0;z-index:350;background:rgba(0,0,0,0.93);display:flex;flex-direction:column;animation:msgIn .2s}
+.img-send-preview{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;min-height:0}
+.img-send-preview img{max-width:95vw;max-height:70vh;border-radius:12px;object-fit:contain}
+.img-send-bar{background:rgba(20,20,22,0.98);padding:12px 16px;display:flex;align-items:center;gap:10px;border-top:1px solid rgba(255,255,255,0.06)}
+.img-send-caption{flex:1;height:40px;border-radius:20px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.05);color:#fff;padding:0 16px;font-size:14px;outline:none}
+.img-send-caption::placeholder{color:#8e8e93}
+.img-send-btn{height:40px;padding:0 18px;border-radius:20px;border:none;background:#007aff;color:#fff;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap}
+.img-send-btn.vo-btn{background:linear-gradient(135deg,#ff9500,#ff6b00);color:#fff}
+.img-send-btn:active{transform:scale(.95)}
+.img-send-cancel{height:40px;padding:0 14px;border-radius:20px;border:1px solid rgba(255,255,255,0.15);background:transparent;color:#8e8e93;font-size:14px;cursor:pointer}
+.img-send-cancel:active{opacity:.7}
 .chat-img{max-width:240px;max-height:300px;border-radius:12px;display:block;cursor:pointer;margin:2px 0}
 .img-expired{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.55);font-size:12px;font-style:italic;margin:2px 0}
 .img-expired svg{width:18px;height:18px;flex-shrink:0;opacity:0.6}
@@ -1951,6 +2015,11 @@ const frozenJitterValues = {};
 // stickers/ folder appears without restart.
 let stickerList = [];
 let stickerPanelOpen = false;
+
+// v3.13: tracks view-once message IDs that the local user has already
+// opened. Persists per session only — refreshes on rejoin. Used to show
+// "Opened" placeholder after the first view.
+const viewOnceOpened = new Set();
 
 let ICE_SERVERS = [
   {urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302']},
@@ -2657,6 +2726,12 @@ function connectWS() {
         if (!m.ok) {
           showStickerToast(m.error || 'Delete failed', 'err', 4000);
         }
+        break;
+
+      // ── v3.13: view-once opened tracking ──
+      case 'msg_opened':
+        // Someone opened a view-once image. Update the placeholder in the DOM.
+        if (m.msg_id) markViewOnceOpened(m.msg_id);
         break;
 
       case 'history':
@@ -4427,6 +4502,17 @@ function toggleMute() {
 
 let replyingTo = null;
 
+// ════════════════════════════════════════════════════════════════════════════
+// v3.13: IMAGE SENDING — WhatsApp-style preview + View Once
+// ════════════════════════════════════════════════════════════════════════════
+// Pick image → show preview overlay with caption input → choose "Send"
+// or "View Once" → only then transmit over WS. View Once images show
+// an Instagram-style placeholder card; recipients tap to open once,
+// then see an "Opened" ghost. The sender also sees "Opened" after
+// the first person views it.
+
+let _imgPreviewDataUrl = '';
+
 function pickChatImage(e) {
   const f = e.target.files && e.target.files[0];
   e.target.value = '';
@@ -4450,12 +4536,12 @@ function pickChatImage(e) {
       if (data.length > 600000) {
         const data2 = c.toDataURL('image/jpeg', 0.4);
         if (data2.length > 600000) {
-          alert("Image too large after compression");
+          showStickerToast('Image too large after compression', 'err', 4000);
           return;
         }
-        sendImageMsg(data2);
+        showImagePreviewOverlay(data2);
       } else {
-        sendImageMsg(data);
+        showImagePreviewOverlay(data);
       }
     };
     img.onerror = () => log("img decode fail");
@@ -4464,11 +4550,60 @@ function pickChatImage(e) {
   r.readAsDataURL(f);
 }
 
-function sendImageMsg(dataUrl) {
+function showImagePreviewOverlay(dataUrl) {
+  _imgPreviewDataUrl = dataUrl;
+  // Remove any existing overlay
+  hideImagePreviewOverlay();
+  const overlay = document.createElement('div');
+  overlay.id = 'imgSendOverlay';
+  overlay.className = 'img-send-overlay';
+  overlay.innerHTML =
+    '<div class="img-send-preview">' +
+      '<img src="' + esc(dataUrl) + '" alt="Preview">' +
+    '</div>' +
+    '<div class="img-send-bar">' +
+      '<input type="text" class="img-send-caption" id="imgCaption" placeholder="Add a caption..." maxlength="200">' +
+      '<button class="img-send-cancel" onclick="hideImagePreviewOverlay()">Cancel</button>' +
+      '<button class="img-send-btn vo-btn" onclick="sendImageFromPreview(true)" title="View Once">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;vertical-align:middle;margin-right:4px"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>View Once' +
+      '</button>' +
+      '<button class="img-send-btn" onclick="sendImageFromPreview(false)">Send</button>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  // Auto-focus the caption input (but don't pop keyboard on mobile until user taps)
+  const capIn = document.getElementById('imgCaption');
+  if (capIn && !('ontouchstart' in window)) capIn.focus();
+  // Enter key in caption sends
+  if (capIn) {
+    capIn.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendImageFromPreview(false);
+      }
+    });
+  }
+}
+
+function hideImagePreviewOverlay() {
+  _imgPreviewDataUrl = '';
+  const el = document.getElementById('imgSendOverlay');
+  if (el) el.remove();
+}
+
+function sendImageFromPreview(viewOnce) {
+  const captionIn = document.getElementById('imgCaption');
+  const caption = captionIn ? captionIn.value.trim() : '';
+  if (!_imgPreviewDataUrl) return;
+  sendImageMsg(_imgPreviewDataUrl, caption, viewOnce);
+  hideImagePreviewOverlay();
+}
+
+function sendImageMsg(dataUrl, caption, viewOnce) {
   if (!ws || ws.readyState !== 1) return;
   if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
   ws.send(JSON.stringify({ type: 'typing_stop' }));
-  const payload = { type: 'chat', text: '', image: dataUrl };
+  const payload = { type: 'chat', text: caption || '', image: dataUrl };
+  if (viewOnce) payload.view_once = true;
   if (replyingTo) {
     payload.reply_to = replyingTo;
     cancelReply();
@@ -4524,12 +4659,49 @@ function cancelReply() {
   if (el) el.remove();
 }
 
-function openImagePreview(src) {
+// ── v3.13: image preview (normal + view-once tracking) ─────────────────────
+// For normal images: simple tap-to-view full screen.
+// For view-once images: first tap shows placeholder, second tap opens
+// full preview. On close, the image is marked "opened" locally and the
+// server is notified so the sender sees "Opened".
+function openImagePreview(src, msgId, isViewOnce) {
+  if (isViewOnce && msgId && !viewOnceOpened.has(msgId)) {
+    // First time opening this view-once image
+    viewOnceOpened.add(msgId);
+    markViewOnceOpened(msgId);
+    // Notify server so sender can see "Opened"
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'msg_opened', msg_id: msgId }));
+    }
+  }
   const overlay = document.createElement('div');
   overlay.className = 'img-preview-overlay';
   overlay.innerHTML = '<span class="close-hint">&times;</span><img src="' + esc(src) + '">';
-  overlay.onclick = () => overlay.remove();
+  overlay.onclick = function() { overlay.remove(); };
   document.body.appendChild(overlay);
+}
+
+// v3.13: replace a view-once placeholder card with the "Opened" ghost state.
+// Called both locally (when this user opens) and via WS broadcast (when
+// ANY user opens — so the sender sees it too).
+function markViewOnceOpened(msgId) {
+  const c = document.getElementById('msgs');
+  if (!c) return;
+  const row = c.querySelector('[data-msg-id="' + esc(msgId) + '"]');
+  if (!row) return;
+  const content = row.querySelector('.msg-content');
+  if (!content) return;
+  // Already showing "Opened"? Done.
+  if (content.querySelector('.viewonce-opened')) return;
+  // Build the "Opened" ghost placeholder
+  const openedHTML = '<div class="viewonce-opened">' +
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>' +
+    '<span class="vo-label">Opened</span></div>';
+  // Preserve the existing header (name + badge), replace everything else
+  const headerEl = content.querySelector('.msg-header');
+  const headerHTML = headerEl ? headerEl.outerHTML : '';
+  content.innerHTML = headerHTML + openedHTML;
+  row.style.pointerEvents = 'none';
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -4669,16 +4841,21 @@ function attachMessageGestures(row, m) {
     onEnd(e.clientX, e.clientY);
   });
 
+  // v3.13: click no longer triggers reply — swipe only. Image preview still works.
   row.addEventListener('click', function(ev) {
     if (didSwipe) { didSwipe = false; return; }
     if (didLongPress) { didLongPress = false; return; }
     if (deleteBtn) { removeDeleteBtn(); return; }
     var t = ev.target;
+    // Normal image preview still works on tap
     if (t.classList && t.classList.contains('chat-img')) {
       ev.stopPropagation(); openImagePreview(t.src); return;
     }
+    // View-once placeholder tap is handled by the placeholder's own click
+    if (t.closest && t.closest('.viewonce-card')) return;
+    // Avatar clicks do nothing
     if (t.tagName === 'IMG' && t.closest('.avatar')) return;
-    startReply(m);
+    // No click-to-reply — swipe only
   });
 }
 
@@ -4748,22 +4925,73 @@ function renderMsg(m) {
       }
       contentHTML = header + replyHTML + stickerHTML;
     } else {
-      let imgHTML = '';
-      if (m.image) {
-        imgHTML = '<img class="chat-img" src="' + esc(m.image) + '" alt="image">';
-      } else if (m.image_expired) {
-        imgHTML = '<div class="img-expired"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg><span>Image no longer available</span></div>';
+      // v3.13: view-once images render as placeholder cards, not direct <img>
+      const isViewOnce = !!m.view_once;
+      const alreadyOpened = isViewOnce && (
+        viewOnceOpened.has(m.id) ||
+        (Array.isArray(m.opened_by) && m.opened_by.length > 0)
+      );
+
+      if (isViewOnce && !alreadyOpened) {
+        // Unopened view-once: Instagram-style placeholder card
+        const isSender = !!m.self;
+        const voLabel = isSender ? 'Photo' : 'View once';
+        const voIcon = isSender
+          ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
+          : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+        const cardId = 'vo-' + esc(m.id);
+        imgHTML = '<div class="viewonce-card" id="' + cardId + '" data-vo-src="' + esc(m.image) + '" data-vo-id="' + esc(m.id) + '">' +
+                    (isSender ? '<svg class="vo-timer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' : '') +
+                    voIcon +
+                    '<span class="vo-label">' + voLabel + '</span>' +
+                    '<span class="vo-sub">Tap to view</span>' +
+                  '</div>';
+        let textHTML = '';
+        if (m.text) textHTML = '<div class="msg-text">' + esc(m.text) + '</div>';
+        const bubbleClass = 'msg-bubble has-img' + (m.text ? ' has-text' : '');
+        contentHTML = header + '<div class="' + bubbleClass + '">' + replyHTML + imgHTML + textHTML + '</div>';
+      } else if (isViewOnce && alreadyOpened) {
+        // Opened view-once: ghost placeholder
+        imgHTML = '<div class="viewonce-opened">' +
+                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>' +
+                    '<span class="vo-label">Opened</span></div>';
+        let textHTML = '';
+        if (m.text) textHTML = '<div class="msg-text">' + esc(m.text) + '</div>';
+        const bubbleClass = 'msg-bubble' + (m.text ? ' has-text' : '');
+        contentHTML = header + '<div class="' + bubbleClass + '">' + replyHTML + imgHTML + textHTML + '</div>';
+        row.style.pointerEvents = 'none';
+      } else {
+        // Normal image (non-view-once)
+        let imgHTML = '';
+        if (m.image) {
+          imgHTML = '<img class="chat-img" src="' + esc(m.image) + '" alt="image">';
+        } else if (m.image_expired) {
+          imgHTML = '<div class="img-expired"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg><span>Image no longer available</span></div>';
+        }
+        let textHTML = '';
+        if (m.text) textHTML = '<div class="msg-text">' + esc(m.text) + '</div>';
+        let bubbleClass = 'msg-bubble';
+        if (m.image) bubbleClass += ' has-img';
+        if (m.image && m.text) bubbleClass += ' has-text';
+        const bubbleInner = replyHTML + imgHTML + (textHTML || (m.image ? '' : esc(m.text)));
+        contentHTML = header + '<div class="' + bubbleClass + '">' + bubbleInner + '</div>';
       }
-      let textHTML = '';
-      if (m.text) textHTML = '<div class="msg-text">' + esc(m.text) + '</div>';
-      let bubbleClass = 'msg-bubble';
-      if (m.image) bubbleClass += ' has-img';
-      if (m.image && m.text) bubbleClass += ' has-text';
-      const bubbleInner = replyHTML + imgHTML + (textHTML || (m.image ? '' : esc(m.text)));
-      contentHTML = header + '<div class="' + bubbleClass + '">' + bubbleInner + '</div>';
     }
 
     row.innerHTML = avHTML + '<div class="msg-content">' + contentHTML + '</div>';
+
+    // v3.13: wire up view-once card click handler
+    if (m.view_once && m.image) {
+      const voCard = row.querySelector('.viewonce-card');
+      if (voCard) {
+        voCard.addEventListener('click', function(ev) {
+          ev.stopPropagation();
+          const src = voCard.getAttribute('data-vo-src');
+          const mid = voCard.getAttribute('data-vo-id');
+          if (src && mid) openImagePreview(src, mid, true);
+        });
+      }
+    }
 
     // v3.13: attach swipe-to-reply and long-press-delete gestures
     attachMessageGestures(row, m);
@@ -4851,7 +5079,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.13 (max " + MAX_PEERS + " peers, sticker uploads, seat-grid, msg deletion, swipe reply)");
+log("page loaded v3.13 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once)");
 </script>
 </body>
 </html>"""
@@ -4994,7 +5222,7 @@ async def main():
     print("v3.12.11: rolled back voice-reactive halo to the reliable gentle keyframe pulse")
     print("v3.12.12: hysteresis on speaking detect — snappy stop, no mid-speech flicker")
     print("v3.12.13: cleanup pass — fixed stale comments, dead refs, banner version")
-    print("v3.13: message deletion (own msgs only) + swipe-to-reply + long-press delete UI")
+    print("v3.13: msg deletion + swipe reply + long-press delete + image preview + view once")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
