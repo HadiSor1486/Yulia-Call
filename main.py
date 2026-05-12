@@ -4926,10 +4926,26 @@ const EMOJI_PICKER_LIST = [
 ];
 const QUICK_REACTIONS = ['🤍','❤️','🔥','😭','🦦'];
 
+// v3.14: track active reaction bar timer + listener to prevent leaks
+var _reactBarTimer = null;
+var _reactBarOutsideFn = null;
+
+function _clearReactBarTimer() {
+  if (_reactBarTimer) { clearTimeout(_reactBarTimer); _reactBarTimer = null; }
+  if (_reactBarOutsideFn) {
+    document.removeEventListener('click', _reactBarOutsideFn);
+    _reactBarOutsideFn = null;
+  }
+}
+
 // Show floating reaction bar above a message
 // v3.14-fix: uses addEventListener (not onclick) for 100% mobile reliability
+// v3.14-fix: clears old timer/listener before creating new bar — prevents
+// old auto-hide timer from killing a newer bar.
 function showReactionBar(row, msgId) {
-  // Remove any existing reaction bars
+  // Kill any old timer/listener before creating new bar
+  _clearReactBarTimer();
+  // Remove any existing reaction bars from DOM
   document.querySelectorAll('.react-bar').forEach(function(b) { b.remove(); });
   const bar = document.createElement('div');
   bar.className = 'react-bar';
@@ -4959,19 +4975,26 @@ function showReactionBar(row, msgId) {
   });
   bar.appendChild(moreBtn);
   row.appendChild(bar);
-  // Auto-hide after 4 seconds
-  var autoHide = setTimeout(hideReactionBar, 4000);
-  // Hide on outside click
-  function outsideClick(e) {
+  // Auto-hide after 4 seconds — track globally so next bar clears it
+  _reactBarTimer = setTimeout(function() {
+    _reactBarTimer = null;
+    _reactBarOutsideFn = null;
+    hideReactionBar();
+  }, 4000);
+  // Hide on outside click — track globally so next bar removes it
+  _reactBarOutsideFn = function(e) {
     if (!bar.contains(e.target)) {
-      clearTimeout(autoHide);
+      _clearReactBarTimer();
       hideReactionBar();
-      document.removeEventListener('click', outsideClick);
     }
-  }
-  setTimeout(function() { document.addEventListener('click', outsideClick); }, 50);
+  };
+  setTimeout(function() {
+    if (_reactBarOutsideFn) document.addEventListener('click', _reactBarOutsideFn);
+  }, 50);
 }
-function hideReactionBar() { document.querySelectorAll('.react-bar').forEach(function(b) { b.remove(); }); }
+function hideReactionBar() {
+  document.querySelectorAll('.react-bar').forEach(function(b) { b.remove(); });
+}
 
 // Show full emoji picker overlay
 // v3.14-fix: all buttons use addEventListener, no inline onclick
@@ -5018,8 +5041,9 @@ function sendReaction(msgId, emoji) {
 }
 
 // Handle incoming reaction broadcast
+// v3.14-defensive: strict null-check before touching DOM
 function handleReaction(m) {
-  if (m.msg_id && m.reactions) {
+  if (m && m.msg_id && m.reactions && typeof m.reactions === 'object') {
     updateMessageReactions(m.msg_id, m.reactions);
   }
 }
