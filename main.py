@@ -1537,7 +1537,7 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 .group-name{font-size:15px;font-weight:600}
 .group-meta{font-size:12px;color:#8e8e93}
 /* ─── v3.13: mic-blocked notification banner ─── */
-.mic-blocked-notify{position:absolute;top:0;left:0;right:0;z-index:9;padding:10px 14px;background:rgba(28,14,14,0.92);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,59,48,0.25);display:flex;align-items:center;gap:10px;cursor:pointer;transform:translateY(-100%);transition:transform .35s cubic-bezier(.22,.61,.36,1),opacity .3s;opacity:0;box-shadow:0 4px 16px rgba(255,59,48,0.12);pointer-events:none}
+.mic-blocked-notify{position:absolute;top:52px;left:0;right:0;z-index:11;padding:10px 14px;background:rgba(28,14,14,0.95);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,59,48,0.25);display:flex;align-items:center;gap:10px;cursor:pointer;transform:translateY(-100%);transition:transform .35s cubic-bezier(.22,.61,.36,1),opacity .3s;opacity:0;box-shadow:0 4px 16px rgba(255,59,48,0.12);pointer-events:none}
 .mic-blocked-notify.show{transform:translateY(0);opacity:1;pointer-events:auto}
 .mic-blocked-notify:active{opacity:.85;transition:opacity .1s}
 .mic-blocked-icon{width:32px;height:32px;border-radius:50%;background:rgba(255,59,48,0.15);display:flex;align-items:center;justify-content:center;color:#ff3b30;flex-shrink:0}
