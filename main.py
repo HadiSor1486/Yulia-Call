@@ -3667,6 +3667,18 @@ function startConnectionTimer(pid, customTimeout) {
     if (peers[pid] !== pc || pc.connectionState === 'connected' || pc.connectionState === 'closed') {
       return;
     }
+    // v3.14-fix: check LIVE TRACK first, before all other state checks.
+    // On relay/TURN connections the iceConnectionState can lag behind
+    // reality — the track is playing but state says "new" or
+    // "have-local-offer". If audio is flowing we NEVER kill it.
+    const hasLiveTrack = pc.getReceivers && pc.getReceivers().some(function(r) {
+      return r.track && r.track.readyState === 'live';
+    });
+    if (hasLiveTrack) {
+      log("CONN-TIMER " + pid + " track is LIVE, skipping all checks");
+      startConnectionTimer(pid, connTimerMs() + 10000);  // recheck in 20s
+      return;
+    }
     if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
       log("CONN-TIMER " + pid + " ICE healthy (" + pc.iceConnectionState + "), waiting for conn flip");
       pc._connTimerFires++;
@@ -3707,19 +3719,6 @@ function startConnectionTimer(pid, customTimeout) {
       }
       log("CONN-TIMER " + pid + " still checking, waiting");
       if (pc._connTimerFires < 3) startConnectionTimer(pid);
-      return;
-    }
-    // v3.13-fix: before doing ICE restart, check if audio is ALREADY
-    // flowing (live track on a receiver). On relay/TURN connections the
-    // iceConnectionState can lag behind reality — the track is playing
-    // but state still says "new". Killing a working track with ICE
-    // restart causes the "suddenly stopped hearing" bug.
-    const hasLiveTrack = pc.getReceivers && pc.getReceivers().some(function(r) {
-      return r.track && r.track.readyState === 'live';
-    });
-    if (hasLiveTrack) {
-      log("CONN-TIMER " + pid + " track is LIVE, skipping ICE restart");
-      startConnectionTimer(pid, connTimerMs() + 10000);  // check again in 20s
       return;
     }
     pc._connTimerFires++;
