@@ -4836,13 +4836,13 @@ function markViewOnceOpened(msgId) {
 // Reactions shown as compact badges bottom-right of message bubble.
 
 const EMOJI_PICKER_LIST = [
-  '👍','👎','❤️','🔥','😂','😭','😡','😍',
+  '🤍','💗','👍🏻','👎🏻','🔥','😂','😭','😡','😍',
   '🤩','😮','😢','😅','😆','🤔','👏','🙏',
-  '💯','🚀','💪','🎉','😊','😘','🥰','😋',
+  '💯','🚀','💪🏻','🎉','😊','😘','🥰','😋',
   '😜','😎','🤓','😏','😒','😔','😤','😠',
   '🤬','😱','😨','😰','😥','😪','😴','😷',
   '🥵','🥶','😵','🤯','🥳','🤠','💀','👻',
-  '👽','🤖','💩','🦋','🌸','🌈','✨','⭐',
+  '👽','💐','🐍','🦋','🌸','🌈','✨','⭐',
   '💫','💥','💎','🍀','🌺','🌻','🌹','🥀'
 ];
 const QUICK_REACTIONS = ['❤️','🔥','😭','🦦'];
@@ -5102,26 +5102,6 @@ function attachMessageGestures(row, m) {
     if (e.button !== 0) return;
     onEnd(e.clientX, e.clientY);
   });
-
-  // v3.13: click no longer triggers reply — swipe only. Image preview still works.
-  // v3.14: double-tap / double-click on OTHER's messages → quick 🤍 heart
-  if (!isOwn) {
-    var lastTap = 0;
-    row.addEventListener('touchend', function(e) {
-      if (didSwipe || didLongPress) return;
-      var now = Date.now();
-      if (now - lastTap < 300) {
-        e.stopPropagation();
-        sendReaction(m.id, '\uD83E\uDD0D');  // 🤍 white heart
-      }
-      lastTap = now;
-    }, { passive: true });
-    row.addEventListener('dblclick', function(ev) {
-      if (didSwipe || didLongPress) return;
-      ev.stopPropagation();
-      sendReaction(m.id, '\uD83E\uDD0D');  // 🤍 white heart
-    });
-  }
 
   // v3.13: click no longer triggers reply — swipe only. Image preview still works.
   row.addEventListener('click', function(ev) {
