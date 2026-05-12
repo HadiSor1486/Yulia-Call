@@ -1115,6 +1115,50 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                                 pass
                         break
 
+            # ── v3.14: message reactions ────────────────────────────────
+            # Client sends { type: "react", msg_id: "...", emoji: "❤️" }
+            # Toggle logic: same emoji again = remove. Different = replace.
+            # Server persists in chat file and broadcasts to all room peers.
+            elif mt == "react":
+                target_msg_id = msg.get("msg_id", "")
+                emoji = msg.get("emoji", "")
+                if not target_msg_id or not emoji:
+                    continue
+                chat_file = f"{room_id}_chat.json"
+                all_msgs = json_read(chat_file, [])
+                found = False
+                for mm in all_msgs:
+                    if mm.get("id") == target_msg_id:
+                        reactions = mm.get("reactions", {})
+                        # Toggle: if same emoji, remove. Otherwise set/replace.
+                        if peer_id in reactions and reactions[peer_id] == emoji:
+                            del reactions[peer_id]
+                        else:
+                            reactions[peer_id] = emoji
+                        if reactions:
+                            mm["reactions"] = reactions
+                        else:
+                            mm.pop("reactions", None)
+                        json_write(chat_file, all_msgs)
+                        # Broadcast updated reactions to all room peers
+                        payload = {
+                            "type": "reaction",
+                            "msg_id": target_msg_id,
+                            "peer_id": peer_id,
+                            "emoji": emoji,
+                            "reactions": reactions,
+                        }
+                        for p_other, pd_other in room["peers"].items():
+                            try:
+                                await pd_other["ws"].send_json(payload)
+                            except Exception:
+                                pass
+                        found = True
+                        break
+                if not found:
+                    await ws.send_json({"type": "react_result", "ok": False,
+                                        "error": "Message not found"})
+
             elif mt in ("webrtc_offer", "webrtc_answer", "webrtc_ice", "request_relay"):
                 target = msg.get("to")
                 msg["from"] = peer_id
@@ -1632,6 +1676,35 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 .img-send-cancel:active{opacity:.7}
 /* View Once button: icon + short label on all screens */
 .img-send-btn.vo-btn .vo-text{font-size:13px}
+/* ─── v3.14: Message reactions ─── */
+.react-bar{position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%) scale(0.85);display:flex;align-items:center;gap:3px;padding:5px 8px;border-radius:22px;background:#2c2c2e;border:1px solid rgba(255,255,255,0.08);box-shadow:0 6px 24px rgba(0,0,0,0.5);z-index:15;opacity:0;animation:reactPop .22s cubic-bezier(.34,1.56,.64,1) forwards;white-space:nowrap}
+@keyframes reactPop{from{opacity:0;transform:translateX(-50%) scale(0.75)}to{opacity:1;transform:translateX(-50%) scale(1)}}
+.react-bar button{width:34px;height:34px;border-radius:50%;border:none;background:transparent;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:transform .12s,background .12s;padding:0;line-height:1}
+.react-bar button:hover{background:rgba(255,255,255,0.1);transform:scale(1.18)}
+.react-bar button:active{transform:scale(.88)}
+.react-bar .react-more{width:30px;height:30px;background:rgba(255,255,255,0.07);border-radius:50%;display:flex;align-items:center;justify-content:center}
+.react-bar .react-more svg{width:15px;height:15px;color:#8e8e93}
+/* Emoji picker overlay */
+.emoji-picker-overlay{position:fixed;inset:0;z-index:400;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;animation:msgIn .15s}
+.emoji-picker-panel{width:min(360px,95vw);max-height:min(480px,80vh);border-radius:18px;background:#1c1c1e;border:1px solid rgba(255,255,255,0.06);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 16px 48px rgba(0,0,0,0.6)}
+.emoji-picker-header{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.06)}
+.emoji-picker-header span{font-size:16px;font-weight:600;color:#fff}
+.emoji-picker-header button{background:transparent;border:none;color:#8e8e93;font-size:20px;cursor:pointer;padding:4px;line-height:1}
+.emoji-picker-header button:active{opacity:.6}
+.emoji-picker-grid{flex:1;overflow-y:auto;padding:14px;display:grid;grid-template-columns:repeat(8,1fr);gap:3px}
+.emoji-picker-grid button{aspect-ratio:1;border-radius:10px;border:none;background:transparent;font-size:24px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .1s,transform .1s;padding:0;line-height:1}
+.emoji-picker-grid button:hover{background:rgba(255,255,255,0.1);transform:scale(1.08)}
+.emoji-picker-grid button:active{transform:scale(.92)}
+/* Reaction badges */
+.reactions-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;padding:0 2px}
+.msg-row.self .reactions-row{justify-content:flex-end}
+.msg-row.other .reactions-row{justify-content:flex-start}
+.reaction-badge{display:inline-flex;align-items:center;gap:3px;padding:3px 8px 3px 6px;border-radius:10px;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.06);font-size:12px;cursor:pointer;transition:background .15s;user-select:none;line-height:1}
+.reaction-badge:hover{background:rgba(255,255,255,0.12)}
+.reaction-badge:active{transform:scale(.95)}
+.reaction-badge .react-count{font-size:11px;font-weight:700;color:#8e8e93;min-width:10px;text-align:center;margin-left:1px}
+.reaction-badge.mine{background:rgba(0,122,255,0.18);border-color:rgba(0,122,255,0.3)}
+.reaction-badge.mine .react-count{color:#64b5f6}
 .chat-img{max-width:240px;max-height:300px;border-radius:12px;display:block;cursor:pointer;margin:2px 0}
 .img-expired{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.55);font-size:12px;font-style:italic;margin:2px 0}
 .img-expired svg{width:18px;height:18px;flex-shrink:0;opacity:0.6}
@@ -2748,6 +2821,11 @@ function connectWS() {
             }
           }
         }
+        break;
+
+      // ── v3.14: message reactions ──
+      case 'reaction':
+        handleReaction(m);
         break;
 
       case 'history':
@@ -4751,6 +4829,142 @@ function markViewOnceOpened(msgId) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// v3.14: MESSAGE REACTIONS — Instagram/WhatsApp/Telegram style
+// ════════════════════════════════════════════════════════════════════════════
+// Long-press on OTHER's message → reaction bar with ❤️ 🔥 😭 🦦 +
+// Double-click/tap on OTHER's message → quick 🤍 heart reaction
+// Reactions shown as compact badges bottom-right of message bubble.
+
+const EMOJI_PICKER_LIST = [
+  '👍','👎','❤️','🔥','😂','😭','😡','😍',
+  '🤩','😮','😢','😅','😆','🤔','👏','🙏',
+  '💯','🚀','💪','🎉','😊','😘','🥰','😋',
+  '😜','😎','🤓','😏','😒','😔','😤','😠',
+  '🤬','😱','😨','😰','😥','😪','😴','😷',
+  '🥵','🥶','😵','🤯','🥳','🤠','💀','👻',
+  '👽','🤖','💩','🦋','🌸','🌈','✨','⭐',
+  '💫','💥','💎','🍀','🌺','🌻','🌹','🥀'
+];
+const QUICK_REACTIONS = ['❤️','🔥','😭','🦦'];
+
+// Show floating reaction bar above a message
+function showReactionBar(row, msgId) {
+  // Remove any existing reaction bars
+  document.querySelectorAll('.react-bar').forEach(function(b) { b.remove(); });
+  const bar = document.createElement('div');
+  bar.className = 'react-bar';
+  let html = '';
+  QUICK_REACTIONS.forEach(function(emoji) {
+    html += '<button onclick="sendReaction(\'' + esc(msgId) + '\',\'' + emoji + '\');hideReactionBar();" title="' + emoji + '">' + emoji + '</button>';
+  });
+  html += '<button class="react-more" onclick="showEmojiPicker(\'' + esc(msgId) + '\');hideReactionBar();" title="More reactions">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>' +
+          '</button>';
+  bar.innerHTML = html;
+  row.style.position = 'relative';
+  row.appendChild(bar);
+  // Auto-hide after 4 seconds or on outside click
+  setTimeout(hideReactionBar, 4000);
+  function outsideClick(e) { if (!bar.contains(e.target)) { hideReactionBar(); document.removeEventListener('click', outsideClick); } }
+  setTimeout(function() { document.addEventListener('click', outsideClick); }, 50);
+}
+function hideReactionBar() { document.querySelectorAll('.react-bar').forEach(function(b) { b.remove(); }); }
+
+// Show full emoji picker overlay
+function showEmojiPicker(msgId) {
+  hideEmojiPicker();
+  const overlay = document.createElement('div');
+  overlay.id = 'emojiPickerOverlay';
+  overlay.className = 'emoji-picker-overlay';
+  overlay.innerHTML =
+    '<div class="emoji-picker-panel">' +
+      '<div class="emoji-picker-header">' +
+        '<span>React</span>' +
+        '<button onclick="hideEmojiPicker()">&times;</button>' +
+      '</div>' +
+      '<div class="emoji-picker-grid" id="emojiPickerGrid"></div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  const grid = document.getElementById('emojiPickerGrid');
+  EMOJI_PICKER_LIST.forEach(function(emoji) {
+    const btn = document.createElement('button');
+    btn.textContent = emoji;
+    btn.addEventListener('click', function() {
+      sendReaction(msgId, emoji);
+      hideEmojiPicker();
+    });
+    grid.appendChild(btn);
+  });
+  // Close on overlay background click
+  overlay.addEventListener('click', function(e) { if (e.target === overlay) hideEmojiPicker(); });
+}
+function hideEmojiPicker() {
+  const el = document.getElementById('emojiPickerOverlay');
+  if (el) el.remove();
+}
+
+// Send reaction to server
+function sendReaction(msgId, emoji) {
+  if (!msgId || !emoji || !ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'react', msg_id: msgId, emoji: emoji }));
+}
+
+// Handle incoming reaction broadcast
+function handleReaction(m) {
+  if (m.msg_id && m.reactions) {
+    updateMessageReactions(m.msg_id, m.reactions);
+  }
+}
+
+// Update reaction badges on an existing message
+function updateMessageReactions(msgId, reactions) {
+  const c = document.getElementById('msgs');
+  if (!c) return;
+  const row = c.querySelector('[data-msg-id="' + esc(msgId) + '"]');
+  if (!row) return;
+  let rRow = row.querySelector('.reactions-row');
+  if (!rRow) {
+    rRow = document.createElement('div');
+    rRow.className = 'reactions-row';
+    const msgContent = row.querySelector('.msg-content');
+    if (msgContent) msgContent.appendChild(rRow);
+    else row.appendChild(rRow);
+  }
+  renderReactions(rRow, reactions, MY_ID || '');
+}
+
+// Render reaction badges into a container
+function renderReactions(container, reactions, myPeerId) {
+  container.innerHTML = '';
+  if (!reactions || typeof reactions !== 'object') return;
+  // Group by emoji: { emoji: count, ... }
+  const counts = {};
+  const mine = {};
+  for (var pid in reactions) {
+    var emoji = reactions[pid];
+    counts[emoji] = (counts[emoji] || 0) + 1;
+    if (pid === myPeerId) mine[emoji] = true;
+  }
+  // Sort by count desc
+  var entries = [];
+  for (var e in counts) entries.push([e, counts[e]]);
+  entries.sort(function(a, b) { return b[1] - a[1]; });
+  entries.forEach(function(entry) {
+    var emoji = entry[0], count = entry[1];
+    var badge = document.createElement('div');
+    badge.className = 'reaction-badge' + (mine[emoji] ? ' mine' : '');
+    badge.innerHTML = emoji + '<span class="react-count">' + count + '</span>';
+    badge.addEventListener('click', function(ev) {
+      ev.stopPropagation();
+      var msgRow = badge.closest('.msg-row');
+      var mid = msgRow ? msgRow.getAttribute('data-msg-id') : '';
+      if (mid) sendReaction(mid, emoji);
+    });
+    container.appendChild(badge);
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // v3.11 MESSAGE INSERTION — REVERSE FLEX PRIMITIVE
 // ════════════════════════════════════════════════════════════════════════════
 // In a column-reverse list, the visual bottom is DOM index 0. To make a
@@ -4828,11 +5042,13 @@ function attachMessageGestures(row, m) {
     if (deleteBtn && !row.contains(e.target)) removeDeleteBtn();
   });
 
+  // v3.14: branch long-press — own message → delete bin, other's → reaction bar
   function onStart(x, y) {
     startX = x; startY = y; startTime = Date.now();
     isDragging = false; didSwipe = false; didLongPress = false;
     longPressTimer = setTimeout(function() {
       if (!isDragging && isOwn) { didLongPress = true; showDeleteBtn(); }
+      else if (!isDragging && !isOwn) { didLongPress = true; showReactionBar(row, m.id); }
     }, LONG_PRESS_MS);
   }
   function onMove(x, y) {
@@ -4888,10 +5104,32 @@ function attachMessageGestures(row, m) {
   });
 
   // v3.13: click no longer triggers reply — swipe only. Image preview still works.
+  // v3.14: double-tap / double-click on OTHER's messages → quick 🤍 heart
+  if (!isOwn) {
+    var lastTap = 0;
+    row.addEventListener('touchend', function(e) {
+      if (didSwipe || didLongPress) return;
+      var now = Date.now();
+      if (now - lastTap < 300) {
+        e.stopPropagation();
+        sendReaction(m.id, '\uD83E\uDD0D');  // 🤍 white heart
+      }
+      lastTap = now;
+    }, { passive: true });
+    row.addEventListener('dblclick', function(ev) {
+      if (didSwipe || didLongPress) return;
+      ev.stopPropagation();
+      sendReaction(m.id, '\uD83E\uDD0D');  // 🤍 white heart
+    });
+  }
+
+  // v3.13: click no longer triggers reply — swipe only. Image preview still works.
   row.addEventListener('click', function(ev) {
     if (didSwipe) { didSwipe = false; return; }
     if (didLongPress) { didLongPress = false; return; }
     if (deleteBtn) { removeDeleteBtn(); return; }
+    // v3.14: dismiss reaction bar on click elsewhere
+    if (document.querySelector('.react-bar')) { hideReactionBar(); return; }
     var t = ev.target;
     // Normal image preview still works on tap
     if (t.classList && t.classList.contains('chat-img')) {
@@ -4899,6 +5137,8 @@ function attachMessageGestures(row, m) {
     }
     // View-once placeholder tap is handled by the placeholder's own click
     if (t.closest && t.closest('.viewonce-card')) return;
+    // Reaction badge clicks are handled by their own listener
+    if (t.closest && t.closest('.reaction-badge')) return;
     // Avatar clicks do nothing
     if (t.tagName === 'IMG' && t.closest('.avatar')) return;
     // No click-to-reply — swipe only
@@ -5034,7 +5274,19 @@ function renderMsg(m) {
       }
     }
 
+    // v3.14: render reactions row (for history + new messages)
+    if (m.id && m.reactions && Object.keys(m.reactions).length > 0) {
+      const msgContent = row.querySelector('.msg-content');
+      if (msgContent) {
+        const rRow = document.createElement('div');
+        rRow.className = 'reactions-row';
+        renderReactions(rRow, m.reactions, MY_ID || '');
+        msgContent.appendChild(rRow);
+      }
+    }
+
     // v3.13: attach swipe-to-reply and long-press-delete gestures
+    // v3.14: long-press on other's messages now shows reaction bar
     attachMessageGestures(row, m);
 
     appendToVisualBottom(c, row);
@@ -5275,4 +5527,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
