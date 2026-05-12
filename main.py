@@ -1536,6 +1536,17 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 .group-info{flex:1;min-width:0}
 .group-name{font-size:15px;font-weight:600}
 .group-meta{font-size:12px;color:#8e8e93}
+/* ─── v3.13: mic-blocked notification banner ─── */
+.mic-blocked-notify{position:absolute;top:0;left:0;right:0;z-index:9;padding:10px 14px;background:rgba(28,14,14,0.92);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,59,48,0.25);display:flex;align-items:center;gap:10px;cursor:pointer;transform:translateY(-100%);transition:transform .35s cubic-bezier(.22,.61,.36,1),opacity .3s;opacity:0;box-shadow:0 4px 16px rgba(255,59,48,0.12);pointer-events:none}
+.mic-blocked-notify.show{transform:translateY(0);opacity:1;pointer-events:auto}
+.mic-blocked-notify:active{opacity:.85;transition:opacity .1s}
+.mic-blocked-icon{width:32px;height:32px;border-radius:50%;background:rgba(255,59,48,0.15);display:flex;align-items:center;justify-content:center;color:#ff3b30;flex-shrink:0}
+.mic-blocked-icon svg{width:18px;height:18px}
+.mic-blocked-text{flex:1;min-width:0}
+.mic-blocked-title{font-size:13px;font-weight:600;color:#ff453a;line-height:1.3}
+.mic-blocked-sub{font-size:11px;color:rgba(255,255,255,0.55);margin-top:1px;line-height:1.3}
+.mic-blocked-chevron{color:rgba(255,255,255,0.35);font-size:16px;flex-shrink:0}
+
 /* ════════════════════════════════════════════════════════════════════════
    CHAT-STACK — single relative container that holds the seat panel (as an
    overlay) and the messages list (filling the area underneath). This is
@@ -1894,6 +1905,18 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
      it absorbs all space between the header and the input bar; when
      the mobile keyboard opens, only this region shrinks (the seat
      panel itself stays put at the top of this region). -->
+<!-- v3.13: mic-blocked notification — slides down from under the header -->
+<div class="mic-blocked-notify" id="micBlockedNotify" onclick="retryMicPermission()">
+  <div class="mic-blocked-icon">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v6a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+  </div>
+  <div class="mic-blocked-text">
+    <div class="mic-blocked-title">Microphone not accessible</div>
+    <div class="mic-blocked-sub">Tap to allow microphone access</div>
+  </div>
+  <div class="mic-blocked-chevron">&#8250;</div>
+</div>
+
 <div class="chat-stack">
 
 <!-- Seat panel: avatar-tile grid for the call. Collapsible via the bottom handle. -->
@@ -2515,6 +2538,15 @@ function startAudioSelfHeal() {
         }).catch(e => log("audio heal: mic reacquire failed: " + e.message));
       }
     }
+    // v3.13: periodically check if mic permission got granted externally
+    // (e.g. user changed site settings). If so, hide the blocked banner.
+    if (localStream && localStream.getAudioTracks().length > 0
+        && localStream.getAudioTracks()[0].readyState === 'live') {
+      const notify = document.getElementById('micBlockedNotify');
+      if (notify && notify.classList.contains('show')) {
+        hideMicBlockedWarning();
+      }
+    }
   }, 5000);
 }
 
@@ -2615,6 +2647,8 @@ async function doJoin() {
     watchLocalTrack();
   } catch (e) {
     log("mic err: " + e.message);
+    // v3.13: show a beautiful notification when mic is blocked/unavailable
+    showMicBlockedWarning();
   }
   document.getElementById('joinOvl').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
@@ -4004,14 +4038,25 @@ function setupPC(pc, pid) {
     a.muted = false;
     a.volume = 1.0;
 
-    a.play().then(() => {
-      log("PLAYING " + pid);
-      audioUnlocked = true;
-      hideAudioUnlockUI();
-    }).catch(err => {
-      log("playBlock " + pid + ": " + err.name);
-      showAudioUnlockUI();
-    });
+    // v3.13-fix: mobile browsers often have the AudioContext suspended even
+    // when HTMLAudioElement.play() works. Force-resume it before playing.
+    const tryPlay = async () => {
+      try {
+        if (remoteAudioCtx && remoteAudioCtx.state === 'suspended') {
+          await remoteAudioCtx.resume();
+          log("audioCtx resumed for " + pid);
+        }
+      } catch (e) {}
+      a.play().then(() => {
+        log("PLAYING " + pid);
+        audioUnlocked = true;
+        hideAudioUnlockUI();
+      }).catch(err => {
+        log("playBlock " + pid + ": " + err.name);
+        showAudioUnlockUI();
+      });
+    };
+    tryPlay();
 
     startInboundLevel(e.streams[0], pid);
   };
@@ -5045,6 +5090,53 @@ function renderSys(t) {
   d.textContent = t;
   appendToVisualBottom(c, d);
   if (wasAtBottom) scrollToLatest(false);
+}
+
+// ── v3.13: mic-blocked notification ────────────────────────────────────────
+// Shows a beautiful red banner under the header when mic access is denied.
+// Tapping it re-requests getUserMedia() which will trigger the browser's
+// permission prompt again (unless the user has permanently blocked it).
+function showMicBlockedWarning() {
+  const el = document.getElementById('micBlockedNotify');
+  if (!el) return;
+  el.classList.add('show');
+}
+function hideMicBlockedWarning() {
+  const el = document.getElementById('micBlockedNotify');
+  if (!el) return;
+  el.classList.remove('show');
+}
+async function retryMicPermission() {
+  log("mic retry: requesting permission...");
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
+    // Success! Attach the new stream
+    if (localStream) {
+      try { localStream.getTracks().forEach(tr => tr.stop()); } catch (e) {}
+    }
+    localStream = stream;
+    // Replace tracks on all existing peer connections
+    Object.values(peers).forEach(pc => {
+      pc.getSenders().forEach(s => {
+        if (s.track && s.track.kind === 'audio') {
+          try { s.replaceTrack(localStream.getAudioTracks()[0]); } catch (e) {}
+        }
+      });
+    });
+    // Re-setup local monitoring
+    const newTrack = localStream.getAudioTracks()[0];
+    if (newTrack) {
+      newTrack.enabled = !isMuted;
+    }
+    setupLocalLevelMonitor();
+    watchLocalTrack();
+    hideMicBlockedWarning();
+    log("mic OK (retry succeeded)");
+    renderSys("Microphone access granted");
+  } catch (e) {
+    log("mic retry failed: " + e.message);
+    // Keep the notification visible so they can try again
+  }
 }
 
 function esc(t) {
