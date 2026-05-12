@@ -3527,7 +3527,7 @@ function startConnectionTimer(pid, customTimeout) {
     if (pc.iceConnectionState === 'new' && pc._connTimerFires === 0) {
       log("CONN-TIMER " + pid + " brand new PC, more time");
       pc._connTimerFires++;
-      startConnectionTimer(pid, connTimerMs() + 20000);  // 30s grace, not 10s
+      startConnectionTimer(pid, connTimerMs() + 10000);  // 20s grace (10+10), not 10s
       return;
     }
     if (pc.iceConnectionState === 'checking') {
@@ -3549,6 +3549,19 @@ function startConnectionTimer(pid, customTimeout) {
       }
       log("CONN-TIMER " + pid + " still checking, waiting");
       if (pc._connTimerFires < 3) startConnectionTimer(pid);
+      return;
+    }
+    // v3.13-fix: before doing ICE restart, check if audio is ALREADY
+    // flowing (live track on a receiver). On relay/TURN connections the
+    // iceConnectionState can lag behind reality — the track is playing
+    // but state still says "new". Killing a working track with ICE
+    // restart causes the "suddenly stopped hearing" bug.
+    const hasLiveTrack = pc.getReceivers && pc.getReceivers().some(function(r) {
+      return r.track && r.track.readyState === 'live';
+    });
+    if (hasLiveTrack) {
+      log("CONN-TIMER " + pid + " track is LIVE, skipping ICE restart");
+      startConnectionTimer(pid, connTimerMs() + 10000);  // check again in 20s
       return;
     }
     pc._connTimerFires++;
@@ -5262,3 +5275,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
