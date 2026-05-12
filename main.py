@@ -1756,12 +1756,13 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 /* View Once button: icon + short label on all screens */
 .img-send-btn.vo-btn .vo-text{font-size:13px}
 /* ─── v3.14: Message reactions ─── */
-.react-bar{position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%) scale(0.85);display:flex;align-items:center;gap:3px;padding:5px 8px;border-radius:22px;background:#2c2c2e;border:1px solid rgba(255,255,255,0.08);box-shadow:0 6px 24px rgba(0,0,0,0.5);z-index:15;opacity:0;animation:reactPop .22s cubic-bezier(.34,1.56,.64,1) forwards;white-space:nowrap}
-@keyframes reactPop{from{opacity:0;transform:translateX(-50%) scale(0.75)}to{opacity:1;transform:translateX(-50%) scale(1)}}
-.react-bar button{width:34px;height:34px;border-radius:50%;border:none;background:transparent;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:transform .12s,background .12s;padding:0;line-height:1}
+/* Position is set via JS (fixed, top/left) — never clipped by viewport edges */
+.react-bar{display:flex;align-items:center;gap:3px;padding:5px 8px;border-radius:22px;background:#2c2c2e;border:1px solid rgba(255,255,255,0.08);box-shadow:0 6px 24px rgba(0,0,0,0.5);z-index:500;opacity:0;animation:reactPop .22s cubic-bezier(.34,1.56,.64,1) forwards;white-space:nowrap}
+@keyframes reactPop{from{opacity:0;transform:scale(0.75)}to{opacity:1;transform:scale(1)}}
+.react-bar button{width:38px;height:38px;border-radius:50%;border:none;background:transparent;font-size:22px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:transform .12s,background .12s;padding:0;line-height:1;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 .react-bar button:hover{background:rgba(255,255,255,0.1);transform:scale(1.18)}
 .react-bar button:active{transform:scale(.88)}
-.react-bar .react-more{width:30px;height:30px;background:rgba(255,255,255,0.07);border-radius:50%;display:flex;align-items:center;justify-content:center}
+.react-bar .react-more{width:34px;height:34px;background:rgba(255,255,255,0.07);border-radius:50%;display:flex;align-items:center;justify-content:center}
 .react-bar .react-more svg{width:15px;height:15px;color:#8e8e93}
 /* Emoji picker overlay */
 .emoji-picker-overlay{position:fixed;inset:0;z-index:400;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;animation:msgIn .15s}
@@ -4940,8 +4941,9 @@ function _clearReactBarTimer() {
 
 // Show floating reaction bar above a message
 // v3.14-fix: uses addEventListener (not onclick) for 100% mobile reliability
-// v3.14-fix: clears old timer/listener before creating new bar — prevents
-// old auto-hide timer from killing a newer bar.
+// v3.14-fix: position:fixed with viewport clamping — never clipped by screen edges
+// The bar is placed above the message row, centered, but forced to stay within
+// the viewport (with 8px padding on each side).
 function showReactionBar(row, msgId) {
   // Kill any old timer/listener before creating new bar
   _clearReactBarTimer();
@@ -4949,8 +4951,6 @@ function showReactionBar(row, msgId) {
   document.querySelectorAll('.react-bar').forEach(function(b) { b.remove(); });
   const bar = document.createElement('div');
   bar.className = 'react-bar';
-  bar.style.position = 'absolute';
-  bar.style.bottom = 'calc(100% + 8px)';
   // Build quick-reaction buttons with addEventListener
   QUICK_REACTIONS.forEach(function(emoji) {
     var btn = document.createElement('button');
@@ -4974,7 +4974,20 @@ function showReactionBar(row, msgId) {
     hideReactionBar();
   });
   bar.appendChild(moreBtn);
-  row.appendChild(bar);
+  document.body.appendChild(bar);  // append to body for fixed positioning
+  // Compute position: center above the message row, clamped to viewport
+  var rowRect = row.getBoundingClientRect();
+  var barRect = bar.getBoundingClientRect();
+  var pad = 8;
+  var top = rowRect.top - barRect.height - 6;
+  if (top < pad) top = rowRect.bottom + 6;  // if no room above, show below
+  var left = rowRect.left + rowRect.width / 2 - barRect.width / 2;
+  left = Math.max(pad, Math.min(left, window.innerWidth - barRect.width - pad));
+  bar.style.position = 'fixed';
+  bar.style.top = top + 'px';
+  bar.style.left = left + 'px';
+  bar.style.bottom = 'auto';
+  bar.style.zIndex = '500';
   // Auto-hide after 4 seconds — track globally so next bar clears it
   _reactBarTimer = setTimeout(function() {
     _reactBarTimer = null;
