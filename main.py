@@ -141,6 +141,76 @@ kyodo_client = None
 _turn_cache = {"servers": None, "expires": 0}
 _turn_lock = asyncio.Lock()  # dedupes concurrent cold-cache fetches
 
+# v3.14: Room + token persistence — rooms and invite tokens survive server restarts.
+# On boot, existing rooms are restored from registry files so active calls aren't
+# killed by Render deployments.
+ROOMS_REGISTRY = "rooms_registry.json"
+TOKENS_REGISTRY = "tokens_registry.json"
+
+def _persist_rooms():
+    """Save room metadata (no peer websockets) to disk."""
+    try:
+        payload = {}
+        for rid, rdata in rooms.items():
+            payload[rid] = {
+                "chat_file": rdata.get("chat_file", f"{rid}_chat.json"),
+                "created": rdata.get("created"),
+                "creator_uid": rdata.get("creator_uid"),
+                "creator_name": rdata.get("creator_name"),
+            }
+        json_write(ROOMS_REGISTRY, payload)
+    except Exception as e:
+        print(f"[persist] rooms err: {e}")
+
+def _persist_tokens():
+    """Save token → room_id mapping to disk (no sensitive data)."""
+    try:
+        payload = {tok: {"room_id": v["room_id"], "creator": v.get("creator", False)}
+                     for tok, v in tokens.items()}
+        json_write(TOKENS_REGISTRY, payload)
+    except Exception as e:
+        print(f"[persist] tokens err: {e}")
+
+def _restore_rooms():
+    """On boot, recreate room entries from persisted registry."""
+    global rooms
+    restored = 0
+    try:
+        reg = json_read(ROOMS_REGISTRY, {})
+        for rid, meta in reg.items():
+            chat_file = meta.get("chat_file", f"{rid}_chat.json")
+            # Only restore if chat file still exists (room wasn't properly cleaned up)
+            if os.path.exists(chat_file):
+                rooms[rid] = {
+                    "peers": {},
+                    "chat_file": chat_file,
+                    "created": meta.get("created", datetime.now().isoformat()),
+                    "creator_uid": meta.get("creator_uid"),
+                    "creator_name": meta.get("creator_name"),
+                }
+                restored += 1
+        if restored:
+            print(f"[persist] restored {restored} room(s) from registry")
+    except Exception as e:
+        print(f"[persist] restore rooms err: {e}")
+
+def _restore_tokens():
+    """On boot, restore valid tokens from persisted registry."""
+    global tokens
+    restored = 0
+    try:
+        reg = json_read(TOKENS_REGISTRY, {})
+        for tok, meta in reg.items():
+            rid = meta.get("room_id", "")
+            # Only restore token if the room still exists
+            if rid in rooms:
+                tokens[tok] = {"room_id": rid, "creator": meta.get("creator", False)}
+                restored += 1
+        if restored:
+            print(f"[persist] restored {restored} token(s) from registry")
+    except Exception as e:
+        print(f"[persist] restore tokens err: {e}")
+
 # v3.12: Semaphore(1) ensures at most one Pillow decode/resize happens at a
 # time across the whole process, so RAM stays bounded even if 10 people hit
 # upload simultaneously. They queue.
@@ -685,6 +755,9 @@ async def run_kyodo_bot():
                         json_write(f"{rid}_chat.json", [])
                         tok = str(uuid.uuid4())
                         tokens[tok] = {"room_id": rid, "creator": True}
+                        # v3.14: persist so room survives deploys
+                        _persist_rooms()
+                        _persist_tokens()
                         asyncio.create_task(_noshow(rid))
                         link = f"{WEB_APP_URL}/call/{rid}?t={tok}"
                         await kyodo_client.send_message(
@@ -1490,6 +1563,9 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                     if room_id in rooms:
                         del rooms[room_id]
                         print(f"[WS] cleaned up empty room {room_id}")
+                    # v3.14: update persisted registry after cleanup
+                    _persist_rooms()
+                    _persist_tokens()
             asyncio.create_task(cleanup_later())
 
 
@@ -1509,6 +1585,9 @@ async def _noshow(room_id):
     if room_id in rooms:
         del rooms[room_id]
     print(f"[WS] expired never-joined room {room_id}")
+    # v3.14: update persisted registry after cleanup
+    _persist_rooms()
+    _persist_tokens()
 
 
 def _append_msg(rid, msg):
@@ -4836,13 +4915,13 @@ function markViewOnceOpened(msgId) {
 // Reactions shown as compact badges bottom-right of message bubble.
 
 const EMOJI_PICKER_LIST = [
-  '🤍','👍🏻','👎🏻','🤍','💗','😂','😭','😡','😍',
+  '🤍','👍','👎','❤️','🔥','😂','😭','😡','😍',
   '🤩','😮','😢','😅','😆','🤔','👏','🙏',
   '💯','🚀','💪','🎉','😊','😘','🥰','😋',
   '😜','😎','🤓','😏','😒','😔','😤','😠',
   '🤬','😱','😨','😰','😥','😪','😴','😷',
   '🥵','🥶','😵','🤯','🥳','🤠','💀','👻',
-  '👽','🤖','💐','🦋','🌸','🌈','✨','⭐',
+  '👽','🤖','💩','🦋','🌸','🌈','✨','⭐',
   '💫','💥','💎','🍀','🌺','🌻','🌹','🥀'
 ];
 const QUICK_REACTIONS = ['🤍','❤️','🔥','😭','🦦'];
@@ -5447,6 +5526,11 @@ async def main():
     print(f"Silent Hill Bot v3.12.13 BEAST MODE | {WEB_APP_URL} | Port {PORT}")
     print(f"Kyodo: {KYODO_OK} | Max peers per room: {MAX_PEERS_PER_ROOM}")
     print(f"Memory caps: {MAX_CHAT_MESSAGES} msgs/room, {IMAGE_RETAIN_COUNT} recent images, {MAX_IMAGE_BYTES//1000}KB per img")
+
+    # v3.14: restore rooms and tokens from previous run so active calls
+    # survive Render deployments (rooms are otherwise purely in RAM).
+    _restore_rooms()
+    _restore_tokens()
 
     # v3.12.1: pull stickers from GitHub before serving any traffic.
     # Render's free tier wipes the filesystem on cold start, so without
