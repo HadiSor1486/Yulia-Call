@@ -1696,13 +1696,13 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 .emoji-picker-grid button:hover{background:rgba(255,255,255,0.1);transform:scale(1.08)}
 .emoji-picker-grid button:active{transform:scale(.92)}
 /* Reaction badges */
-.reactions-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;padding:0 2px}
+.reactions-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;padding:0 2px;pointer-events:auto;position:relative;z-index:2}
 .msg-row.self .reactions-row{justify-content:flex-end}
 .msg-row.other .reactions-row{justify-content:flex-start}
-.reaction-badge{display:inline-flex;align-items:center;gap:3px;padding:3px 8px 3px 6px;border-radius:10px;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.06);font-size:12px;cursor:pointer;transition:background .15s;user-select:none;line-height:1}
+.reaction-badge{display:inline-flex;align-items:center;gap:3px;padding:3px 8px 3px 6px;border-radius:10px;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.06);font-size:12px;cursor:pointer;transition:background .15s;user-select:none;line-height:1;pointer-events:auto;position:relative;z-index:3}
 .reaction-badge:hover{background:rgba(255,255,255,0.12)}
 .reaction-badge:active{transform:scale(.95)}
-.reaction-badge .react-count{font-size:11px;font-weight:700;color:#8e8e93;min-width:10px;text-align:center;margin-left:1px}
+.reaction-badge .react-count{font-size:11px;font-weight:700;color:#8e8e93;min-width:10px;text-align:center;margin-left:1px;pointer-events:none}
 .reaction-badge.mine{background:rgba(0,122,255,0.18);border-color:rgba(0,122,255,0.3)}
 .reaction-badge.mine .react-count{color:#64b5f6}
 .chat-img{max-width:240px;max-height:300px;border-radius:12px;display:block;cursor:pointer;margin:2px 0}
@@ -4836,41 +4836,66 @@ function markViewOnceOpened(msgId) {
 // Reactions shown as compact badges bottom-right of message bubble.
 
 const EMOJI_PICKER_LIST = [
-  '🤍','💗','👍🏻','👎🏻','🔥','😂','😭','😡','😍',
+  '🤍','👍🏻','👎🏻','🤍','💗','😂','😭','😡','😍',
   '🤩','😮','😢','😅','😆','🤔','👏','🙏',
-  '💯','🚀','💪🏻','🎉','😊','😘','🥰','😋',
+  '💯','🚀','💪','🎉','😊','😘','🥰','😋',
   '😜','😎','🤓','😏','😒','😔','😤','😠',
   '🤬','😱','😨','😰','😥','😪','😴','😷',
   '🥵','🥶','😵','🤯','🥳','🤠','💀','👻',
-  '👽','💐','🐍','🦋','🌸','🌈','✨','⭐',
+  '👽','🤖','💐','🦋','🌸','🌈','✨','⭐',
   '💫','💥','💎','🍀','🌺','🌻','🌹','🥀'
 ];
-const QUICK_REACTIONS = ['❤️','🔥','😭','🦦'];
+const QUICK_REACTIONS = ['🤍','❤️','🔥','😭','🦦'];
 
 // Show floating reaction bar above a message
+// v3.14-fix: uses addEventListener (not onclick) for 100% mobile reliability
 function showReactionBar(row, msgId) {
   // Remove any existing reaction bars
   document.querySelectorAll('.react-bar').forEach(function(b) { b.remove(); });
   const bar = document.createElement('div');
   bar.className = 'react-bar';
-  let html = '';
+  bar.style.position = 'absolute';
+  bar.style.bottom = 'calc(100% + 8px)';
+  // Build quick-reaction buttons with addEventListener
   QUICK_REACTIONS.forEach(function(emoji) {
-    html += '<button onclick="sendReaction(\'' + esc(msgId) + '\',\'' + emoji + '\');hideReactionBar();" title="' + emoji + '">' + emoji + '</button>';
+    var btn = document.createElement('button');
+    btn.textContent = emoji;
+    btn.title = emoji;
+    btn.addEventListener('click', function(ev) {
+      ev.stopPropagation();
+      sendReaction(msgId, emoji);
+      hideReactionBar();
+    });
+    bar.appendChild(btn);
   });
-  html += '<button class="react-more" onclick="showEmojiPicker(\'' + esc(msgId) + '\');hideReactionBar();" title="More reactions">' +
-            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>' +
-          '</button>';
-  bar.innerHTML = html;
-  row.style.position = 'relative';
+  // More button (+)
+  var moreBtn = document.createElement('button');
+  moreBtn.className = 'react-more';
+  moreBtn.title = 'More reactions';
+  moreBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+  moreBtn.addEventListener('click', function(ev) {
+    ev.stopPropagation();
+    showEmojiPicker(msgId);
+    hideReactionBar();
+  });
+  bar.appendChild(moreBtn);
   row.appendChild(bar);
-  // Auto-hide after 4 seconds or on outside click
-  setTimeout(hideReactionBar, 4000);
-  function outsideClick(e) { if (!bar.contains(e.target)) { hideReactionBar(); document.removeEventListener('click', outsideClick); } }
+  // Auto-hide after 4 seconds
+  var autoHide = setTimeout(hideReactionBar, 4000);
+  // Hide on outside click
+  function outsideClick(e) {
+    if (!bar.contains(e.target)) {
+      clearTimeout(autoHide);
+      hideReactionBar();
+      document.removeEventListener('click', outsideClick);
+    }
+  }
   setTimeout(function() { document.addEventListener('click', outsideClick); }, 50);
 }
 function hideReactionBar() { document.querySelectorAll('.react-bar').forEach(function(b) { b.remove(); }); }
 
 // Show full emoji picker overlay
+// v3.14-fix: all buttons use addEventListener, no inline onclick
 function showEmojiPicker(msgId) {
   hideEmojiPicker();
   const overlay = document.createElement('div');
@@ -4880,14 +4905,18 @@ function showEmojiPicker(msgId) {
     '<div class="emoji-picker-panel">' +
       '<div class="emoji-picker-header">' +
         '<span>React</span>' +
-        '<button onclick="hideEmojiPicker()">&times;</button>' +
+        '<button id="emojiPickerClose">&times;</button>' +
       '</div>' +
       '<div class="emoji-picker-grid" id="emojiPickerGrid"></div>' +
     '</div>';
   document.body.appendChild(overlay);
+  // Wire up close button
+  var closeBtn = document.getElementById('emojiPickerClose');
+  if (closeBtn) closeBtn.addEventListener('click', hideEmojiPicker);
+  // Build emoji grid
   const grid = document.getElementById('emojiPickerGrid');
   EMOJI_PICKER_LIST.forEach(function(emoji) {
-    const btn = document.createElement('button');
+    var btn = document.createElement('button');
     btn.textContent = emoji;
     btn.addEventListener('click', function() {
       sendReaction(msgId, emoji);
