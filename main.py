@@ -5108,6 +5108,8 @@ function hideMicBlockedWarning() {
 }
 async function retryMicPermission() {
   log("mic retry: requesting permission...");
+  const titleEl = document.querySelector('.mic-blocked-title');
+  const subEl = document.querySelector('.mic-blocked-sub');
   try {
     const stream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
     // Success! Attach the new stream
@@ -5130,12 +5132,35 @@ async function retryMicPermission() {
     }
     setupLocalLevelMonitor();
     watchLocalTrack();
-    hideMicBlockedWarning();
+    // Brief success flash before hiding
+    if (titleEl) titleEl.textContent = "Microphone enabled";
+    if (subEl) subEl.textContent = "You can now speak";
+    setTimeout(hideMicBlockedWarning, 1200);
     log("mic OK (retry succeeded)");
     renderSys("Microphone access granted");
   } catch (e) {
-    log("mic retry failed: " + e.message);
-    // Keep the notification visible so they can try again
+    log("mic retry failed: " + e.name + " — " + e.message);
+    // Update banner to show the user what went wrong + how to fix
+    const isPermDenied = e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError';
+    if (isPermDenied) {
+      if (titleEl) titleEl.textContent = "Microphone blocked in browser";
+      if (subEl) {
+        subEl.innerHTML = 'Tap the lock icon near the URL, then Site settings &rarr; Microphone &rarr; Allow';
+      }
+    } else {
+      if (titleEl) titleEl.textContent = "Cannot access microphone";
+      if (subEl) subEl.textContent = e.message || "Tap to try again";
+    }
+    // Gentle shake animation to draw attention
+    const el = document.getElementById('micBlockedNotify');
+    if (el) {
+      el.style.transition = 'none';
+      el.style.transform = 'translateY(0) translateX(-4px)';
+      setTimeout(function() { el.style.transform = 'translateY(0) translateX(4px)'; }, 60);
+      setTimeout(function() { el.style.transform = 'translateY(0) translateX(-3px)'; }, 120);
+      setTimeout(function() { el.style.transform = 'translateY(0) translateX(0)'; }, 180);
+      setTimeout(function() { el.style.transition = ''; }, 250);
+    }
   }
 }
 
