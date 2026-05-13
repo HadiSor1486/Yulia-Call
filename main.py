@@ -1,5 +1,5 @@
 """
-Silent Hill Voice Call Bot — v3.15 ULTRA HARDCORE
+Silent Hill Voice Call Bot — v3.15.1 ULTRA HARDCORE
 ═══════════════════════════════════════════════════════════════════════════════
 v3.15 — ULTRA HARDCORE: DTLS-stall detection, offer-avalanche prevention, zombie-audio guard,, "false failure" prevention,
          audio-aware retry logic. No more random disconnects for the ~3%.
@@ -3975,13 +3975,33 @@ async function forceIceRestart(pid) {
   p._gentleRestartCount = (p._gentleRestartCount || 0) + 1;
   log("FAST ICE restart " + pid + " (gentle #" + p._gentleRestartCount + ")");
   try {
+    // v3.15-fix: don't race with an ongoing createOffer/rebuild.
+    if (renegInProgress[pid]) {
+      log("ICE restart deferred (reneg in progress) " + pid);
+      return;
+    }
     const o = await pc.createOffer({ iceRestart: true });
     o.sdp = preferOpusAndTune(o.sdp);
     await pc.setLocalDescription(o);
     ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
+    log("ICE restart offer SENT " + pid);
   } catch (e) {
     log("fast iceRestart fail: " + e.message);
-    scheduleRetry(pid);
+    // v3.15-fix: if the error is an m-line mismatch, the PC's signaling state
+    // is corrupted. A gentle scheduleRetry won't help — need a full rebuild.
+    const isMlineError = e.message && (
+      e.message.includes("m-lines") ||
+      e.message.includes("order of m-lines") ||
+      e.message.includes("setLocalDescription") ||
+      e.message.includes("signaling")
+    );
+    if (isMlineError) {
+      log("ICE restart: signaling state corrupted for " + pid + " -> full rebuild");
+      destroyPeer(pid);
+      setTimeout(() => createOffer(pid), 500);
+    } else {
+      scheduleRetry(pid);
+    }
   } finally {
     setTimeout(() => {
       if (p) p._iceRestarting = false;
@@ -4072,8 +4092,8 @@ function shouldForceRelay(pid) {
 }
 
 async function createOffer(pid) {
-  if (lastOfferAt[pid] && Date.now() - lastOfferAt[pid] < 2000) {
-    log("offer DEDUP " + pid);
+  if (lastOfferAt[pid] && Date.now() - lastOfferAt[pid] < 4000) {
+    log("offer DEDUP " + pid + " (within 4s)");
     return;
   }
   lastOfferAt[pid] = Date.now();
@@ -4095,35 +4115,8 @@ async function createOffer(pid) {
     const offer = await pc.createOffer();
     offer.sdp = preferOpusAndTune(offer.sdp);
     await pc.setLocalDescription(offer);
-    // v3.15: if ICE gathering doesn't complete within 8s, send what we have.
-    // Some browsers (especially mobile Safari) get stuck gathering forever.
-    // The candidates gathered so far (including TURN) are usually sufficient.
-    if (pc.iceGatheringState !== 'complete') {
-      setTimeout(() => {
-        if (pc.connectionState === 'closed') return;
-        if (pc.iceGatheringState !== 'complete' && pc.localDescription) {
-          log("ICE gathering timeout for " + pid + " — sending with partial candidates");
-          ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
-          log("offer SENT " + pid + " (partial ICE)");
-        }
-      }, 8000);
-      // Wait for gathering to complete naturally OR timeout above
-      await new Promise(resolve => {
-        const check = () => {
-          if (pc.iceGatheringState === 'complete' || pc.connectionState === 'closed') {
-            pc.removeEventListener('icegatheringstatechange', check);
-            resolve();
-          }
-        };
-        pc.addEventListener('icegatheringstatechange', check);
-        setTimeout(() => { pc.removeEventListener('icegatheringstatechange', check); resolve(); }, 8500);
-      });
-    }
-    // Only send if not already sent by timeout handler above
-    if (pc.connectionState !== 'closed' && pc.localDescription) {
-      ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
-      log("offer SENT " + pid);
-    }
+    ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
+    log("offer SENT " + pid);
     startConnectionTimer(pid);
   } catch (e) {
     log("offer FAIL " + pid + ": " + e.message);
@@ -4234,7 +4227,18 @@ async function handleAnswer(from, sdp) {
     log("ans applied " + from);
   } catch (e) {
     log("ansErr " + from + ": " + e.message);
-    scheduleRetry(from);
+    // v3.15-fix: don't retry on signaling-state mismatch — the answer is
+    // probably for a PC that was already destroyed and rebuilt.
+    const isStaleError = e.message && (
+      e.message.includes("state") ||
+      e.message.includes("setRemoteDescription") ||
+      e.message.includes("Closed")
+    );
+    if (!isStaleError) {
+      scheduleRetry(from);
+    } else {
+      log("ansErr " + from + " — stale PC, skipping retry");
+    }
   }
 }
 
@@ -4583,25 +4587,21 @@ function setupPC(pc, pid) {
     }
   };
 
-  // v3.15: Handle negotiationneeded for track changes (mic reacquire,
-  // bluetooth headset switch, etc.). Only the larger side initiates to
-  // avoid collision. Debounced to prevent rapid-fire renegotiations.
-  pc.onnegotiationneeded = () => {
-    if (MY_ID <= pid) return;
-    if (pc._negotiationPending) return;
-    if (pc.connectionState === 'closed' || pc.connectionState === 'failed') return;
-    if (pc.signalingState !== 'stable') return;
-    pc._negotiationPending = true;
-    log("negotiationneeded " + pid + " -> gentle ICE restart");
-    forceIceRestart(pid);
-    setTimeout(() => { if (pc) pc._negotiationPending = false; }, 5000);
-  };
-
   pc.oniceconnectionstatechange = () => {
     log("PC " + pid + " ICE=" + pc.iceConnectionState);
     // v3.15: early detection of ICE failure — trigger recovery before
     // connectionState reaches 'failed' (which can take 10-15s longer).
     if (pc.iceConnectionState === 'failed') {
+      // v3.15-fix: verify this is still the current PC, not a destroyed one.
+      // Also skip if a rebuild is already in progress (renegInProgress set).
+      if (peers[pid] !== pc) {
+        log("PC " + pid + " ICE=failed on stale PC, ignoring");
+        return;
+      }
+      if (renegInProgress[pid]) {
+        log("PC " + pid + " ICE=failed but reneg in progress, deferring");
+        return;
+      }
       log("PC " + pid + " ICE=failed -> early recovery");
       const pData = peerMap.get(pid);
       if (pData && isAudioActuallyFlowing(pc, pid)) {
@@ -4747,6 +4747,22 @@ function startStats(pc, pid) {
       if (peerInfo) peerInfo.lossEwma = lossEwma[pid];
 
       logTick++;
+      // v3.15-fix: one-way dead detection for RELAY. If we're sending 
+      // packets (dS>0) but receiving nothing (dR=0) on a RELAY connection,
+      // the TURN path is broken in one direction. Force rebuild.
+      const isRelay = pcNow && (peerRelay[pid] || (pcNow.currentRemoteDescription &&
+        pcNow.currentRemoteDescription.sdp &&
+        pcNow.currentRemoteDescription.sdp.includes('relay')));
+      if (isRelay && dRecv === 0 && dSent > 0 && !peerMuted && isConnected) {
+        pcNow._oneWayDeadCount = (pcNow._oneWayDeadCount || 0) + 1;
+        if (pcNow._oneWayDeadCount >= 2) {
+          log("STATS " + pid + " one-way dead on RELAY (dR=0 dS=" + dSent + ") -> rebuild");
+          fullRebuild(pid, 'one-way-dead');
+        }
+      } else if (pcNow) {
+        pcNow._oneWayDeadCount = 0;
+      }
+
       const isAnomaly = lossPct > 5
         || (dRecv === 0 && !peerMuted && !inMuteGrace)
         || (dSent === 0 && !isMuted)
@@ -5965,7 +5981,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.15 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING)");
+log("page loaded v3.15.1 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING)");
 </script>
 </body>
 </html>"""
