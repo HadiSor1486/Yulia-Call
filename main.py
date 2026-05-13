@@ -762,7 +762,7 @@ async def run_kyodo_bot():
                         link = f"{WEB_APP_URL}/call/{rid}?t={tok}"
                         await kyodo_client.send_message(
                             m.chatId,
-                            f"Silent Hill Voice Session\n{link}\nTap to join the call.",
+                            f"Silent Hill Voice Session\n[click to join|{link}]",
                             m.circleId,
                         )
                 except Exception as e:
