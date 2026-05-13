@@ -1,7 +1,7 @@
 """
-Silent Hill Voice Call Bot — v3.14 BEAST MODE
+Silent Hill Voice Call Bot — v3.14.2 BEAST MODE
 ═══════════════════════════════════════════════════════════════════════════════
-v3.14 — BULLETPROOF CALLING: DTLS-stall detection, "false failure" prevention,
+v3.14 — BULLETPROOF CALLING: DTLS-stall detection, offer-avalanche prevention, "false failure" prevention,
          audio-aware retry logic. No more random disconnects for the ~3%.
 v3.13 — MESSAGE DELETION + SWIPE-TO-REPLY + LONG-PRESS DELETE UI +
          WHATSAPP-STYLE IMAGE PREVIEW + VIEW ONCE.
@@ -3024,7 +3024,16 @@ function connectWS() {
         const isZombie = reason.startsWith('zombie');
         const isFullRebuild = reason.startsWith('full-rebuild');
         const isFreshRelay = reason === 'stuck-checking' || reason === 'retry-after-fail';
+        const isSoftFailure = reason === 'soft-failed-but-audio-flowing' || reason === 'false-failure-gentle';
         if (!isZombie && !isFullRebuild && !isFreshRelay && MY_ID < m.from) {
+          break;
+        }
+        // v3.14-fix-2: if this is a soft-failure renegotiation and we're the
+        // larger side already doing a gentle ICE restart (renegInProgress set),
+        // skip the duplicate request. Both sides detected the same failure;
+        // the larger side is already handling it via forceIceRestart.
+        if (isSoftFailure && MY_ID > m.from && renegInProgress[m.from]) {
+          log("ignoring relay request from " + m.from + " (" + reason + ") — already handling gentle restart");
           break;
         }
         log("got relay request from " + m.from + " (" + reason + ")");
@@ -3791,8 +3800,16 @@ async function forceIceRestart(pid) {
     return;
   }
   p._iceRestarting = true;
+  // v3.14-fix-2: set renegInProgress so switchPeerToRelay won't create a
+  // DUPLICATE offer while this gentle restart is in flight. Both flags are
+  // needed because the code checks different flags in different places.
+  renegInProgress[pid] = true;
   lastIceRestartAt[pid] = Date.now();
-  log("FAST ICE restart " + pid);
+  // v3.14-fix-2: track gentle restarts so we can escalate to full rebuild
+  // if gentle restarts keep failing (prevents infinite death spiral).
+  p._gentleRestartAt = Date.now();
+  p._gentleRestartCount = (p._gentleRestartCount || 0) + 1;
+  log("FAST ICE restart " + pid + " (gentle #" + p._gentleRestartCount + ")");
   try {
     const o = await pc.createOffer({ iceRestart: true });
     o.sdp = preferOpusAndTune(o.sdp);
@@ -3802,7 +3819,10 @@ async function forceIceRestart(pid) {
     log("fast iceRestart fail: " + e.message);
     scheduleRetry(pid);
   } finally {
-    setTimeout(() => { if (p) p._iceRestarting = false; }, 3000);
+    setTimeout(() => {
+      if (p) p._iceRestarting = false;
+      renegInProgress[pid] = false;
+    }, 3000);
   }
 }
 
@@ -3923,10 +3943,18 @@ async function handleOffer(from, sdp) {
     try {
       clearConnectionTimer(existing);
       if (existing.signalingState === 'have-local-offer') {
-        if (MY_ID > from) {
+        /* v3.14-fix-2: if our own pending offer is stale (>3s old), the incoming
+           offer is likely a fresh renegotiation from the other side. Accept it
+           instead of ignoring, preventing deadlock when both sides detect
+           failure simultaneously and both send offers. */
+        const ourOfferStale = lastOfferAt[from] && (Date.now() - lastOfferAt[from] > 3000);
+        if (MY_ID > from && !ourOfferStale) {
           log("collision: I'm impolite, ignoring offer from " + from);
           renegInProgress[from] = false;
           return;
+        }
+        if (MY_ID > from && ourOfferStale) {
+          log("collision: impolite but our offer is stale (>3s), accepting " + from);
         }
         log("collision: polite rollback for " + from);
         try {
@@ -4241,6 +4269,9 @@ function setupPC(pc, pid) {
     if (pc.connectionState === 'connected') {
       clearConnectionTimer(pc);
       if (p) p.retries = 0;
+      /* v3.14-fix-2: connection is healthy, reset gentle restart counter
+         so future failures start fresh instead of immediately escalating. */
+      if (p) p._gentleRestartCount = 0;
       _lastAudioFlowing[pid] = Date.now();
       detectRelay(pc, pid);
       capOutboundBitrate(pc, adaptiveBitrate());
@@ -4261,23 +4292,38 @@ function setupPC(pc, pid) {
       // (DTLS never completes) even though audio packets are flowing fine. Tearing
       // down a working connection and rebuilding it just wastes TURN bandwidth and
       // increments the retry counter toward permanent give-up.
-      if (isAudioActuallyFlowing(pc, pid)) {
+      const pData = peerMap.get(pid);
+      // v3.14-fix-2: ESCALATION. If we've already done 2+ gentle restarts within
+      // 30s and the connection keeps failing, the gentle approach isn't working.
+      // Escalate to a full RELAY rebuild which actually changes the network path.
+      const gentleCount = pData ? (pData._gentleRestartCount || 0) : 0;
+      const lastGentle = pData ? pData._gentleRestartAt : 0;
+      const gentleRecent = lastGentle && (Date.now() - lastGentle < 30000);
+      const shouldEscalate = gentleCount >= 2 && gentleRecent;
+      if (shouldEscalate) {
+        log("FAILED " + pid + " — ESCALATING to full RELAY rebuild (gentle #" + gentleCount + " failed)");
+        if (pData) pData._gentleRestartCount = 0;
+        scheduleRetry(pid);
+      } else if (isAudioActuallyFlowing(pc, pid)) {
         log("FAILED " + pid + " but audio IS FLOWING — gentle ICE restart instead of rebuild");
         if (MY_ID > pid) {
           forceIceRestart(pid);
         } else {
-          // Smaller side can't ICE restart — ask larger side to do a full rebuild
+          // Smaller side can't ICE restart — ask larger side to do a gentle restart
           if (ws && ws.readyState === 1) {
             ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'soft-failed-but-audio-flowing' }));
           }
-          // Give the larger side time to rebuild before we clear our PC
+          // Give the larger side time to restart before we clear our PC
           setTimeout(function() {
-            if (peers[pid] && peers[pid].connectionState === 'failed') {
+            if (peers[pid] && peers[pid].connectionState === 'failed' && !isAudioActuallyFlowing(peers[pid], pid)) {
               destroyPeer(pid);
             }
           }, 3000);
         }
       } else {
+        // v3.14-fix-2: reset gentle restart counter when we do a full retry,
+        // so future failures can try gentle approach again
+        if (pData) pData._gentleRestartCount = 0;
         scheduleRetry(pid);
       }
     }
@@ -4299,10 +4345,19 @@ function setupPC(pc, pid) {
         }
         // v3.14-fix: if still disconnected but audio is STILL flowing, the state
         // machine is just stuck. Don't do a destructive retry — gentle ICE restart.
-        if (isAudioActuallyFlowing(currentPc, pid)) {
+        // v3.14-fix-2: but ESCALATE if gentle restarts keep failing.
+        const pData2 = peerMap.get(pid);
+        const gCount2 = pData2 ? (pData2._gentleRestartCount || 0) : 0;
+        const lastG2 = pData2 ? pData2._gentleRestartAt : 0;
+        const gRecent2 = lastG2 && (Date.now() - lastG2 < 30000);
+        if (isAudioActuallyFlowing(currentPc, pid) && !(gCount2 >= 2 && gRecent2)) {
           log("still disconnected " + pid + " but audio LIVE -> gentle ICE restart");
           if (MY_ID > pid) forceIceRestart(pid);
           return;
+        }
+        if (gCount2 >= 2 && gRecent2) {
+          log("still disconnected " + pid + " — ESCALATING (gentle #" + gCount2 + " failed)");
+          if (pData2) pData2._gentleRestartCount = 0;
         }
         if (currentPc.connectionState === 'disconnected' || currentPc.connectionState === 'failed') {
           log("still disconnected " + pid + " -> retry");
@@ -4585,8 +4640,12 @@ async function requestRelaySwitch(pid, reason) {
 }
 
 async function switchPeerToRelay(pid) {
-  if (renegInProgress[pid]) {
-    log("switchPeerToRelay: reneg in progress, deferring " + pid);
+  // v3.14-fix-2: check BOTH flags. forceIceRestart sets _iceRestarting on
+  // the peer object, and renegInProgress separately. Checking only one
+  // allows duplicate offers that corrupt the signaling state.
+  const p = peerMap.get(pid);
+  if (renegInProgress[pid] || (p && (p._iceRestarting || p._retrying))) {
+    log("switchPeerToRelay: reneg/iceRestart/retry in progress, deferring " + pid);
     return;
   }
   renegInProgress[pid] = true;
@@ -4601,6 +4660,17 @@ async function switchPeerToRelay(pid) {
   const pc = peers[pid];
   if (!pc) {
     try { await createOffer(pid); } finally {}
+    return;
+  }
+  // v3.14-fix-2: same guards as forceIceRestart. Calling createOffer on a
+  // PC in bad states produces invalid offers that corrupt signaling.
+  if (pc.signalingState === 'have-remote-offer') {
+    log("switchPeerToRelay skipped (have-remote-offer) " + pid);
+    renegInProgress[pid] = false;
+    return;
+  }
+  if (pc.connectionState === 'closed') {
+    renegInProgress[pid] = false;
     return;
   }
   try {
@@ -5617,7 +5687,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.14 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING)");
+log("page loaded v3.14.2 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING)");
 </script>
 </body>
 </html>"""
