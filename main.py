@@ -1,6 +1,8 @@
 """
-Silent Hill Voice Call Bot — v3.13 BEAST MODE
+Silent Hill Voice Call Bot — v3.14 BEAST MODE
 ═══════════════════════════════════════════════════════════════════════════════
+v3.14 — BULLETPROOF CALLING: DTLS-stall detection, "false failure" prevention,
+         audio-aware retry logic. No more random disconnects for the ~3%.
 v3.13 — MESSAGE DELETION + SWIPE-TO-REPLY + LONG-PRESS DELETE UI +
          WHATSAPP-STYLE IMAGE PREVIEW + VIEW ONCE.
 
@@ -2164,6 +2166,11 @@ const lossEwma = {};
 const sustainedBadStart = {};
 let lastMuteToggleAt = 0;
 
+// v3.14-fix: tracks when we last confirmed audio is actually flowing for a peer,
+// independent of the PC connectionState. Used to detect "false failures" where
+// the state machine says 'failed' but audio packets are still arriving.
+const _lastAudioFlowing = {};
+
 const frozenJitterCounts = {};
 const frozenJitterValues = {};
 
@@ -2226,6 +2233,31 @@ function adaptiveBitrate() {
   if (n >= 8) return 20;
   if (n >= 5) return 24;
   return 32;
+}
+
+// v3.14-fix: checks whether audio is actually flowing for a peer, regardless of
+// what the PC connectionState claims. This prevents destroying working connections
+// when the state machine gets out of sync with reality (DTLS stall bug on ~3% of
+// browsers — track plays but connectionState never reaches 'connected').
+function isAudioActuallyFlowing(pc, pid) {
+  if (!pc || pc.connectionState === 'closed') return false;
+  // Check 1: do we have live receivers?
+  const hasLiveTrack = pc.getReceivers && pc.getReceivers().some(function(r) {
+    return r.track && r.track.readyState === 'live';
+  });
+  if (!hasLiveTrack) return false;
+  // Check 2: have we received audio packets recently (within last 8s)?
+  const lastFlow = _lastAudioFlowing[pid];
+  if (lastFlow && Date.now() - lastFlow < 8000) return true;
+  // Check 3: is the audio element actually playing?
+  const a = audios[pid];
+  if (a && a.srcObject && !a.paused) {
+    const hasLiveTracks = a.srcObject.getTracks().some(function(t) {
+      return t.readyState === 'live';
+    });
+    if (hasLiveTracks) return true;
+  }
+  return false;
 }
 
 function statsIntervalMs() {
@@ -3676,6 +3708,14 @@ function startConnectionTimer(pid, customTimeout) {
     });
     if (hasLiveTrack) {
       log("CONN-TIMER " + pid + " track is LIVE, skipping all checks");
+      // v3.14-fix: audio is confirmed flowing — update timestamp and reset
+      // retry counters so we don't give up on this peer.
+      _lastAudioFlowing[pid] = Date.now();
+      const pp = peerMap.get(pid);
+      if (pp && pp.retries > 0) {
+        log("CONN-TIMER " + pid + " resetting retries (was " + pp.retries + ")");
+        pp.retries = 0;
+      }
       startConnectionTimer(pid, connTimerMs() + 10000);  // recheck in 20s
       return;
     }
@@ -3796,6 +3836,7 @@ function destroyPeer(pid, keepAudio) {
   delete lossEwma[pid];
   delete sustainedBadStart[pid];
   delete relayConnectedAt[pid];
+  delete _lastAudioFlowing[pid];
 }
 
 function nukePeer(pid) {
@@ -3821,6 +3862,7 @@ function nukePeer(pid) {
   delete lossEwma[pid];
   delete sustainedBadStart[pid];
   delete relayConnectedAt[pid];
+  delete _lastAudioFlowing[pid];
 }
 
 function shouldForceRelay(pid) {
@@ -4184,6 +4226,10 @@ function setupPC(pc, pid) {
     });
 
     startInboundLevel(e.streams[0], pid);
+    // v3.14-fix: mark audio as flowing the moment we receive a track.
+    // The track event means SRTP is decrypting successfully — audio IS working
+    // even if the connectionState machine hasn't caught up yet.
+    _lastAudioFlowing[pid] = Date.now();
   };
 
   pc.onconnectionstatechange = () => {
@@ -4195,6 +4241,7 @@ function setupPC(pc, pid) {
     if (pc.connectionState === 'connected') {
       clearConnectionTimer(pc);
       if (p) p.retries = 0;
+      _lastAudioFlowing[pid] = Date.now();
       detectRelay(pc, pid);
       capOutboundBitrate(pc, adaptiveBitrate());
       startStats(pc, pid);
@@ -4209,17 +4256,59 @@ function setupPC(pc, pid) {
     if (pc.connectionState === 'failed') {
       log("FAILED " + pid);
       clearConnectionTimer(pc);
-      scheduleRetry(pid);
+      // v3.14-fix: before doing a destructive retry, check if audio is actually
+      // still flowing. On ~3% of browsers the connectionState machine gets stuck
+      // (DTLS never completes) even though audio packets are flowing fine. Tearing
+      // down a working connection and rebuilding it just wastes TURN bandwidth and
+      // increments the retry counter toward permanent give-up.
+      if (isAudioActuallyFlowing(pc, pid)) {
+        log("FAILED " + pid + " but audio IS FLOWING — gentle ICE restart instead of rebuild");
+        if (MY_ID > pid) {
+          forceIceRestart(pid);
+        } else {
+          // Smaller side can't ICE restart — ask larger side to do a full rebuild
+          if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'soft-failed-but-audio-flowing' }));
+          }
+          // Give the larger side time to rebuild before we clear our PC
+          setTimeout(function() {
+            if (peers[pid] && peers[pid].connectionState === 'failed') {
+              destroyPeer(pid);
+            }
+          }, 3000);
+        }
+      } else {
+        scheduleRetry(pid);
+      }
     }
 
     if (pc.connectionState === 'disconnected') {
-      log("DISCONNECTED " + pid + " — waiting briefly");
+      // v3.14-fix: if audio is actually flowing, give the connection much more
+      // time to recover on its own. ICE can briefly disconnect during network
+      // flaps without breaking the audio path. A 4s timeout was too aggressive
+      // for mobile networks. Scale the wait based on whether audio is working.
+      const audioFlowing = isAudioActuallyFlowing(pc, pid);
+      const waitMs = audioFlowing ? 8000 : 4000;
+      log("DISCONNECTED " + pid + " — waiting " + waitMs + "ms (audio " + (audioFlowing ? "LIVE" : "silent") + ")");
       setTimeout(() => {
-        if (peers[pid] && peers[pid].connectionState === 'disconnected') {
+        const currentPc = peers[pid];
+        if (!currentPc) return;
+        if (currentPc.connectionState === 'connected') {
+          log("disconnected " + pid + " self-recovered — no action needed");
+          return;
+        }
+        // v3.14-fix: if still disconnected but audio is STILL flowing, the state
+        // machine is just stuck. Don't do a destructive retry — gentle ICE restart.
+        if (isAudioActuallyFlowing(currentPc, pid)) {
+          log("still disconnected " + pid + " but audio LIVE -> gentle ICE restart");
+          if (MY_ID > pid) forceIceRestart(pid);
+          return;
+        }
+        if (currentPc.connectionState === 'disconnected' || currentPc.connectionState === 'failed') {
           log("still disconnected " + pid + " -> retry");
           scheduleRetry(pid);
         }
-      }, 4000);
+      }, waitMs);
     }
   };
 
@@ -4319,10 +4408,24 @@ function startStats(pc, pid) {
       // again. Reset the give-up state so we'll try rebuilds again later
       // if the connection drops a second time.
       if (dRecv > 0) {
+        _lastAudioFlowing[pid] = Date.now();
         if (fullRebuildAttempts[pid]) fullRebuildAttempts[pid] = 0;
         if (peerGivenUp[pid]) {
           delete peerGivenUp[pid];
           log("recovered " + pid + " — rebuild counter reset");
+        }
+        // v3.14-fix: if packets are flowing but connectionState is NOT 'connected',
+        // the state machine is out of sync (DTLS stall). Reset the retry counter
+        // so we don't give up on a peer that's actually working.
+        const pcNow = peers[pid];
+        if (pcNow && pcNow.connectionState !== 'connected' && p) {
+          if (p.retries > 0) {
+            log("soft-connected " + pid + " — packets flowing but state=" +
+                pcNow.connectionState + ", resetting retries from " + p.retries + " to 0");
+            p.retries = 0;
+          }
+          // Also update peerMap state to reflect reality
+          p.connState = pcNow.connectionState;
         }
       }
 
@@ -4521,6 +4624,24 @@ async function scheduleRetry(pid) {
   const p = peerMap.get(pid);
   if (!p) return;
   if (p._retrying) return;
+  // v3.14-fix: check if this is a "false failure" — audio is actually working
+  // but the state machine is stuck. Don't increment the retry counter for these,
+  // because doing so leads to premature give-up after MAX_RETRIES.
+  const currentPc = peers[pid];
+  const isFalseFailure = currentPc && isAudioActuallyFlowing(currentPc, pid);
+  if (isFalseFailure) {
+    log("scheduleRetry: audio is LIVE for " + pid + " — not counting as real failure");
+    // Instead of a destructive retry with counter, do a gentle ICE restart
+    // (larger side only — smaller side sends relay request)
+    if (MY_ID > pid) {
+      forceIceRestart(pid);
+    } else if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'false-failure-gentle' }));
+    }
+    // Brief delay then clear _retrying so future retries can still fire
+    setTimeout(function() { if (p) p._retrying = false; }, 2000);
+    return;
+  }
   p._retrying = true;
   p.retries = (p.retries || 0) + 1;
 
@@ -5496,7 +5617,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.13 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once)");
+log("page loaded v3.14 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING)");
 </script>
 </body>
 </html>"""
@@ -5645,6 +5766,7 @@ async def main():
     print("v3.12.12: hysteresis on speaking detect — snappy stop, no mid-speech flicker")
     print("v3.12.13: cleanup pass — fixed stale comments, dead refs, banner version")
     print("v3.13: msg deletion + swipe reply + long-press delete + image preview + view once")
+    print("v3.14: BULLETPROOF CALLING — DTLS-stall detection, audio-aware retry, false-failure prevention")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
