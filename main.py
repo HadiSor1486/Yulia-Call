@@ -1,7 +1,7 @@
 """
-Silent Hill Voice Call Bot — v3.14.2 BEAST MODE
+Silent Hill Voice Call Bot — v3.15 ULTRA HARDCORE
 ═══════════════════════════════════════════════════════════════════════════════
-v3.14 — BULLETPROOF CALLING: DTLS-stall detection, offer-avalanche prevention, "false failure" prevention,
+v3.15 — ULTRA HARDCORE: DTLS-stall detection, offer-avalanche prevention, zombie-audio guard,, "false failure" prevention,
          audio-aware retry logic. No more random disconnects for the ~3%.
 v3.13 — MESSAGE DELETION + SWIPE-TO-REPLY + LONG-PRESS DELETE UI +
          WHATSAPP-STYLE IMAGE PREVIEW + VIEW ONCE.
@@ -2652,6 +2652,57 @@ function startWakeLockWatch() {
   }, 30000);
 }
 
+// v3.15: periodic cleanup of stale state that accumulates over long calls
+function runPeriodicCleanup() {
+  // Clean up ICE buffers for peers that no longer exist
+  Object.keys(iceBuffer).forEach(pid => {
+    if (!peers[pid] || !peerMap.has(pid)) {
+      delete iceBuffer[pid];
+    }
+  });
+  // Clean up stale reneg flags for peers that left
+  Object.keys(renegInProgress).forEach(pid => {
+    if (!peerMap.has(pid)) delete renegInProgress[pid];
+  });
+  Object.keys(peerRelay).forEach(pid => {
+    if (!peerMap.has(pid)) delete peerRelay[pid];
+  });
+  Object.keys(lastRelayAt).forEach(pid => {
+    if (!peerMap.has(pid)) delete lastRelayAt[pid];
+  });
+  Object.keys(lastIceRestartAt).forEach(pid => {
+    if (!peerMap.has(pid)) delete lastIceRestartAt[pid];
+  });
+  Object.keys(lastFullRebuildAt).forEach(pid => {
+    if (!peerMap.has(pid)) delete lastFullRebuildAt[pid];
+  });
+  Object.keys(fullRebuildAttempts).forEach(pid => {
+    if (!peerMap.has(pid)) delete fullRebuildAttempts[pid];
+  });
+  Object.keys(peerGivenUp).forEach(pid => {
+    if (!peerMap.has(pid)) delete peerGivenUp[pid];
+  });
+  Object.keys(lastOfferAt).forEach(pid => {
+    if (!peerMap.has(pid)) delete lastOfferAt[pid];
+  });
+  Object.keys(lastMutedAt).forEach(pid => {
+    if (!peerMap.has(pid)) delete lastMutedAt[pid];
+  });
+  Object.keys(lastOfferUfrag).forEach(pid => {
+    if (!peerMap.has(pid)) delete lastOfferUfrag[pid];
+  });
+  Object.keys(_lastAudioFlowing).forEach(pid => {
+    if (!peerMap.has(pid)) delete _lastAudioFlowing[pid];
+  });
+  // v3.15: detect and cleanup orphaned PCs (peerMap entry gone but PC still exists)
+  Object.keys(peers).forEach(pid => {
+    if (!peerMap.has(pid)) {
+      log("cleanup: destroying orphaned PC for " + pid);
+      destroyPeer(pid);
+    }
+  });
+}
+
 function startAudioSelfHeal() {
   if (audioHealTimer) clearInterval(audioHealTimer);
   audioHealTimer = setInterval(() => {
@@ -2676,6 +2727,11 @@ function startAudioSelfHeal() {
         }
       } catch (e) {}
     });
+    // v3.15: run periodic cleanup every 3rd tick (~15s)
+    if (audioHealTimer && audioHealTimer._tickCount === undefined) audioHealTimer._tickCount = 0;
+    if (audioHealTimer) audioHealTimer._tickCount++;
+    if (audioHealTimer && audioHealTimer._tickCount % 3 === 0) runPeriodicCleanup();
+
     if (localStream) {
       const micTrack = localStream.getAudioTracks()[0];
       if (micTrack && micTrack.readyState === 'ended') {
@@ -2707,25 +2763,76 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     if (!wakeLock) acquireWakeLock();
     log("foreground — refreshing peer health");
+    // v3.15: stagger restarts with jitter to prevent offer avalanche.
+    // Skip peers whose audio is actually flowing (false disconnected state).
+    let idx = 0;
     Object.entries(peers).forEach(([pid, pc]) => {
-      if (pc.connectionState === 'disconnected' && MY_ID > pid) {
-        log("disconnected peer on resume -> ICE restart " + pid);
-        forceIceRestart(pid);
+      if (pc.connectionState !== 'disconnected' && pc.connectionState !== 'failed') return;
+      if (MY_ID <= pid) return;
+      if (isAudioActuallyFlowing(pc, pid)) {
+        log("foreground: " + pid + " audio LIVE, skipping restart");
+        return;
       }
+      const delay = idx * 500 + Math.random() * 300;
+      idx++;
+      setTimeout(() => {
+        const currentPc = peers[pid];
+        if (currentPc && (currentPc.connectionState === 'disconnected' || currentPc.connectionState === 'failed')) {
+          log("foreground: ICE restart " + pid + " after " + delay + "ms");
+          forceIceRestart(pid);
+        }
+      }, delay);
     });
   }
 });
 
 window.addEventListener('online', () => {
   log("network online — refreshing connections");
+  // v3.15: stagger restarts with jitter to prevent offer avalanche.
+  // Skip peers whose audio is actually flowing (they recovered on their own).
+  let idx = 0;
   Object.entries(peers).forEach(([pid, pc]) => {
-    if (MY_ID > pid && pc.connectionState !== 'closed') {
-      setTimeout(() => forceIceRestart(pid), Math.random() * 500);
+    if (MY_ID <= pid) return;
+    if (pc.connectionState === 'closed') return;
+    if (isAudioActuallyFlowing(pc, pid)) {
+      log("network online: " + pid + " audio LIVE, skipping");
+      return;
     }
+    const delay = idx * 400 + Math.random() * 200;
+    idx++;
+    setTimeout(() => {
+      const currentPc = peers[pid];
+      if (currentPc && currentPc.connectionState !== 'closed' && currentPc.connectionState !== 'connected') {
+        log("network online: ICE restart " + pid + " after " + delay + "ms");
+        forceIceRestart(pid);
+      }
+    }, delay);
   });
 });
 window.addEventListener('offline', () => {
   log("network offline");
+});
+
+// v3.15: handle bfcache restore. When the browser restores the page from
+// the back/forward cache, all WebSocket and WebRTC state is stale. Force
+// a clean reconnect to get back into a known-good state.
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted) {
+    log("bfcache restore detected — forcing clean reconnect");
+    cleanupRTC();
+    wsRetries = 0;
+    setTimeout(connectWS, 500);
+  }
+});
+
+// v3.15: clean shutdown on page close — notify server so it can immediately
+// remove us from the peer list instead of waiting for the WebSocket timeout.
+window.addEventListener('beforeunload', () => {
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({ type: 'leave' })); } catch (e) {}
+    ws.close();
+  }
+  cleanupRTC();
 });
 
 function watchLocalTrack() {
@@ -2756,6 +2863,36 @@ function watchLocalTrack() {
     }
   });
 }
+
+// v3.15: handle audio device changes (bluetooth headset, earpiece, etc).
+// When the default audio device changes, we need to reacquire the mic
+// and renegotiate all peer connections so the new device is used.
+let _deviceChangeDebounce = null;
+navigator.mediaDevices.addEventListener('devicechange', () => {
+  if (_deviceChangeDebounce) clearTimeout(_deviceChangeDebounce);
+  _deviceChangeDebounce = setTimeout(() => {
+    if (!localStream) return;
+    log("audio device changed — reacquiring mic");
+    navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS).then(newStream => {
+      const newTrack = newStream.getAudioTracks()[0];
+      if (!newTrack) return;
+      newTrack.enabled = !isMuted;
+      Object.values(peers).forEach(pc => {
+        if (pc.connectionState === 'closed') return;
+        pc.getSenders().forEach(s => {
+          if (s.track && s.track.kind === 'audio') {
+            try { s.replaceTrack(newTrack); } catch (e) {}
+          }
+        });
+      });
+      try { localStream.getTracks().forEach(tr => tr.stop()); } catch (e) {}
+      localStream = newStream;
+      watchLocalTrack();
+      setupLocalLevelMonitor();
+      log("mic switched to new device");
+    }).catch(e => log("devicechange mic reacquire failed: " + e.message));
+  }, 1000);
+});
 
 async function doJoin() {
   const rawName = document.getElementById('nameIn').value.trim();
@@ -3131,9 +3268,24 @@ function connectWS() {
       return;
     }
     if (!leaving) {
-      const delay = Math.min(1000 * Math.pow(1.5, wsRetries), 15000);
+      // v3.15: mark all peer connections as potentially stale. Don't destroy
+      // them yet — they might recover when WS reconnects. But stop stats
+      // timers to prevent errors from firing on PCs without a signaling channel.
+      Object.keys(statsTimers).forEach(pid => {
+        clearInterval(statsTimers[pid]);
+        delete statsTimers[pid];
+      });
+      Object.keys(inboundLevelTimers).forEach(pid => {
+        clearInterval(inboundLevelTimers[pid]);
+        delete inboundLevelTimers[pid];
+      });
+      // v3.15: exponential backoff with jitter to prevent thundering herd
+      // when server comes back up (all clients reconnecting simultaneously).
+      const baseDelay = Math.min(1000 * Math.pow(1.5, wsRetries), 15000);
+      const jitter = Math.random() * 500;
+      const delay = baseDelay + jitter;
       wsRetries++;
-      log("WS reconnect in " + delay + "ms");
+      log("WS reconnect in " + Math.round(delay) + "ms (base=" + baseDelay + " jitter=" + Math.round(jitter) + ")");
       setTimeout(connectWS, delay);
     } else {
       cleanupRTC();
@@ -3749,6 +3901,18 @@ function startConnectionTimer(pid, customTimeout) {
       startConnectionTimer(pid, connTimerMs() + 10000);  // 20s grace (10+10), not 10s
       return;
     }
+    // v3.15: handle 'connecting' stuck (DTLS handshake freeze) — this is
+    // the root cause of most "random disconnects". DTLS can get stuck
+    // indefinitely, leaving connectionState='connecting' forever.
+    if (pc.connectionState === 'connecting' && pc._connTimerFires >= 2) {
+      log("CONN-TIMER " + pid + " DTLS handshake stuck in 'connecting' -> force restart");
+      if (MY_ID > pid && !peerRelay[pid]) {
+        peerRelay[pid] = true;
+        lastRelayAt[pid] = Date.now();
+      }
+      scheduleRetry(pid);
+      return;
+    }
     if (pc.iceConnectionState === 'checking') {
       pc._connTimerFires++;
       if (pc._connTimerFires >= 1 && !peerRelay[pid] && MY_ID > pid) {
@@ -3857,6 +4021,14 @@ function destroyPeer(pid, keepAudio) {
   delete sustainedBadStart[pid];
   delete relayConnectedAt[pid];
   delete _lastAudioFlowing[pid];
+  // v3.15: clean up all per-peer counters to prevent memory growth
+  delete frozenJitterCounts[pid];
+  delete frozenJitterValues[pid];
+  delete _lastJitters[pid];
+  delete lossEwma[pid];
+  delete sustainedBadStart[pid];
+  delete _zombieCounts[pid];
+  delete _zombieCooldowns[pid];
 }
 
 function nukePeer(pid) {
@@ -3883,6 +4055,14 @@ function nukePeer(pid) {
   delete sustainedBadStart[pid];
   delete relayConnectedAt[pid];
   delete _lastAudioFlowing[pid];
+  // v3.15: clean up all per-peer counters
+  delete frozenJitterCounts[pid];
+  delete frozenJitterValues[pid];
+  delete _lastJitters[pid];
+  delete lossEwma[pid];
+  delete sustainedBadStart[pid];
+  delete _zombieCounts[pid];
+  delete _zombieCooldowns[pid];
 }
 
 function shouldForceRelay(pid) {
@@ -3915,8 +4095,35 @@ async function createOffer(pid) {
     const offer = await pc.createOffer();
     offer.sdp = preferOpusAndTune(offer.sdp);
     await pc.setLocalDescription(offer);
-    ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
-    log("offer SENT " + pid);
+    // v3.15: if ICE gathering doesn't complete within 8s, send what we have.
+    // Some browsers (especially mobile Safari) get stuck gathering forever.
+    // The candidates gathered so far (including TURN) are usually sufficient.
+    if (pc.iceGatheringState !== 'complete') {
+      setTimeout(() => {
+        if (pc.connectionState === 'closed') return;
+        if (pc.iceGatheringState !== 'complete' && pc.localDescription) {
+          log("ICE gathering timeout for " + pid + " — sending with partial candidates");
+          ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
+          log("offer SENT " + pid + " (partial ICE)");
+        }
+      }, 8000);
+      // Wait for gathering to complete naturally OR timeout above
+      await new Promise(resolve => {
+        const check = () => {
+          if (pc.iceGatheringState === 'complete' || pc.connectionState === 'closed') {
+            pc.removeEventListener('icegatheringstatechange', check);
+            resolve();
+          }
+        };
+        pc.addEventListener('icegatheringstatechange', check);
+        setTimeout(() => { pc.removeEventListener('icegatheringstatechange', check); resolve(); }, 8500);
+      });
+    }
+    // Only send if not already sent by timeout handler above
+    if (pc.connectionState !== 'closed' && pc.localDescription) {
+      ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
+      log("offer SENT " + pid);
+    }
     startConnectionTimer(pid);
   } catch (e) {
     log("offer FAIL " + pid + ": " + e.message);
@@ -4193,8 +4400,17 @@ function showAudioUnlockUI() {
   el.textContent = 'Tap here to enable sound';
   el.onclick = () => {
     log("audio unlock tapped");
-    if (remoteAudioCtx && remoteAudioCtx.state === 'suspended') {
-      remoteAudioCtx.resume().catch(() => {});
+    // v3.15: aggressively resume audio context + restart all audio elements.
+    // Mobile Safari suspends the audio context when the tab loses focus.
+    if (remoteAudioCtx) {
+      if (remoteAudioCtx.state === 'suspended') {
+        remoteAudioCtx.resume().catch(() => {});
+      }
+      // Also try resuming the shared AudioContext used for level monitoring
+      try {
+        const ac = getSharedAC();
+        if (ac.state === 'suspended') ac.resume().catch(() => {});
+      } catch (e) {}
     }
     Object.values(audios).forEach(a => {
       try {
@@ -4367,8 +4583,34 @@ function setupPC(pc, pid) {
     }
   };
 
+  // v3.15: Handle negotiationneeded for track changes (mic reacquire,
+  // bluetooth headset switch, etc.). Only the larger side initiates to
+  // avoid collision. Debounced to prevent rapid-fire renegotiations.
+  pc.onnegotiationneeded = () => {
+    if (MY_ID <= pid) return;
+    if (pc._negotiationPending) return;
+    if (pc.connectionState === 'closed' || pc.connectionState === 'failed') return;
+    if (pc.signalingState !== 'stable') return;
+    pc._negotiationPending = true;
+    log("negotiationneeded " + pid + " -> gentle ICE restart");
+    forceIceRestart(pid);
+    setTimeout(() => { if (pc) pc._negotiationPending = false; }, 5000);
+  };
+
   pc.oniceconnectionstatechange = () => {
     log("PC " + pid + " ICE=" + pc.iceConnectionState);
+    // v3.15: early detection of ICE failure — trigger recovery before
+    // connectionState reaches 'failed' (which can take 10-15s longer).
+    if (pc.iceConnectionState === 'failed') {
+      log("PC " + pid + " ICE=failed -> early recovery");
+      const pData = peerMap.get(pid);
+      if (pData && isAudioActuallyFlowing(pc, pid)) {
+        log("ICE failed but audio LIVE for " + pid + " -> gentle restart");
+        if (MY_ID > pid) forceIceRestart(pid);
+      } else {
+        scheduleRetry(pid);
+      }
+    }
   };
 }
 
@@ -4431,7 +4673,11 @@ function startStats(pc, pid) {
       delete statsTimers[pid];
       return;
     }
-    if (peers[pid]?.connectionState !== 'connected') return;
+    // v3.15: Run stats even when connectionState !== 'connected' so we
+    // can detect DTLS stalls (false failures where audio flows but state
+    // is stuck). Skip loss/bandwidth analysis for non-connected peers.
+    const connStateNow = peers[pid]?.connectionState;
+    const isConnected = connStateNow === 'connected';
 
     try {
       const stats = await peers[pid].getStats();
@@ -4454,9 +4700,15 @@ function startStats(pc, pid) {
       lastRecv = recv; lastLost = lost; lastSent = sent;
 
       const peerInfo = peerMap.get(pid);
-      if (peerInfo) {
+      if (peerInfo && isConnected) {
         peerInfo.lossPct = lossPct;
         peerInfo.recvRate = dRecv / (intervalMs / 1000);
+      }
+
+      // v3.15: if packets are arriving AT ALL, audio is flowing — update
+      // the timestamp regardless of connectionState (DTLS stall detection).
+      if (dRecv > 0) {
+        _lastAudioFlowing[pid] = Date.now();
       }
 
       // v3.12.2: if packets are actually flowing, this peer is healthy
@@ -4538,6 +4790,22 @@ function startStats(pc, pid) {
         consecutiveStalled = 0;
       }
 
+      // v3.15: Only run loss-based quality analysis for actually-connected
+      // peers. For DTLS-stall peers, we trust isAudioActuallyFlowing instead.
+      if (!isConnected) {
+        // v3.15: DTLS stall detection — packets flowing but state stuck
+        const pcNow = peers[pid];
+        if (pcNow && dRecv > 0 && connStateNow !== 'connected') {
+          const pp = peerMap.get(pid);
+          if (pp && pp.retries > 0) {
+            log("soft-connected " + pid + " — packets flowing but state=" + connStateNow + ", resetting retries from " + pp.retries + " to 0");
+            pp.retries = 0;
+            pp.connState = connStateNow;
+          }
+        }
+        return;  // Skip loss/bandwidth analysis for non-connected peers
+      }
+
       if (dSent === 0 && !isMuted) {
         outboundStall++;
         if (outboundStall >= 2 && !peerRelay[pid] && !relayJustConnected) {
@@ -4548,18 +4816,28 @@ function startStats(pc, pid) {
         outboundStall = 0;
       }
 
+      // v3.15: ZOMBIE detection with audio reality check. A "frozen jitter"
+      // can happen when the peer is simply silent (not speaking) OR when the
+      // connection is truly dead. Only renegotiate if audio is NOT flowing.
       if (detectFrozenJitter(pid, jitter, dRecv)) {
-        log("ZOMBIE jitter frozen on " + pid + " -> full renegotiate");
-        if (MY_ID > pid) {
-          destroyPeer(pid);
-          setTimeout(() => createOffer(pid), 300);
+        const pcNow = peers[pid];
+        if (pcNow && isAudioActuallyFlowing(pcNow, pid)) {
+          log("ZOMBIE jitter frozen on " + pid + " but audio IS FLOWING — skipping reneg");
+          // Reset the zombie counter since audio is fine
+          frozenJitterCounts[pid] = 0;
         } else {
-          destroyPeer(pid);
-          renegInProgress[pid] = true;
-          if (ws && ws.readyState === 1) {
-            ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'zombie-reneg' }));
+          log("ZOMBIE jitter frozen on " + pid + " -> full renegotiate");
+          if (MY_ID > pid) {
+            destroyPeer(pid);
+            setTimeout(() => createOffer(pid), 300);
+          } else {
+            destroyPeer(pid);
+            renegInProgress[pid] = true;
+            if (ws && ws.readyState === 1) {
+              ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'zombie-reneg' }));
+            }
+            setTimeout(() => { renegInProgress[pid] = false; }, 3000);
           }
-          setTimeout(() => { renegInProgress[pid] = false; }, 3000);
         }
       }
     } catch (e) {}
@@ -5687,7 +5965,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.14.2 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING)");
+log("page loaded v3.15 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING)");
 </script>
 </body>
 </html>"""
