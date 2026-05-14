@@ -2061,8 +2061,7 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 /* ════════════════════════════════════════════════════════════════════════════
    v3.16 — MESSAGE CLICK PANEL (Copy + Reply)
    ════════════════════════════════════════════════════════════════════════════ */
-.msg-click-panel{position:absolute;z-index:200;background:rgba(42,42,46,0.97);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-radius:16px;padding:6px;border:1px solid rgba(255,255,255,0.08);box-shadow:0 12px 40px rgba(0,0,0,0.55),0 2px 8px rgba(0,0,0,0.25);opacity:0;transform:scale(0.85) translateY(8px);transition:opacity .15s ease,transform .18s cubic-bezier(.2,.7,.2,1);pointer-events:none;min-width:150px;overflow:hidden}
-.msg-click-panel.show{opacity:1;transform:scale(1) translateY(0);pointer-events:auto}
+.msg-click-panel{position:fixed;z-index:200;background:rgba(42,42,46,0.97);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-radius:16px;padding:6px;border:1px solid rgba(255,255,255,0.08);box-shadow:0 12px 40px rgba(0,0,0,0.55),0 2px 8px rgba(0,0,0,0.25);min-width:150px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 .msg-click-panel-item{display:flex;align-items:center;gap:12px;padding:11px 16px;border-radius:10px;cursor:pointer;transition:background .12s,color .12s;color:#fff;font-size:14px;font-weight:500;user-select:none;-webkit-user-select:none}
 .msg-click-panel-item:hover{background:rgba(255,255,255,0.1)}
 .msg-click-panel-item:active{background:rgba(255,255,255,0.14)}
@@ -2790,10 +2789,8 @@ let _msgClickPanelTimer = null;
 
 function showMsgClickPanel(msgEl, m) {
   hideMsgClickPanel();
-  // Don't show if reaction bar is open or delete button is visible
-  if (document.querySelector('.react-bar')) { log("click panel blocked: react bar open"); return; }
-  if (document.querySelector('.msg-delete-btn')) { log("click panel blocked: delete btn visible"); return; }
-  log("msg click panel creating for " + (m.id || '?'));
+  if (document.querySelector('.react-bar')) return;
+  if (document.querySelector('.msg-delete-btn')) return;
 
   const panel = document.createElement('div');
   panel.className = 'msg-click-panel';
@@ -2808,27 +2805,42 @@ function showMsgClickPanel(msgEl, m) {
       'Reply' +
     '</div>';
 
+  // Start hidden but measuring — visibility:hidden gives accurate dimensions
+  panel.style.visibility = 'hidden';
+  panel.style.opacity = '0';
   document.body.appendChild(panel);
-  _msgClickPanel = panel;
 
-  // Position above the message bubble
-  const rect = msgEl.getBoundingClientRect();
+  // Measure with proper layout (visibility:hidden participates in layout)
+  const rowRect = msgEl.getBoundingClientRect();
   const panelRect = panel.getBoundingClientRect();
-  const chatRect = document.getElementById('chat').getBoundingClientRect();
+  const chatEl = document.getElementById('chat');
+  const chatRect = chatEl ? chatEl.getBoundingClientRect() : {top:0,left:0,right:window.innerWidth,bottom:window.innerHeight};
 
-  let left = rect.left + (rect.width / 2) - (panelRect.width / 2);
-  let top = rect.top - panelRect.height - 10;
+  // Center above the message row
+  let left = rowRect.left + (rowRect.width / 2) - (panelRect.width / 2);
+  let top = rowRect.top - panelRect.height - 8;
 
-  // Clamp to chat boundaries
-  left = Math.max(chatRect.left + 4, Math.min(left, chatRect.right - panelRect.width - 4));
-  top = Math.max(chatRect.top + 4, top);
+  // Clamp to viewport / chat boundaries
+  const pad = 6;
+  left = Math.max(chatRect.left + pad, Math.min(left, chatRect.right - panelRect.width - pad));
+  if (top < chatRect.top + pad) {
+    top = rowRect.bottom + 8;
+  }
 
   panel.style.left = left + 'px';
   panel.style.top = top + 'px';
 
-  // Animate in
+  // Store ref BEFORE making visible
+  _msgClickPanel = panel;
+
+  // Now make visible with a smooth fade-in
+  panel.style.transition = 'opacity .12s ease, transform .15s ease';
+  panel.style.transform = 'scale(0.92) translateY(4px)';
+
   requestAnimationFrame(function() {
-    panel.classList.add('show');
+    panel.style.visibility = 'visible';
+    panel.style.opacity = '1';
+    panel.style.transform = 'scale(1) translateY(0)';
   });
 
   // Click handlers
@@ -2836,16 +2848,15 @@ function showMsgClickPanel(msgEl, m) {
     ev.stopPropagation();
     if (m.text) {
       navigator.clipboard.writeText(m.text).then(function() {
-        showStickerToast('Copied', 'ok', 1500);
+        showStickerToast('Copied', 'ok', 1200);
       }).catch(function() {
-        // Fallback
-        const ta = document.createElement('textarea');
+        var ta = document.createElement('textarea');
         ta.value = m.text;
         document.body.appendChild(ta);
         ta.select();
         document.execCommand('copy');
         document.body.removeChild(ta);
-        showStickerToast('Copied', 'ok', 1500);
+        showStickerToast('Copied', 'ok', 1200);
       });
     }
     hideMsgClickPanel();
@@ -2857,13 +2868,13 @@ function showMsgClickPanel(msgEl, m) {
     hideMsgClickPanel();
   });
 
-  // Auto-dismiss after 4s
-  _msgClickPanelTimer = setTimeout(hideMsgClickPanel, 4000);
+  // Auto-dismiss
+  _msgClickPanelTimer = setTimeout(hideMsgClickPanel, 3500);
 
-  // Dismiss on click elsewhere (after a small delay to avoid immediate close)
+  // Dismiss on click outside
   setTimeout(function() {
     document.addEventListener('click', _onDocClickDismiss);
-  }, 100);
+  }, 80);
 }
 
 function _onDocClickDismiss(e) {
@@ -2877,11 +2888,11 @@ function hideMsgClickPanel() {
   document.removeEventListener('click', _onDocClickDismiss);
   if (_msgClickPanel) {
     var dyingPanel = _msgClickPanel;
-    dyingPanel.classList.remove('show');
+    dyingPanel.style.opacity = '0';
+    dyingPanel.style.transform = 'scale(0.92) translateY(4px)';
     setTimeout(function() {
-      // v3.16-fix: only remove if it's still the same panel (not replaced)
       if (_msgClickPanel === dyingPanel) { _msgClickPanel.remove(); _msgClickPanel = null; }
-    }, 200);
+    }, 150);
   }
 }
 
