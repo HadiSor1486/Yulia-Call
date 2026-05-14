@@ -2321,9 +2321,12 @@ function isAudioActuallyFlowing(pc, pid) {
     return r.track && r.track.readyState === 'live';
   });
   if (!hasLiveTrack) return false;
-  // Check 2: have we received audio packets recently (within last 8s)?
+  // Check 2: have we received audio packets recently (within last 3s)?
+  // v3.16-fix: was 8s, now 3s. The old 8s window caused false positives
+  // after DTLS stalls — the track stays "live" for seconds after packets
+  // stop flowing, and the audio element keeps playing buffered audio.
   const lastFlow = _lastAudioFlowing[pid];
-  if (lastFlow && Date.now() - lastFlow < 8000) return true;
+  if (lastFlow && Date.now() - lastFlow < 3000) return true;
   // Check 3: is the audio element actually playing?
   const a = audios[pid];
   if (a && a.srcObject && !a.paused) {
@@ -2789,6 +2792,8 @@ let _msgClickPanelTimer = null;
 
 function showMsgClickPanel(msgEl, m) {
   hideMsgClickPanel();
+  // v3.16-fix: don't show panel for sticker-only or image-only messages
+  if (m.sticker) return;
   if (document.querySelector('.react-bar')) return;
   if (document.querySelector('.msg-delete-btn')) return;
 
@@ -4883,8 +4888,10 @@ function setupPC(pc, pid) {
       const shouldEscalate = gentleCount >= 2 && gentleRecent;
       if (shouldEscalate) {
         log("FAILED " + pid + " — ESCALATING to full RELAY rebuild (gentle #" + gentleCount + " failed)");
-        if (pData) pData._gentleRestartCount = 0;
-        scheduleRetry(pid);
+        // v3.16-fix: call fullRebuild DIRECTLY instead of scheduleRetry.
+        // scheduleRetry's false-failure detection would intercept and do
+        // another gentle restart, creating an infinite death spiral.
+        fullRebuild(pid, 'escalation-failed');
       } else if (isAudioActuallyFlowing(pc, pid)) {
         log("FAILED " + pid + " but audio IS FLOWING — gentle ICE restart instead of rebuild");
         if (MY_ID > pid) {
@@ -4915,7 +4922,10 @@ function setupPC(pc, pid) {
       // flaps without breaking the audio path. A 4s timeout was too aggressive
       // for mobile networks. Scale the wait based on whether audio is working.
       const audioFlowing = isAudioActuallyFlowing(pc, pid);
-      const waitMs = audioFlowing ? 8000 : 4000;
+      // v3.16-fix: reduced from 8000ms to 4000ms. With the tighter 3s
+      // audio window, if audio is truly flowing we'll know sooner. If not,
+      // we recover faster instead of waiting 8s for nothing.
+      const waitMs = audioFlowing ? 4000 : 4000;
       log("DISCONNECTED " + pid + " — waiting " + waitMs + "ms (audio " + (audioFlowing ? "LIVE" : "silent") + ")");
       setTimeout(() => {
         const currentPc = peers[pid];
@@ -4938,7 +4948,11 @@ function setupPC(pc, pid) {
         }
         if (gCount2 >= 2 && gRecent2) {
           log("still disconnected " + pid + " — ESCALATING (gentle #" + gCount2 + " failed)");
-          if (pData2) pData2._gentleRestartCount = 0;
+          // v3.16-fix: call fullRebuild DIRECTLY instead of scheduleRetry.
+          // scheduleRetry's false-failure detection would intercept and do
+          // another gentle restart, creating an infinite death spiral.
+          fullRebuild(pid, 'escalation-disconnected');
+          return;
         }
         if (currentPc.connectionState === 'disconnected' || currentPc.connectionState === 'failed') {
           log("still disconnected " + pid + " -> retry");
