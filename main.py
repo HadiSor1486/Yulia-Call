@@ -2314,6 +2314,12 @@ function adaptiveBitrate() {
 // what the PC connectionState claims. This prevents destroying working connections
 // when the state machine gets out of sync with reality (DTLS stall bug on ~3% of
 // browsers — track plays but connectionState never reaches 'connected').
+//
+// v3.17-fix: the previous 3s window was a lie. The stats loop only runs every
+// 4-8s, so _lastAudioFlowing is updated at most every 4-8s. A 3s check window
+// would always return stale for the gap between stats ticks, producing wildly
+// inconsistent results based on luck of timing. We now use a window that
+// comfortably covers the stats interval plus a safety margin.
 function isAudioActuallyFlowing(pc, pid) {
   if (!pc || pc.connectionState === 'closed') return false;
   // Check 1: do we have live receivers?
@@ -2321,22 +2327,61 @@ function isAudioActuallyFlowing(pc, pid) {
     return r.track && r.track.readyState === 'live';
   });
   if (!hasLiveTrack) return false;
-  // Check 2: have we received audio packets recently (within last 3s)?
-  // v3.16-fix: was 8s, now 3s. The old 8s window caused false positives
-  // after DTLS stalls — the track stays "live" for seconds after packets
-  // stop flowing, and the audio element keeps playing buffered audio.
+  // Check 2: have we received audio packets recently? Window = max stats
+  // interval (8s) + one full extra tick of safety (8s) = 16s. Beyond this,
+  // we treat audio as silent regardless of what the track readyState says.
   const lastFlow = _lastAudioFlowing[pid];
-  if (lastFlow && Date.now() - lastFlow < 3000) return true;
-  // Check 3: is the audio element actually playing?
-  const a = audios[pid];
-  if (a && a.srcObject && !a.paused) {
-    const hasLiveTracks = a.srcObject.getTracks().some(function(t) {
-      return t.readyState === 'live';
-    });
-    if (hasLiveTracks) return true;
+  const FLOW_WINDOW_MS = 16000;
+  const STRICT_WINDOW_MS = 6000;
+  if (lastFlow && Date.now() - lastFlow < STRICT_WINDOW_MS) return true;
+  // Check 3 (relaxed): audio element actually playing AND we got packets
+  // within the wider window. The element playing alone isn't enough —
+  // browsers keep playing buffered audio for seconds after packets stop.
+  if (lastFlow && Date.now() - lastFlow < FLOW_WINDOW_MS) {
+    const a = audios[pid];
+    if (a && a.srcObject && !a.paused) {
+      const hasLiveTracks = a.srcObject.getTracks().some(function(t) {
+        return t.readyState === 'live';
+      });
+      if (hasLiveTracks) return true;
+    }
   }
   return false;
 }
+
+// v3.17-fix: on-demand fast packet check. Used by failure handlers BEFORE
+// deciding "audio is flowing" — bypasses the slow stats loop so we get a
+// fresh answer at the moment of failure rather than relying on a stat
+// snapshot that might be 4-8s stale.
+async function freshAudioCheck(pc, pid) {
+  if (!pc || pc.connectionState === 'closed') return false;
+  try {
+    const before = _lastInboundPackets[pid] || 0;
+    const stats = await pc.getStats();
+    let recv = 0;
+    stats.forEach(function(r) {
+      if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+        recv = r.packetsReceived || 0;
+      }
+    });
+    _lastInboundPackets[pid] = recv;
+    // First call after a destroy/rebuild: no prior baseline, fall back to
+    // the stats-based check rather than guessing.
+    if (before === 0 && recv > 0) {
+      _lastAudioFlowing[pid] = Date.now();
+      return true;
+    }
+    if (recv > before) {
+      _lastAudioFlowing[pid] = Date.now();
+      return true;
+    }
+    return false;
+  } catch (e) {
+    // If getStats fails, the PC is probably dead — definitely not flowing.
+    return false;
+  }
+}
+const _lastInboundPackets = {};
 
 function statsIntervalMs() {
   const n = peerMap.size;
@@ -4376,7 +4421,57 @@ async function forceIceRestart(pid) {
   }
 }
 
+// v3.17-fix: WATCHDOG. The single biggest source of "stuck forever" bugs is
+// when one recovery path is started (gentle restart, request_relay, etc.) and
+// nothing fires if it silently fails — the WS message could be dropped, the
+// other side could be in a bad state, the gentle restart could itself fail
+// without throwing, etc. This watchdog is the SAFETY NET: schedule it whenever
+// a connection enters failed/disconnected, and it WILL escalate to fullRebuild
+// if the connection isn't healthy within ~6s, no matter what happened in
+// between. Idempotent — calling it multiple times is fine.
+const _failedWatchdogs = {};
+function scheduleFailedWatchdog(pid) {
+  if (_failedWatchdogs[pid]) return; // already scheduled
+  _failedWatchdogs[pid] = setTimeout(async function() {
+    delete _failedWatchdogs[pid];
+    const pc = peers[pid];
+    if (!pc) return; // peer is gone, nothing to do
+    if (pc.connectionState === 'connected') return; // recovered, great
+    if (pc.connectionState === 'closed') return;
+    // Still failed/disconnected/connecting after 6s. Try one fresh packet
+    // check — if real audio is flowing, the state machine is the only thing
+    // broken, and a fullRebuild would needlessly drop a working call.
+    const reallyFlowing = await freshAudioCheck(pc, pid);
+    if (peers[pid] !== pc) return;
+    if (peers[pid].connectionState === 'connected') return;
+    if (reallyFlowing) {
+      log("WATCHDOG " + pid + " state=" + peers[pid].connectionState + " but audio LIVE -> rescheduling");
+      // Audio is genuinely flowing — give it one more cycle, then escalate
+      // for real if it's still stuck.
+      _failedWatchdogs[pid] = setTimeout(function() {
+        delete _failedWatchdogs[pid];
+        const p2 = peers[pid];
+        if (!p2) return;
+        if (p2.connectionState === 'connected' || p2.connectionState === 'closed') return;
+        log("WATCHDOG " + pid + " STILL stuck after second window -> fullRebuild");
+        fullRebuild(pid, 'watchdog-stuck-with-audio');
+      }, 6000);
+      return;
+    }
+    log("WATCHDOG " + pid + " state=" + peers[pid].connectionState + " audio silent -> fullRebuild");
+    fullRebuild(pid, 'watchdog-' + peers[pid].connectionState);
+  }, 6000);
+}
+function clearFailedWatchdog(pid) {
+  if (_failedWatchdogs[pid]) {
+    clearTimeout(_failedWatchdogs[pid]);
+    delete _failedWatchdogs[pid];
+  }
+}
+
 function destroyPeer(pid, keepAudio) {
+  // v3.17-fix: clear watchdog so it doesn't fire against a destroyed PC
+  clearFailedWatchdog(pid);
   if (peers[pid]) {
     clearConnectionTimer(peers[pid]);
     const dying = peers[pid];
@@ -4854,6 +4949,8 @@ function setupPC(pc, pid) {
 
     if (pc.connectionState === 'connected') {
       clearConnectionTimer(pc);
+      // v3.17-fix: cancel any pending failure watchdog — we recovered.
+      clearFailedWatchdog(pid);
       if (p) p.retries = 0;
       /* v3.14-fix-2: connection is healthy, reset gentle restart counter
          so future failures start fresh instead of immediately escalating. */
@@ -4873,88 +4970,104 @@ function setupPC(pc, pid) {
     if (pc.connectionState === 'failed') {
       log("FAILED " + pid);
       clearConnectionTimer(pc);
-      // v3.14-fix: before doing a destructive retry, check if audio is actually
-      // still flowing. On ~3% of browsers the connectionState machine gets stuck
-      // (DTLS never completes) even though audio packets are flowing fine. Tearing
-      // down a working connection and rebuilding it just wastes TURN bandwidth and
-      // increments the retry counter toward permanent give-up.
+      // v3.17-fix: ALWAYS schedule a watchdog escalation. The old code's
+      // "send request_relay and hope" path was the source of the silent
+      // death — if the larger side didn't respond (also disconnected on
+      // their end, or message lost during the brief WS hiccup), the smaller
+      // side would just sit on a dead PC forever. The watchdog guarantees
+      // we recover within ~6s no matter what the other side does.
+      scheduleFailedWatchdog(pid);
       const pData = peerMap.get(pid);
-      // v3.14-fix-2: ESCALATION. If we've already done 2+ gentle restarts within
+      // ESCALATION. If we've already done 2+ gentle restarts within
       // 30s and the connection keeps failing, the gentle approach isn't working.
       // Escalate to a full RELAY rebuild which actually changes the network path.
       const gentleCount = pData ? (pData._gentleRestartCount || 0) : 0;
       const lastGentle = pData ? pData._gentleRestartAt : 0;
       const gentleRecent = lastGentle && (Date.now() - lastGentle < 30000);
-      const shouldEscalate = gentleCount >= 2 && gentleRecent;
+      // v3.17-fix: lowered threshold from 2 to 1. If a gentle restart was
+      // already attempted in the last 30s and we're STILL failing, that's
+      // enough evidence the gentle path is broken — don't burn another cycle.
+      const shouldEscalate = gentleCount >= 1 && gentleRecent;
       if (shouldEscalate) {
         log("FAILED " + pid + " — ESCALATING to full RELAY rebuild (gentle #" + gentleCount + " failed)");
-        // v3.16-fix: call fullRebuild DIRECTLY instead of scheduleRetry.
-        // scheduleRetry's false-failure detection would intercept and do
-        // another gentle restart, creating an infinite death spiral.
         fullRebuild(pid, 'escalation-failed');
-      } else if (isAudioActuallyFlowing(pc, pid)) {
-        log("FAILED " + pid + " but audio IS FLOWING — gentle ICE restart instead of rebuild");
-        if (MY_ID > pid) {
-          forceIceRestart(pid);
-        } else {
-          // Smaller side can't ICE restart — ask larger side to do a gentle restart
-          if (ws && ws.readyState === 1) {
-            ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'soft-failed-but-audio-flowing' }));
-          }
-          // Give the larger side time to restart before we clear our PC
-          setTimeout(function() {
-            if (peers[pid] && peers[pid].connectionState === 'failed' && !isAudioActuallyFlowing(peers[pid], pid)) {
-              destroyPeer(pid);
-            }
-          }, 3000);
-        }
       } else {
-        // v3.14-fix-2: reset gentle restart counter when we do a full retry,
-        // so future failures can try gentle approach again
-        if (pData) pData._gentleRestartCount = 0;
-        scheduleRetry(pid);
+        // v3.17-fix: do a FRESH packet check before trusting the stats-loop
+        // cached value. Without this, isAudioActuallyFlowing may report stale
+        // "true" because packets stopped 4-8s ago but stats hasn't ticked yet.
+        freshAudioCheck(pc, pid).then(function(reallyFlowing) {
+          // PC may have been destroyed during the await
+          if (peers[pid] !== pc) return;
+          if (peers[pid].connectionState !== 'failed') return;
+          if (reallyFlowing) {
+            log("FAILED " + pid + " but audio IS FLOWING — gentle ICE restart instead of rebuild");
+            if (MY_ID > pid) {
+              forceIceRestart(pid);
+            } else {
+              if (ws && ws.readyState === 1) {
+                ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'soft-failed-but-audio-flowing' }));
+              }
+              // v3.17-fix: do NOT silently destroy after a hopeful timeout.
+              // The watchdog (scheduled above) will escalate properly if
+              // recovery doesn't happen.
+            }
+          } else {
+            log("FAILED " + pid + " audio NOT flowing — scheduleRetry");
+            if (pData) pData._gentleRestartCount = 0;
+            scheduleRetry(pid);
+          }
+        }).catch(function(err) {
+          log("FAILED " + pid + " freshAudioCheck threw: " + err.message + " -> retry");
+          if (pData) pData._gentleRestartCount = 0;
+          scheduleRetry(pid);
+        });
       }
     }
 
     if (pc.connectionState === 'disconnected') {
       // v3.14-fix: if audio is actually flowing, give the connection much more
       // time to recover on its own. ICE can briefly disconnect during network
-      // flaps without breaking the audio path. A 4s timeout was too aggressive
-      // for mobile networks. Scale the wait based on whether audio is working.
+      // flaps without breaking the audio path.
       const audioFlowing = isAudioActuallyFlowing(pc, pid);
-      // v3.16-fix: reduced from 8000ms to 4000ms. With the tighter 3s
-      // audio window, if audio is truly flowing we'll know sooner. If not,
-      // we recover faster instead of waiting 8s for nothing.
       const waitMs = audioFlowing ? 4000 : 4000;
       log("DISCONNECTED " + pid + " — waiting " + waitMs + "ms (audio " + (audioFlowing ? "LIVE" : "silent") + ")");
-      setTimeout(() => {
+      // v3.17-fix: also schedule the watchdog. Disconnected often becomes
+      // failed in 5-10s; we want a safety net for the case where the state
+      // never transitions (rare but observed on flaky mobile networks).
+      scheduleFailedWatchdog(pid);
+      setTimeout(async () => {
         const currentPc = peers[pid];
         if (!currentPc) return;
         if (currentPc.connectionState === 'connected') {
           log("disconnected " + pid + " self-recovered — no action needed");
           return;
         }
-        // v3.14-fix: if still disconnected but audio is STILL flowing, the state
-        // machine is just stuck. Don't do a destructive retry — gentle ICE restart.
-        // v3.14-fix-2: but ESCALATE if gentle restarts keep failing.
         const pData2 = peerMap.get(pid);
         const gCount2 = pData2 ? (pData2._gentleRestartCount || 0) : 0;
         const lastG2 = pData2 ? pData2._gentleRestartAt : 0;
         const gRecent2 = lastG2 && (Date.now() - lastG2 < 30000);
-        if (isAudioActuallyFlowing(currentPc, pid) && !(gCount2 >= 2 && gRecent2)) {
-          log("still disconnected " + pid + " but audio LIVE -> gentle ICE restart");
-          if (MY_ID > pid) forceIceRestart(pid);
-          return;
-        }
-        if (gCount2 >= 2 && gRecent2) {
+        // v3.17-fix: lowered threshold from 2 to 1, matching the failed handler.
+        if (gCount2 >= 1 && gRecent2) {
           log("still disconnected " + pid + " — ESCALATING (gentle #" + gCount2 + " failed)");
-          // v3.16-fix: call fullRebuild DIRECTLY instead of scheduleRetry.
-          // scheduleRetry's false-failure detection would intercept and do
-          // another gentle restart, creating an infinite death spiral.
           fullRebuild(pid, 'escalation-disconnected');
           return;
         }
-        if (currentPc.connectionState === 'disconnected' || currentPc.connectionState === 'failed') {
+        // v3.17-fix: fresh packet check instead of trusting stale cached flag
+        const reallyFlowing = await freshAudioCheck(currentPc, pid);
+        if (!peers[pid] || peers[pid] !== currentPc) return;
+        if (peers[pid].connectionState === 'connected') return;
+        if (reallyFlowing) {
+          log("still disconnected " + pid + " but audio LIVE -> gentle ICE restart");
+          if (MY_ID > pid) {
+            forceIceRestart(pid);
+          } else if (ws && ws.readyState === 1) {
+            // v3.17-fix: smaller side actually triggers the recovery instead
+            // of just sitting. Previously this case was a no-op.
+            ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'soft-failed-but-audio-flowing' }));
+          }
+          return;
+        }
+        if (peers[pid].connectionState === 'disconnected' || peers[pid].connectionState === 'failed') {
           log("still disconnected " + pid + " -> retry");
           scheduleRetry(pid);
         }
@@ -4978,13 +5091,26 @@ function setupPC(pc, pid) {
         return;
       }
       log("PC " + pid + " ICE=failed -> early recovery");
+      // v3.17-fix: schedule watchdog here too so we don't depend on the
+      // connectionState transition to 'failed' to trigger the safety net.
+      scheduleFailedWatchdog(pid);
       const pData = peerMap.get(pid);
-      if (pData && isAudioActuallyFlowing(pc, pid)) {
-        log("ICE failed but audio LIVE for " + pid + " -> gentle restart");
-        if (MY_ID > pid) forceIceRestart(pid);
-      } else {
+      freshAudioCheck(pc, pid).then(function(reallyFlowing) {
+        if (peers[pid] !== pc) return;
+        if (peers[pid].iceConnectionState === 'connected' || peers[pid].iceConnectionState === 'completed') return;
+        if (pData && reallyFlowing) {
+          log("ICE failed but audio LIVE for " + pid + " -> gentle restart");
+          if (MY_ID > pid) {
+            forceIceRestart(pid);
+          } else if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'soft-failed-but-audio-flowing' }));
+          }
+        } else {
+          scheduleRetry(pid);
+        }
+      }).catch(function() {
         scheduleRetry(pid);
-      }
+      });
     }
   };
 }
@@ -5276,6 +5402,18 @@ async function fullRebuild(pid, reason) {
       ws.send(JSON.stringify({ type: 'request_relay', to: pid, reason: 'full-rebuild:' + reason }));
     }
     setTimeout(() => { renegInProgress[pid] = false; }, 3000);
+    // v3.17-fix: SELF-HEALING fallback. The smaller side normally waits for the
+    // larger side to send an offer after a rebuild. But if the larger side
+    // is in a bad state (lost the WS message, already in reneg, never received
+    // the request), the smaller side waits forever. After 8s, if no offer
+    // arrived (peers[pid] still null), initiate from our side as a last resort.
+    // The peers[pid] check is the truthsource: handleOffer creates a new PC.
+    setTimeout(function() {
+      if (!peerMap.has(pid)) return; // peer left
+      if (peers[pid]) return; // larger side responded, we have a PC
+      log("FULL-REBUILD fallback: larger side never responded for " + pid + " — initiating from smaller side");
+      createOffer(pid);
+    }, 8000);
   }
 }
 
@@ -6366,7 +6504,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.16 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING)");
+log("page loaded v3.17 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING + WATCHDOG)");
 </script>
 </body>
 </html>"""
@@ -6516,6 +6654,7 @@ async def main():
     print("v3.12.13: cleanup pass — fixed stale comments, dead refs, banner version")
     print("v3.13: msg deletion + swipe reply + long-press delete + image preview + view once")
     print("v3.14: BULLETPROOF CALLING — DTLS-stall detection, audio-aware retry, false-failure prevention")
+    print("v3.17: WATCHDOG — guaranteed recovery from any stuck failed/disconnected state + smaller-side self-heal")
     print("=" * 60)
     await asyncio.gather(
         Server(Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")).serve(),
