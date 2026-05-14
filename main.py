@@ -1,5 +1,5 @@
 """
-Silent Hill Voice Call Bot — v3.15.1 ULTRA HARDCORE
+Silent Hill Voice Call Bot — v3.16 ULTRA HARDCORE
 ═══════════════════════════════════════════════════════════════════════════════
 v3.15 — ULTRA HARDCORE: DTLS-stall detection, offer-avalanche prevention, zombie-audio guard,, "false failure" prevention,
          audio-aware retry logic. No more random disconnects for the ~3%.
@@ -39,6 +39,7 @@ v3.13 — MESSAGE DELETION + SWIPE-TO-REPLY + LONG-PRESS DELETE UI +
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
+import os
 import asyncio, json, os, re, time, uuid, hmac, hashlib, base64, io
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -784,6 +785,21 @@ async def run_kyodo_bot():
 # ─── FASTAPI ────────────────────────────────────────────────────────────────
 app = FastAPI()
 
+# v3.16: serve avatar images from local avatars/ directory
+# Users upload av1.jpg, av2.jpg etc. to the avatars/ folder
+from starlette.responses import FileResponse
+
+AVATARS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatars")
+os.makedirs(AVATARS_DIR, exist_ok=True)
+
+@app.get("/avatars/{filename}")
+async def serve_avatar(filename: str):
+    filepath = os.path.join(AVATARS_DIR, filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Avatar not found")
+    return FileResponse(filepath)
+
+
 
 @app.get("/")
 async def root():
@@ -1234,6 +1250,31 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                     await ws.send_json({"type": "react_result", "ok": False,
                                         "error": "Message not found"})
 
+            # v3.16: host assigns avatar to a peer
+            elif mt == "set_peer_avatar":
+                if not is_host:
+                    await ws.send_json({"type": "peer_avatar_result", "ok": False, "error": "Only host can assign avatars"})
+                    continue
+                target_pid = msg.get("target_pid", "")
+                avatar_url = msg.get("avatar", "")
+                if not target_pid or not avatar_url:
+                    continue
+                # Store the assignment
+                if room_id not in host_assigned_avatars:
+                    host_assigned_avatars[room_id] = {}
+                host_assigned_avatars[room_id][target_pid] = avatar_url
+                # Broadcast to all peers in the room
+                payload = {
+                    "type": "peer_avatar_set",
+                    "target_pid": target_pid,
+                    "avatar": avatar_url,
+                }
+                for p_other, pd_other in room["peers"].items():
+                    try:
+                        await pd_other["ws"].send_json(payload)
+                    except Exception:
+                        pass
+
             elif mt in ("webrtc_offer", "webrtc_answer", "webrtc_ice", "request_relay"):
                 target = msg.get("to")
                 msg["from"] = peer_id
@@ -1539,6 +1580,9 @@ async def ws_endpoint(ws: WebSocket, room_id: str, t: str = Query(...)):
                 pass
         if peer_id in room["peers"]:
             del room["peers"][peer_id]
+        # v3.16: clean up host-assigned avatar for this peer
+        if room_id in host_assigned_avatars and peer_id in host_assigned_avatars[room_id]:
+            del host_assigned_avatars[room_id][peer_id]
         lm = {"type": "peer_left", "peer_id": peer_id, "name": name}
         sm = {"type": "chat", "kind": "system",
               "text": f"{name} left the call",
@@ -2013,6 +2057,33 @@ html,body{height:100%;overflow:hidden;overscroll-behavior:none;position:fixed;in
 .room-full-sub{font-size:13px;color:#7a6a55;max-width:280px;line-height:1.5}
 .room-full-retry{margin-top:24px;height:42px;padding:0 22px;border-radius:21px;border:none;background:#3a2e1f;color:#e8dcc4;font-size:14px;font-weight:600;cursor:pointer}
 .room-full-retry:active{opacity:0.85}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   v3.16 — MESSAGE CLICK PANEL (Copy + Reply)
+   ════════════════════════════════════════════════════════════════════════════ */
+.msg-click-panel{position:absolute;z-index:200;background:rgba(42,42,46,0.97);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-radius:16px;padding:6px;border:1px solid rgba(255,255,255,0.08);box-shadow:0 12px 40px rgba(0,0,0,0.55),0 2px 8px rgba(0,0,0,0.25);opacity:0;transform:scale(0.85) translateY(8px);transition:opacity .15s ease,transform .18s cubic-bezier(.2,.7,.2,1);pointer-events:none;min-width:150px;overflow:hidden}
+.msg-click-panel.show{opacity:1;transform:scale(1) translateY(0);pointer-events:auto}
+.msg-click-panel-item{display:flex;align-items:center;gap:12px;padding:11px 16px;border-radius:10px;cursor:pointer;transition:background .12s,color .12s;color:#fff;font-size:14px;font-weight:500;user-select:none;-webkit-user-select:none}
+.msg-click-panel-item:hover{background:rgba(255,255,255,0.1)}
+.msg-click-panel-item:active{background:rgba(255,255,255,0.14)}
+.msg-click-panel-icon{width:18px;height:18px;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,0.65);flex-shrink:0}
+.msg-click-panel-icon svg{width:100%;height:100%}
+.msg-click-panel-sep{height:1px;background:rgba(255,255,255,0.08);margin:2px 10px}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   v3.16 — HOST AVATAR PICKER
+   ════════════════════════════════════════════════════════════════════════════ */
+.av-picker{position:absolute;z-index:250;background:rgba(38,38,42,0.98);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-radius:18px;padding:14px;border:1px solid rgba(255,255,255,0.1);box-shadow:0 16px 48px rgba(0,0,0,0.6),0 4px 12px rgba(0,0,0,0.3);opacity:0;transform:scale(0.88) translateY(10px);transition:opacity .16s ease,transform .2s cubic-bezier(.2,.7,.2,1);pointer-events:none}
+.av-picker.show{opacity:1;transform:scale(1) translateY(0);pointer-events:auto}
+.av-picker-title{font-size:13px;font-weight:600;color:rgba(255,255,255,0.7);margin-bottom:10px;text-align:center;letter-spacing:0.3px}
+.av-picker-grid{display:grid;grid-template-columns:repeat(4,56px);gap:8px}
+.av-picker-item{width:56px;height:56px;border-radius:50%;overflow:hidden;cursor:pointer;transition:transform .15s,box-shadow .15s;border:2px solid transparent;background:#2c2c2e;box-sizing:border-box}
+.av-picker-item:hover{transform:scale(1.12);box-shadow:0 4px 16px rgba(0,0,0,0.4)}
+.av-picker-item:active{transform:scale(0.95)}
+.av-picker-item img{width:100%;height:100%;object-fit:cover;display:block}
+.seat-av[data-assignable="true"]{cursor:pointer}
+.seat-av[data-assignable="true"]:hover{box-shadow:0 0 0 3px rgba(255,204,0,0.45)}
+
 </style>
 </head>
 <body>
@@ -2170,6 +2241,11 @@ let lastMuteToggleAt = 0;
 // independent of the PC connectionState. Used to detect "false failures" where
 // the state machine says 'failed' but audio packets are still arriving.
 const _lastAudioFlowing = {};
+
+// v3.16: tracks avatars assigned by the host to peers. Key = peer_id, value = avatar URL.
+// These override the peer's own avatar (which is empty for most people).
+const hostAssignedAvatars = {};
+let _avPickerOpen = false;
 
 const frozenJitterCounts = {};
 const frozenJitterValues = {};
@@ -2703,6 +2779,237 @@ function runPeriodicCleanup() {
   });
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// v3.16 — MESSAGE CLICK PANEL (Copy + Reply)
+// Single-click on other's messages reveals a sleek dark panel with Copy
+// and Reply options. Positioned above the message with smooth animation.
+// ════════════════════════════════════════════════════════════════════════════
+let _msgClickPanel = null;
+let _msgClickPanelTimer = null;
+
+function showMsgClickPanel(msgEl, m) {
+  hideMsgClickPanel();
+  // Don't show if reaction bar is open or delete button is visible
+  if (document.querySelector('.react-bar')) { log("click panel blocked: react bar open"); return; }
+  if (document.querySelector('.msg-delete-btn')) { log("click panel blocked: delete btn visible"); return; }
+  log("msg click panel creating for " + (m.id || '?'));
+
+  const panel = document.createElement('div');
+  panel.className = 'msg-click-panel';
+  panel.innerHTML =
+    '<div class="msg-click-panel-item" data-action="copy">' +
+      '<span class="msg-click-panel-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span>' +
+      'Copy' +
+    '</div>' +
+    '<div class="msg-click-panel-sep"></div>' +
+    '<div class="msg-click-panel-item" data-action="reply">' +
+      '<span class="msg-click-panel-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></span>' +
+      'Reply' +
+    '</div>';
+
+  document.body.appendChild(panel);
+  _msgClickPanel = panel;
+
+  // Position above the message bubble
+  const rect = msgEl.getBoundingClientRect();
+  const panelRect = panel.getBoundingClientRect();
+  const chatRect = document.getElementById('chat').getBoundingClientRect();
+
+  let left = rect.left + (rect.width / 2) - (panelRect.width / 2);
+  let top = rect.top - panelRect.height - 10;
+
+  // Clamp to chat boundaries
+  left = Math.max(chatRect.left + 4, Math.min(left, chatRect.right - panelRect.width - 4));
+  top = Math.max(chatRect.top + 4, top);
+
+  panel.style.left = left + 'px';
+  panel.style.top = top + 'px';
+
+  // Animate in
+  requestAnimationFrame(function() {
+    panel.classList.add('show');
+  });
+
+  // Click handlers
+  panel.querySelector('[data-action="copy"]').addEventListener('click', function(ev) {
+    ev.stopPropagation();
+    if (m.text) {
+      navigator.clipboard.writeText(m.text).then(function() {
+        showStickerToast('Copied', 'ok', 1500);
+      }).catch(function() {
+        // Fallback
+        const ta = document.createElement('textarea');
+        ta.value = m.text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showStickerToast('Copied', 'ok', 1500);
+      });
+    }
+    hideMsgClickPanel();
+  });
+
+  panel.querySelector('[data-action="reply"]').addEventListener('click', function(ev) {
+    ev.stopPropagation();
+    startReply(m);
+    hideMsgClickPanel();
+  });
+
+  // Auto-dismiss after 4s
+  _msgClickPanelTimer = setTimeout(hideMsgClickPanel, 4000);
+
+  // Dismiss on click elsewhere (after a small delay to avoid immediate close)
+  setTimeout(function() {
+    document.addEventListener('click', _onDocClickDismiss);
+  }, 100);
+}
+
+function _onDocClickDismiss(e) {
+  if (_msgClickPanel && !_msgClickPanel.contains(e.target)) {
+    hideMsgClickPanel();
+  }
+}
+
+function hideMsgClickPanel() {
+  if (_msgClickPanelTimer) { clearTimeout(_msgClickPanelTimer); _msgClickPanelTimer = null; }
+  document.removeEventListener('click', _onDocClickDismiss);
+  if (_msgClickPanel) {
+    var dyingPanel = _msgClickPanel;
+    dyingPanel.classList.remove('show');
+    setTimeout(function() {
+      // v3.16-fix: only remove if it's still the same panel (not replaced)
+      if (_msgClickPanel === dyingPanel) { _msgClickPanel.remove(); _msgClickPanel = null; }
+    }, 200);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v3.16 — HOST AVATAR PICKER
+// Host clicks a peer's empty avatar → picker appears → choose avatar →
+// broadcast to all. Peers with existing avatars cannot be re-assigned.
+// ════════════════════════════════════════════════════════════════════════════
+let _avPickerEl = null;
+let _avPickerTargetPid = null;
+
+function showAvatarPicker(pid, anchorEl) {
+  if (!isHost) return;
+  if (_avPickerOpen) hideAvatarPicker();
+  const p = peerMap.get(pid);
+  if (!p) return;
+  // Don't show if peer already has an avatar (their own or host-assigned)
+  if (p.avatar || hostAssignedAvatars[pid]) return;
+
+  _avPickerTargetPid = pid;
+  _avPickerOpen = true;
+
+  const picker = document.createElement('div');
+  picker.className = 'av-picker';
+  picker.innerHTML = '<div class="av-picker-title">Pick for ' + esc(p.name || '?') + '</div><div class="av-picker-grid"></div>';
+
+  const grid = picker.querySelector('.av-picker-grid');
+  HOST_AVATARS.forEach(function(url, idx) {
+    const item = document.createElement('div');
+    item.className = 'av-picker-item';
+    item.innerHTML = '<img src="' + url + '" alt="">';
+    item.addEventListener('click', function(ev) {
+      ev.stopPropagation();
+      assignAvatarToPeer(pid, url);
+      hideAvatarPicker();
+    });
+    grid.appendChild(item);
+  });
+
+  document.body.appendChild(picker);
+  _avPickerEl = picker;
+
+  // Position near the clicked avatar
+  const rect = anchorEl.getBoundingClientRect();
+  const pickerRect = picker.getBoundingClientRect();
+  const chatRect = document.getElementById('chat').getBoundingClientRect();
+
+  let left = rect.left + (rect.width / 2) - 130;
+  let top = rect.bottom + 8;
+
+  // Clamp
+  left = Math.max(chatRect.left + 4, Math.min(left, chatRect.right - 270));
+  if (top + 180 > window.innerHeight - 20) {
+    top = rect.top - 180;
+  }
+
+  picker.style.left = left + 'px';
+  picker.style.top = top + 'px';
+
+  requestAnimationFrame(function() { picker.classList.add('show'); });
+
+  // Dismiss
+  setTimeout(function() {
+    document.addEventListener('click', _onAvPickerDismiss);
+  }, 100);
+}
+
+function _onAvPickerDismiss(e) {
+  if (_avPickerEl && !_avPickerEl.contains(e.target)) {
+    hideAvatarPicker();
+  }
+}
+
+function hideAvatarPicker() {
+  _avPickerOpen = false;
+  _avPickerTargetPid = null;
+  document.removeEventListener('click', _onAvPickerDismiss);
+  if (_avPickerEl) {
+    _avPickerEl.classList.remove('show');
+    setTimeout(function() {
+      if (_avPickerEl) { _avPickerEl.remove(); _avPickerEl = null; }
+    }, 200);
+  }
+}
+
+function assignAvatarToPeer(pid, avatarUrl) {
+  if (!isHost) return;
+  hostAssignedAvatars[pid] = avatarUrl;
+  // Update the peer's avatar in peerMap so it shows immediately
+  const p = peerMap.get(pid);
+  if (p) {
+    p._hostAvatar = avatarUrl;
+  }
+  // Refresh the seat grid
+  updPeers();
+  // Refresh any visible messages from this peer
+  refreshPeerMessages(pid);
+  // Broadcast to server
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'set_peer_avatar', target_pid: pid, avatar: avatarUrl }));
+  }
+  log('assigned avatar to ' + pid);
+}
+
+// Refresh avatar on existing messages from a peer
+function refreshPeerMessages(pid) {
+  const p = peerMap.get(pid);
+  if (!p) return;
+  const avSrc = p.avatar || p._hostAvatar || hostAssignedAvatars[pid] || '';
+  const msgs = document.getElementById('msgs');
+  if (!msgs) return;
+  // Find all message rows from this peer and update their avatars
+  msgs.querySelectorAll('.msg-row').forEach(function(row) {
+    const msgPid = row.getAttribute('data-peer-id');
+    if (msgPid === pid) {
+      const avDiv = row.querySelector('.avatar');
+      if (avDiv) {
+        if (avSrc) {
+          avDiv.innerHTML = '<img src="' + esc(avSrc) + '">';
+        } else {
+          const name = p.name || '?';
+          avDiv.innerHTML = '<span>' + esc(name[0].toUpperCase()) + '</span>';
+        }
+      }
+    }
+  });
+}
+
 function startAudioSelfHeal() {
   if (audioHealTimer) clearInterval(audioHealTimer);
   audioHealTimer = setInterval(() => {
@@ -3077,6 +3384,17 @@ function connectWS() {
         handleReaction(m);
         break;
 
+      // v3.16: host-assigned avatar update
+      case 'peer_avatar_set':
+        if (m.target_pid && m.avatar) {
+          hostAssignedAvatars[m.target_pid] = m.avatar;
+          const pm = peerMap.get(m.target_pid);
+          if (pm) pm._hostAvatar = m.avatar;
+          updPeers();
+          refreshPeerMessages(m.target_pid);
+        }
+        break;
+
       case 'history':
         // v3.11: history arrives oldest-first. With column-reverse, the
         // visual bottom is DOM first child, so to keep the order
@@ -3354,10 +3672,13 @@ function _seatDotClass(p, id) {
   return dot;
 }
 
-function _avatarHTML(name, avatarData) {
+function _avatarHTML(name, avatarData, pid) {
+  // v3.16: check host-assigned avatars first, then peer's own avatar
+  const hostAv = pid ? hostAssignedAvatars[pid] : null;
+  const effectiveAv = avatarData || hostAv || '';
   const initial = name && name.length ? esc(name[0].toUpperCase()) : '?';
-  if (avatarData) {
-    return '<img src="' + avatarData + '" alt="">';
+  if (effectiveAv) {
+    return '<img src="' + effectiveAv + '" alt="">';
   }
   return '<span>' + initial + '</span>';
 }
@@ -3368,6 +3689,15 @@ const EMPTY_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 function _seatTile(opts) {
   // opts: { name, avatar, dot, speaking, muted, isHost, isYou, pid }
   const speakingClass = opts.speaking ? ' speaking' : '';
+
+// v3.16: pre-made avatars for host assignment (compressed 128x128 PNGs)
+const HOST_AVATARS = [
+  "/avatars/av1.jpg", "/avatars/av2.jpg", "/avatars/av3.jpg",
+  "/avatars/av4.jpg", "/avatars/av5.jpg", "/avatars/av6.jpg",
+  "/avatars/av7.jpg", "/avatars/av8.jpg"
+];
+
+
   const hostFrame = opts.isHost ? ' host-frame' : '';
   const muteBadge = opts.muted
     ? '<span class="seat-mute" aria-label="Muted">' + MUTE_SVG + '</span>'
@@ -3382,7 +3712,7 @@ function _seatTile(opts) {
     '<div class="seat"' + pidAttr + '>' +
       '<div class="seat-av-wrap">' +
         '<div class="seat-av' + speakingClass + hostFrame + '">' +
-          _avatarHTML(opts.name, opts.avatar) +
+          _avatarHTML(opts.name, opts.avatar, opts.pid) +
         '</div>' +
         muteBadge +
       '</div>' +
@@ -3497,8 +3827,25 @@ function updPeers() {
   const MIN_VISIBLE_SLOTS = 4;
   const visible = Math.min(Math.max(total + 1, MIN_VISIBLE_SLOTS), serverMaxPeers);
   for (let i = total; i < visible; i++) h += _emptySeatTile();
-  grid.innerHTML = h;
-
+    grid.innerHTML = h;
+  // v3.16: host can click empty avatars to assign profile pictures
+  if (isHost) {
+    grid.querySelectorAll('.seat[data-pid]').forEach(function(seat) {
+      const pid = seat.getAttribute('data-pid');
+      const p = peerMap.get(pid);
+      if (p && !p.avatar && !p._hostAvatar && !hostAssignedAvatars[pid]) {
+        const avEl = seat.querySelector('.seat-av');
+        if (avEl) {
+          avEl.setAttribute('data-assignable', 'true');
+          avEl.title = 'Click to assign avatar';
+          avEl.addEventListener('click', function(ev) {
+            ev.stopPropagation();
+            showAvatarPicker(pid, avEl);
+          });
+        }
+      }
+    });
+  }
   // Pull-tab count (shown when panel is collapsed)
   const pullCount = document.getElementById('seatPullCount');
   if (pullCount) pullCount.textContent = total + '/' + serverMaxPeers + ' in call';
@@ -3950,12 +4297,17 @@ async function forceIceRestart(pid) {
     log("ICE restart ignored (smaller side) " + pid);
     return;
   }
-  if (lastIceRestartAt[pid] && Date.now() - lastIceRestartAt[pid] < 8000) {
-    log("ICE restart cooldown " + pid);
-    return;
-  }
   const pc = peers[pid];
   if (!pc || pc.connectionState === 'closed') return;
+  // v3.16-fix: bypass cooldown when connection is truly failed — the 8s
+  // cooldown was killing peers who needed immediate recovery. A 'failed'
+  // state means the browser has given up; we can't afford to wait.
+  const isFailed = pc.connectionState === 'failed';
+  const cooldownMs = isFailed ? 0 : 3000;
+  if (lastIceRestartAt[pid] && Date.now() - lastIceRestartAt[pid] < cooldownMs) {
+    log("ICE restart cooldown " + pid + " (" + (Date.now() - lastIceRestartAt[pid]) + "ms / " + cooldownMs + "ms)");
+    return;
+  }
   const p = peerMap.get(pid);
   if (!p || p._iceRestarting || p._retrying) return;
   if (pc.iceConnectionState === 'checking' || pc.iceConnectionState === 'connecting') return;
@@ -3968,23 +4320,21 @@ async function forceIceRestart(pid) {
   // DUPLICATE offer while this gentle restart is in flight. Both flags are
   // needed because the code checks different flags in different places.
   renegInProgress[pid] = true;
-  lastIceRestartAt[pid] = Date.now();
-  // v3.14-fix-2: track gentle restarts so we can escalate to full rebuild
-  // if gentle restarts keep failing (prevents infinite death spiral).
-  p._gentleRestartAt = Date.now();
-  p._gentleRestartCount = (p._gentleRestartCount || 0) + 1;
-  log("FAST ICE restart " + pid + " (gentle #" + p._gentleRestartCount + ")");
+  log("FAST ICE restart " + pid);
   try {
-    // v3.15-fix: don't race with an ongoing createOffer/rebuild.
-    if (renegInProgress[pid]) {
-      log("ICE restart deferred (reneg in progress) " + pid);
-      return;
-    }
     const o = await pc.createOffer({ iceRestart: true });
     o.sdp = preferOpusAndTune(o.sdp);
     await pc.setLocalDescription(o);
     ws.send(JSON.stringify({ type: 'webrtc_offer', to: pid, sdp: pc.localDescription.sdp }));
     log("ICE restart offer SENT " + pid);
+    // v3.16-fix: ONLY set timestamp and increment counter AFTER successful
+    // offer creation. Previously these were set before the offer, so when
+    // the redundant renegInProgress check deferred the restart, the cooldown
+    // and counter were already set — blocking future recovery attempts.
+    lastIceRestartAt[pid] = Date.now();
+    p._gentleRestartAt = Date.now();
+    p._gentleRestartCount = (p._gentleRestartCount || 0) + 1;
+    log("ICE restart success " + pid + " (gentle #" + p._gentleRestartCount + ")");
   } catch (e) {
     log("fast iceRestart fail: " + e.message);
     // v3.15-fix: if the error is an m-line mismatch, the PC's signaling state
@@ -5732,13 +6082,17 @@ function attachMessageGestures(row, m) {
     onEnd(e.clientX, e.clientY);
   });
 
-  // v3.13: click no longer triggers reply — swipe only. Image preview still works.
+  // v3.16: single-click on OTHER people's messages shows Copy+Reply panel.
+  // Click on own messages dismisses the panel. Image/view-once/reaction
+  // clicks still work as before.
   row.addEventListener('click', function(ev) {
     if (didSwipe) { didSwipe = false; return; }
     if (didLongPress) { didLongPress = false; return; }
     if (deleteBtn) { removeDeleteBtn(); return; }
     // v3.14: dismiss reaction bar on click elsewhere
     if (document.querySelector('.react-bar')) { hideReactionBar(); return; }
+    // v3.16: dismiss msg click panel on any other click
+    hideMsgClickPanel();
     var t = ev.target;
     // Normal image preview still works on tap
     if (t.classList && t.classList.contains('chat-img')) {
@@ -5750,7 +6104,11 @@ function attachMessageGestures(row, m) {
     if (t.closest && t.closest('.reaction-badge')) return;
     // Avatar clicks do nothing
     if (t.tagName === 'IMG' && t.closest('.avatar')) return;
-    // No click-to-reply — swipe only
+    // v3.16: show click panel for OTHER people's messages only
+    if (!isOwn) {
+      log("msg click panel opening for " + (m.id || '?'));
+      showMsgClickPanel(row, m);
+    }
   });
 }
 
@@ -5768,7 +6126,7 @@ function renderMsg(m) {
     const pi = peerMap.get(m.peer_id) || {};
     const name = m.name || pi.name || '?';
     const showBadge = !!(m.is_admin || pi.is_admin);
-    const avSrc = m.avatar || pi.avatar || '';
+    const avSrc = m.avatar || pi.avatar || hostAssignedAvatars[m.peer_id] || '';
 
     const hasSticker = !!(m.sticker || m.sticker_expired);
     const hasImage = !!(m.image || m.image_expired);
@@ -5780,6 +6138,8 @@ function renderMsg(m) {
     row.className = 'msg-row ' + (isSelf ? 'self' : 'other');
     if (stickerOnly && !isDeleted) row.classList.add('has-sticker-only');
     if (m.id) row.setAttribute('data-msg-id', m.id);
+    // v3.16: track which peer sent this message for avatar refresh
+    if (m.peer_id) row.setAttribute('data-peer-id', m.peer_id);
 
     let avHTML;
     if (avSrc) avHTML = '<div class="avatar"><img src="' + esc(avSrc) + '"></div>';
@@ -5981,7 +6341,7 @@ window.addEventListener('beforeunload', () => {
   cleanupRTC();
 });
 
-log("page loaded v3.15.1 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING)");
+log("page loaded v3.16 (max " + MAX_PEERS + " peers, stickers, seat-grid, msg deletion, swipe reply, view once, BULLETPROOF CALLING)");
 </script>
 </body>
 </html>"""
