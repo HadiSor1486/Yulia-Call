@@ -70,8 +70,8 @@ import zombie as zomb_mod
 # ─── CONFIG ─────────────────────────────────────────────────────────────────
 # User explicitly requested credentials remain hardcoded as defaults.
 # (They're not considered sensitive in this project.)
-EMAIL = os.getenv("BOT_EMAIL", "hadidaoud.ha@gmail.com")
-PASSWORD = os.getenv("BOT_PASSWORD", "yulia123")
+EMAIL = os.getenv("BOT_EMAIL")
+PASSWORD = os.getenv("BOT_PASSWORD")
 DEVICE_ID = os.getenv("BOT_DEVICE_ID", "870d649515ce700797d6a56965689f3aaa7d5e82dfdce994b239e00e37238184")
 CHAT_ID = os.getenv("BOT_CHAT_ID", "cmh2gy89r01pvt33exijh1wr3")
 CIRCLE_ID = os.getenv("BOT_CIRCLE_ID", "cm9bylrbn00hmux6t43mczt2o")
