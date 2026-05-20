@@ -7,3 +7,4 @@ kyodo==1.7.2
 packaging
 websockets
 python-multipart
+livekit-api>=1.0.0
