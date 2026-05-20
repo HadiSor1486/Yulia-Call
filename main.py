@@ -51,8 +51,8 @@ import call_system
 EMAIL = os.getenv("BOT_EMAIL")
 PASSWORD = os.getenv("BOT_PASSWORD")
 DEVICE_ID = os.getenv("BOT_DEVICE_ID", "870d649515ce700797d6a56965689f3aaa7d5e82dfdce994b239e00e37238184")
-CHAT_ID = os.getenv("BOT_CHAT_ID", "cmh2gy89r01pvt33exijh1wr3")
-CIRCLE_ID = os.getenv("BOT_CIRCLE_ID", "cm9bylrbn00hmux6t43mczt2o")
+CHAT_ID = os.getenv("BOT_CHAT_ID", "cmgxt1tlf00err93e9oiujdzi")
+CIRCLE_ID = os.getenv("BOT_CIRCLE_ID", "cmgxt1tay00e6r93efs89iob1")
 WEB_APP_URL = os.environ.get("WEB_APP_URL", "http://localhost:8000")
 PORT = int(os.environ.get("PORT", "8000"))
 
